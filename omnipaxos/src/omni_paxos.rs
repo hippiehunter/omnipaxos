@@ -100,7 +100,7 @@ impl ClusterConfig {
     /// Checks that all the fields of the cluster config are valid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let num_nodes = self.nodes.len();
-        valid_config!(num_nodes > 1, "Need more than 1 node");
+        valid_config!(num_nodes >= 1, "Need at least 1 node");
         valid_config!(self.configuration_id != 0, "Configuration ID cannot be 0");
         if let Some(FlexibleQuorum {
             read_quorum_size,
@@ -112,12 +112,12 @@ impl ClusterConfig {
                 "The quorums must overlap i.e., the sum of their sizes must exceed the # of nodes"
             );
             valid_config!(
-                read_quorum_size >= 2 && read_quorum_size <= num_nodes,
-                "Read quorum must be in range 2 to # of nodes in the cluster"
+                read_quorum_size >= 1 && read_quorum_size <= num_nodes,
+                "Read quorum must be in range 1 to # of nodes in the cluster"
             );
             valid_config!(
-                write_quorum_size >= 2 && write_quorum_size <= num_nodes,
-                "Write quorum must be in range 2 to # of nodes in the cluster"
+                write_quorum_size >= 1 && write_quorum_size <= num_nodes,
+                "Write quorum must be in range 1 to # of nodes in the cluster"
             );
             // No constraint that read >= write; the overlap constraint above is sufficient.
         }

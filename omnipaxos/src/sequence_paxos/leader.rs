@@ -37,22 +37,28 @@ where
                 accepted_idx,
                 log_sync: None,
             };
-            self.leader_state.set_promise(my_promise, self.pid, true);
+            let received_majority =
+                self.leader_state.set_promise(my_promise, self.pid, true);
             /* initialise longest chosen sequence and update state */
             self.state = (Role::Leader, Phase::Prepare);
-            let prep = Prepare {
-                n,
-                decided_idx,
-                n_accepted: na,
-                accepted_idx,
-            };
-            /* send prepare */
-            for pid in &self.peers {
-                self.outgoing.push(Message::SequencePaxos(PaxosMessage {
-                    from: self.pid,
-                    to: *pid,
-                    msg: PaxosMsg::Prepare(prep),
-                }));
+            if received_majority {
+                // Single-node: self-promise alone forms a quorum.
+                self.handle_majority_promises().await?;
+            } else {
+                let prep = Prepare {
+                    n,
+                    decided_idx,
+                    n_accepted: na,
+                    accepted_idx,
+                };
+                /* send prepare */
+                for pid in &self.peers {
+                    self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                        from: self.pid,
+                        to: *pid,
+                        msg: PaxosMsg::Prepare(prep),
+                    }));
+                }
             }
         } else {
             self.become_follower();
@@ -119,6 +125,7 @@ where
             self.leader_state
                 .set_accepted_idx(self.pid, metadata.accepted_idx);
             self.send_acceptdecide(metadata);
+            self.try_decide_self_accepted().await?;
         }
         Ok(())
     }
@@ -131,6 +138,7 @@ where
             self.leader_state
                 .set_accepted_idx(self.pid, metadata.accepted_idx);
             self.send_acceptdecide(metadata);
+            self.try_decide_self_accepted().await?;
         }
         Ok(())
     }
@@ -144,6 +152,7 @@ where
         }
         let accepted_idx = self.internal_storage.get_accepted_idx();
         self.leader_state.set_accepted_idx(self.pid, accepted_idx);
+        self.try_decide_self_accepted().await?;
         let followers: Vec<NodeId> = self.leader_state.get_promised_followers().to_vec();
         for pid in followers {
             self.send_accept_stopsign(pid, ss.clone(), false);
@@ -279,6 +288,7 @@ where
         self.state = (Role::Leader, Phase::Accept);
         self.leader_state
             .set_accepted_idx(self.pid, new_accepted_idx);
+        self.try_decide_self_accepted().await?;
         let followers: Vec<NodeId> = self.leader_state.get_promised_followers().to_vec();
         for pid in followers {
             self.send_accsync(pid).await?;
@@ -408,6 +418,18 @@ where
         }
     }
 
+    /// Check if the leader's own accept is sufficient to form a quorum (single-node case)
+    /// and advance decided_idx if so.
+    async fn try_decide_self_accepted(&mut self) -> StorageResult<()> {
+        let accepted_idx = self.leader_state.get_accepted_idx(self.pid);
+        if accepted_idx > self.internal_storage.get_decided_idx()
+            && self.leader_state.is_chosen(accepted_idx)
+        {
+            self.internal_storage.set_decided_idx(accepted_idx).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn flush_batch_leader(&mut self) -> StorageResult<()> {
         let accepted_metadata = self
             .internal_storage
@@ -416,6 +438,7 @@ where
             self.leader_state
                 .set_accepted_idx(self.pid, metadata.accepted_idx);
             self.send_acceptdecide(metadata);
+            self.try_decide_self_accepted().await?;
         }
         Ok(())
     }

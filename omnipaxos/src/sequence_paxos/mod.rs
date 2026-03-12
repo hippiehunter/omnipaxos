@@ -58,15 +58,21 @@ where
         let (state, leader) = match storage.get_promise().await? {
             // if we recover a promise from storage then we must do failure recovery
             Some(b) => {
-                let state = (Role::Follower, Phase::Recover);
-                for peer_pid in &peers {
-                    let prepreq = PrepareReq { n: b };
-                    outgoing.push(Message::SequencePaxos(PaxosMessage {
-                        from: pid,
-                        to: *peer_pid,
-                        msg: PaxosMsg::PrepareReq(prepreq),
-                    }));
-                }
+                let state = if peers.is_empty() {
+                    // Single-node cluster: no peers to recover from, BLE will
+                    // elect us as leader normally.
+                    (Role::Follower, Phase::None)
+                } else {
+                    for peer_pid in &peers {
+                        let prepreq = PrepareReq { n: b };
+                        outgoing.push(Message::SequencePaxos(PaxosMessage {
+                            from: pid,
+                            to: *peer_pid,
+                            msg: PaxosMsg::PrepareReq(prepreq),
+                        }));
+                    }
+                    (Role::Follower, Phase::Recover)
+                };
                 (state, b)
             }
             None => ((Role::Follower, Phase::None), Ballot::default()),

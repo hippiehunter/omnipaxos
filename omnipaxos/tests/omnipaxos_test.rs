@@ -1,6 +1,6 @@
 use omnipaxos::{
     messages::Message,
-    storage::{memory_storage::MemoryStorage, Entry, Snapshot},
+    storage::{memory_storage::MemoryStorage, Entry, Snapshot, Storage},
     util::LogEntry,
     ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
 };
@@ -411,5 +411,154 @@ fn test_snapshot() {
                 other
             ),
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Single-node cluster tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_single_node_leader_election() {
+    smol::block_on(async {
+        let mut cluster = TestCluster::new(vec![1]).await;
+        // A single node should elect itself as leader within a few ticks.
+        let leader = elect_leader(&mut cluster).await;
+        assert_eq!(leader, 1, "the only node must be the leader");
+    });
+}
+
+#[test]
+fn test_single_node_replication() {
+    smol::block_on(async {
+        let mut cluster = TestCluster::new(vec![1]).await;
+        let leader = elect_leader(&mut cluster).await;
+        assert_eq!(leader, 1);
+
+        // Propose entries and verify they are decided immediately.
+        let num_entries: u64 = 5;
+        for i in 1..=num_entries {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(10).await;
+
+        let node = cluster.nodes.get(&1).unwrap();
+        assert_eq!(
+            node.get_decided_idx(),
+            num_entries as usize,
+            "single node should decide all entries"
+        );
+
+        let entries = node
+            .read_decided_suffix(0)
+            .await
+            .unwrap()
+            .expect("should have decided entries");
+        let ids: Vec<u64> = entries
+            .iter()
+            .filter_map(|e| match e {
+                LogEntry::Decided(v) => Some(v.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    });
+}
+
+#[test]
+fn test_single_node_reconfigure_to_three() {
+    smol::block_on(async {
+        let mut cluster = TestCluster::new(vec![1]).await;
+        let leader = elect_leader(&mut cluster).await;
+        assert_eq!(leader, 1);
+
+        // Propose some entries first.
+        for i in 1..=3 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(10).await;
+
+        // Reconfigure from 1 node to 3 nodes.
+        let new_config = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let node = cluster.nodes.get_mut(&leader).unwrap();
+        node.reconfigure(new_config, None).await.unwrap();
+
+        // Tick to let the stopsign be decided.
+        cluster.tick_and_route(10).await;
+
+        let node = cluster.nodes.get(&leader).unwrap();
+        let ss = node.is_reconfigured();
+        assert!(
+            ss.is_some(),
+            "single node should have decided the stopsign for reconfiguration"
+        );
+        let ss = ss.unwrap();
+        assert_eq!(ss.next_config.nodes, vec![1, 2, 3]);
+    });
+}
+
+#[test]
+fn test_single_node_recovery() {
+    smol::block_on(async {
+        // Simulate recovery: create a MemoryStorage with a stored promise
+        // (as if the node had been a leader before crashing).
+        use omnipaxos::ballot_leader_election::Ballot;
+
+        let mut storage: MemoryStorage<Value> = MemoryStorage::default();
+        let ballot = Ballot {
+            config_id: 1,
+            n: 1,
+            priority: 0,
+            pid: 1,
+        };
+        storage.set_promise(ballot).await.unwrap();
+        storage.set_accepted_round(ballot).await.unwrap();
+        // Write some entries that were accepted before "crash".
+        storage
+            .append_entries(vec![
+                Value::with_id(1),
+                Value::with_id(2),
+                Value::with_id(3),
+            ])
+            .await
+            .unwrap();
+        storage.set_decided_idx(3).await.unwrap();
+
+        let cluster_config = ClusterConfig {
+            configuration_id: 1,
+            nodes: vec![1],
+            ..Default::default()
+        };
+        let server_config = ServerConfig {
+            pid: 1,
+            ..Default::default()
+        };
+        let config = OmniPaxosConfig {
+            cluster_config,
+            server_config,
+        };
+        let mut recovered = config.build(storage).await.unwrap();
+
+        // The recovered node should not be stuck in Recover phase.
+        // Tick enough for BLE to elect it leader again.
+        for _ in 0..50 {
+            recovered.tick().await.unwrap();
+        }
+
+        // Verify it can accept new entries.
+        recovered.append(Value::with_id(10)).await.unwrap();
+        for _ in 0..10 {
+            recovered.tick().await.unwrap();
+        }
+
+        assert_eq!(
+            recovered.get_decided_idx(),
+            4,
+            "recovered single node should decide new entry"
+        );
     });
 }
