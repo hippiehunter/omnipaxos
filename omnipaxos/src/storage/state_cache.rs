@@ -1,16 +1,11 @@
 use super::{internal_storage::InternalStorageConfig, Entry, StopSign};
 use crate::ballot_leader_election::Ballot;
-#[cfg(feature = "unicache")]
-use crate::{unicache::*, util::NodeId};
 
 /// A simple in-memory storage for simple state values of OmniPaxos.
 pub(super) struct StateCache<T>
 where
     T: Entry,
 {
-    #[cfg(feature = "unicache")]
-    /// Id of this node
-    pub pid: NodeId,
     /// The maximum number of entries to batch.
     pub batch_size: usize,
     /// Vector which contains all the logged entries in-memory.
@@ -27,24 +22,14 @@ where
     pub compacted_idx: usize,
     /// Stopsign entry.
     pub stopsign: Option<StopSign>,
-    #[cfg(feature = "unicache")]
-    /// Batch of entries that are processed (i.e., maybe encoded). Only used by the leader.
-    pub batched_processed_by_leader: Vec<T::EncodeResult>,
-    #[cfg(feature = "unicache")]
-    pub unicache: T::UniCache,
 }
 
 impl<T> StateCache<T>
 where
     T: Entry,
 {
-    pub(super) fn new(
-        config: InternalStorageConfig,
-        #[cfg(feature = "unicache")] pid: NodeId,
-    ) -> Self {
+    pub(super) fn new(config: InternalStorageConfig) -> Self {
         StateCache {
-            #[cfg(feature = "unicache")]
-            pid,
             batch_size: config.batch_size,
             batched_entries: Vec::with_capacity(config.batch_size),
             promise: Ballot::default(),
@@ -53,21 +38,12 @@ where
             accepted_idx: 0,
             compacted_idx: 0,
             stopsign: None,
-            #[cfg(feature = "unicache")]
-            batched_processed_by_leader: Vec::with_capacity(config.batch_size),
-            #[cfg(feature = "unicache")]
-            unicache: T::UniCache::new(),
         }
     }
 
     // Appends an entry to the end of the `batched_entries`. If the batch is full, the
     // batch is flushed and return flushed entries. Else, return None.
     pub(super) fn append_entry(&mut self, entry: T) -> Option<Vec<T>> {
-        #[cfg(feature = "unicache")]
-        {
-            let processed = self.unicache.try_encode(&entry);
-            self.batched_processed_by_leader.push(processed);
-        }
         self.batched_entries.push(entry);
         self.take_entries_if_batch_is_full()
     }
@@ -75,16 +51,6 @@ where
     // Appends entries to the end of the `batched_entries`. If the batch is full, the
     // batch is flushed and return flushed entries. Else, return None.
     pub(super) fn append_entries(&mut self, entries: Vec<T>) -> Option<Vec<T>> {
-        #[cfg(feature = "unicache")]
-        {
-            if self.promise.pid == self.pid {
-                // only try encoding if we're the leader
-                for entry in &entries {
-                    let processed = self.unicache.try_encode(entry);
-                    self.batched_processed_by_leader.push(processed);
-                }
-            }
-        }
         self.batched_entries.extend(entries);
         self.take_entries_if_batch_is_full()
     }
@@ -113,11 +79,6 @@ where
     // return an empty vector.
     pub(super) fn take_batched_entries(&mut self) -> Vec<T> {
         std::mem::take(&mut self.batched_entries)
-    }
-
-    #[cfg(feature = "unicache")]
-    pub(super) fn take_batched_processed(&mut self) -> Vec<T::EncodeResult> {
-        std::mem::take(&mut self.batched_processed_by_leader)
     }
 
     // Returns whether a stopsign is decided

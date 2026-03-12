@@ -2,7 +2,9 @@ use super::super::ballot_leader_election::Ballot;
 
 use super::*;
 
-use crate::util::{MessageStatus, WRITE_ERROR_MSG};
+use crate::storage::StorageResult;
+use crate::util::MessageStatus;
+use std::sync::Arc;
 
 impl<T, B> SequencePaxos<T, B>
 where
@@ -10,26 +12,22 @@ where
     B: Storage<T>,
 {
     /*** Follower ***/
-    pub(crate) fn handle_prepare(&mut self, prep: Prepare, from: NodeId) {
+    pub(crate) async fn handle_prepare(&mut self, prep: Prepare, from: NodeId) -> StorageResult<()> {
         let old_promise = self.internal_storage.get_promise();
         if old_promise < prep.n || (old_promise == prep.n && self.state.1 == Phase::Recover) {
-            // Flush any pending writes
-            // Don't have to handle flushed entries here because we will sync with followers
-            let _ = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);
-            self.internal_storage
-                .set_promise(prep.n)
-                .expect(WRITE_ERROR_MSG);
+            // Atomically flush pending writes and set promise (fix B1)
+            let _ = self.internal_storage.flush_batch_and_set_promise(prep.n).await?;
             self.state = (Role::Follower, Phase::Prepare);
             self.current_seq_num = SequenceNumber::default();
             let na = self.internal_storage.get_accepted_round();
             let accepted_idx = self.internal_storage.get_accepted_idx();
             let log_sync = if na > prep.n_accepted {
                 // I'm more up to date: send leader what he is missing after his decided index.
-                Some(self.create_log_sync(prep.decided_idx, prep.decided_idx))
+                Some(self.create_log_sync(prep.decided_idx, prep.decided_idx).await?)
             } else if na == prep.n_accepted && accepted_idx > prep.accepted_idx {
                 // I'm more up to date and in same round: send leader what he is missing after his
                 // accepted index.
-                Some(self.create_log_sync(prep.accepted_idx, prep.decided_idx))
+                Some(self.create_log_sync(prep.accepted_idx, prep.decided_idx).await?)
             } else {
                 // I'm equally or less up to date
                 None
@@ -48,15 +46,15 @@ where
                 msg: PaxosMsg::Promise(promise),
             }));
         }
+        Ok(())
     }
 
-    pub(crate) fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) {
+    pub(crate) async fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) -> StorageResult<()> {
         if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {
             self.cached_promise_message = None;
             let new_accepted_idx = self
                 .internal_storage
-                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))
-                .expect(WRITE_ERROR_MSG);
+                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync)).await?;
             if self.internal_storage.get_stopsign().is_none() {
                 self.forward_buffered_proposals();
             }
@@ -73,9 +71,8 @@ where
                 to: from,
                 msg: PaxosMsg::Accepted(accepted),
             }));
-            #[cfg(feature = "unicache")]
-            self.internal_storage.set_unicache(accsync.unicache);
         }
+        Ok(())
     }
 
     fn forward_buffered_proposals(&mut self) {
@@ -85,21 +82,17 @@ where
         }
     }
 
-    pub(crate) fn handle_acceptdecide(&mut self, acc_dec: AcceptDecide<T>) {
+    pub(crate) async fn handle_acceptdecide(&mut self, acc_dec: AcceptDecide<T>) -> StorageResult<()> {
         if self.check_valid_ballot(acc_dec.n)
             && self.state == (Role::Follower, Phase::Accept)
             && self.handle_sequence_num(acc_dec.seq_num, acc_dec.n.pid) == MessageStatus::Expected
         {
-            #[cfg(not(feature = "unicache"))]
-            let entries = acc_dec.entries;
-            #[cfg(feature = "unicache")]
-            let entries = self.internal_storage.decode_entries(acc_dec.entries);
+            let entries = Arc::try_unwrap(acc_dec.entries).unwrap_or_else(|arc| (*arc).clone());
             let mut new_accepted_idx = self
                 .internal_storage
-                .append_entries_and_get_accepted_idx(entries)
-                .expect(WRITE_ERROR_MSG);
+                .append_entries_and_get_accepted_idx(entries).await?;
             let flushed_after_decide =
-                self.update_decided_idx_and_get_accepted_idx(acc_dec.decided_idx);
+                self.update_decided_idx_and_get_accepted_idx(acc_dec.decided_idx).await?;
             if flushed_after_decide.is_some() {
                 new_accepted_idx = flushed_after_decide;
             }
@@ -107,53 +100,53 @@ where
                 self.reply_accepted(acc_dec.n, idx);
             }
         }
+        Ok(())
     }
 
-    pub(crate) fn handle_accept_stopsign(&mut self, acc_ss: AcceptStopSign) {
+    pub(crate) async fn handle_accept_stopsign(&mut self, acc_ss: AcceptStopSign) -> StorageResult<()> {
         if self.check_valid_ballot(acc_ss.n)
             && self.state == (Role::Follower, Phase::Accept)
             && self.handle_sequence_num(acc_ss.seq_num, acc_ss.n.pid) == MessageStatus::Expected
         {
-            // Flush entries before appending stopsign. The accepted index is ignored here as
-            // it will be updated when appending stopsign.
-            let _ = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);
+            // Atomically flush entries and set stopsign (fix B4)
             let new_accepted_idx = self
                 .internal_storage
-                .set_stopsign(Some(acc_ss.ss))
-                .expect(WRITE_ERROR_MSG);
+                .flush_batch_and_set_stopsign(Some(acc_ss.ss)).await?;
             self.reply_accepted(acc_ss.n, new_accepted_idx);
         }
+        Ok(())
     }
 
-    pub(crate) fn handle_decide(&mut self, dec: Decide) {
+    pub(crate) async fn handle_decide(&mut self, dec: Decide) -> StorageResult<()> {
         if self.check_valid_ballot(dec.n)
             && self.state.1 == Phase::Accept
             && self.handle_sequence_num(dec.seq_num, dec.n.pid) == MessageStatus::Expected
         {
-            let new_accepted_idx = self.update_decided_idx_and_get_accepted_idx(dec.decided_idx);
+            let new_accepted_idx = self.update_decided_idx_and_get_accepted_idx(dec.decided_idx).await?;
             if let Some(idx) = new_accepted_idx {
                 self.reply_accepted(dec.n, idx);
             }
         }
+        Ok(())
     }
 
     /// To maintain decided index <= accepted index, batched entries may be flushed.
     /// Returns `Some(new_accepted_idx)` if entries are flushed, otherwise `None`.
-    fn update_decided_idx_and_get_accepted_idx(&mut self, new_decided_idx: usize) -> Option<usize> {
+    async fn update_decided_idx_and_get_accepted_idx(&mut self, new_decided_idx: usize) -> StorageResult<Option<usize>> {
         if new_decided_idx <= self.internal_storage.get_decided_idx() {
-            return None;
+            return Ok(None);
         }
         if new_decided_idx > self.internal_storage.get_accepted_idx() {
-            let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);
-            self.internal_storage
-                .set_decided_idx(new_decided_idx.min(new_accepted_idx))
-                .expect(WRITE_ERROR_MSG);
-            Some(new_accepted_idx)
+            // Atomically flush batch and set decided index (fix B3)
+            // Clamping to new accepted_idx is handled inside the method
+            let new_accepted_idx = self
+                .internal_storage
+                .flush_batch_and_set_decided_idx(new_decided_idx).await?;
+            Ok(Some(new_accepted_idx))
         } else {
             self.internal_storage
-                .set_decided_idx(new_decided_idx)
-                .expect(WRITE_ERROR_MSG);
-            None
+                .set_decided_idx(new_decided_idx).await?;
+            Ok(None)
         }
     }
 
@@ -227,11 +220,14 @@ where
     }
 
     /// Also returns the MessageStatus of the sequence based on the incoming sequence number.
-    fn handle_sequence_num(&mut self, seq_num: SequenceNumber, from: NodeId) -> MessageStatus {
+    fn handle_sequence_num(&mut self, seq_num: SequenceNumber, _from: NodeId) -> MessageStatus {
         let msg_status = self.current_seq_num.check_msg_status(seq_num);
         match msg_status {
             MessageStatus::Expected => self.current_seq_num = seq_num,
-            MessageStatus::DroppedPreceding => self.reconnected(from),
+            // Instead of triggering a full re-sync via reconnected(), simply ignore
+            // dropped messages and let the normal resend timeout mechanism handle
+            // recovery. This avoids unnecessary full re-syncs on transient drops.
+            MessageStatus::DroppedPreceding => (),
             MessageStatus::Outdated => (),
         };
         msg_status
@@ -281,11 +277,12 @@ where
         }
     }
 
-    pub(crate) fn flush_batch_follower(&mut self) {
+    pub(crate) async fn flush_batch_follower(&mut self) -> StorageResult<()> {
         let accepted_idx = self.internal_storage.get_accepted_idx();
-        let new_accepted_idx = self.internal_storage.flush_batch().expect(WRITE_ERROR_MSG);
+        let new_accepted_idx = self.internal_storage.flush_batch().await?;
         if new_accepted_idx > accepted_idx {
             self.reply_accepted(self.get_promise(), new_accepted_idx);
         }
+        Ok(())
     }
 }

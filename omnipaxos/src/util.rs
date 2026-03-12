@@ -5,7 +5,7 @@ use super::{
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, fmt::Debug, marker::PhantomData};
+use std::{cmp::Ordering, collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 /// Struct used to help another server synchronize their log with the current state of our own log.
 #[derive(Clone, Debug)]
@@ -76,16 +76,18 @@ where
     T: Entry,
 {
     pub n_leader: Ballot,
+    /// All cluster member PIDs (including self)
+    peers: Vec<NodeId>,
+    /// Map from PID to compact index
+    pid_to_idx: HashMap<NodeId, usize>,
     promises_meta: Vec<PromiseState>,
-    // the sequence number of accepts for each follower where AcceptSync has sequence number = 1
     follower_seq_nums: Vec<SequenceNumber>,
-    pub accepted_indexes: Vec<usize>,
+    accepted_indexes: Vec<usize>,
     max_promise_meta: PromiseMetaData,
     max_promise_sync: Option<LogSync<T>>,
-    latest_accept_meta: Vec<Option<(Ballot, usize)>>, //  index in outgoing
-    pub max_pid: usize,
-    // The number of promises needed in the prepare phase to become synced and
-    // the number of accepteds needed in the accept phase to decide an entry.
+    latest_accept_meta: Vec<Option<(Ballot, usize)>>,
+    /// Cached list of promised follower PIDs, updated on promise state changes.
+    promised_followers: Vec<NodeId>,
     pub quorum: Quorum,
 }
 
@@ -93,39 +95,51 @@ impl<T> LeaderState<T>
 where
     T: Entry,
 {
-    pub fn with(n_leader: Ballot, max_pid: usize, quorum: Quorum) -> Self {
+    pub fn with(n_leader: Ballot, peers: &[NodeId], self_pid: NodeId, quorum: Quorum) -> Self {
+        // Build all_nodes: self + peers
+        let mut all_nodes = Vec::with_capacity(peers.len() + 1);
+        all_nodes.push(self_pid);
+        all_nodes.extend_from_slice(peers);
+        let num = all_nodes.len();
+        let pid_to_idx: HashMap<NodeId, usize> =
+            all_nodes.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+
         Self {
             n_leader,
-            promises_meta: vec![PromiseState::NotPromised; max_pid],
-            follower_seq_nums: vec![SequenceNumber::default(); max_pid],
-            accepted_indexes: vec![0; max_pid],
+            peers: all_nodes,
+            pid_to_idx,
+            promises_meta: vec![PromiseState::NotPromised; num],
+            follower_seq_nums: vec![SequenceNumber::default(); num],
+            accepted_indexes: vec![0; num],
             max_promise_meta: PromiseMetaData::default(),
             max_promise_sync: None,
-            latest_accept_meta: vec![None; max_pid],
-            max_pid,
+            latest_accept_meta: vec![None; num],
+            promised_followers: Vec::new(),
             quorum,
         }
     }
 
-    fn pid_to_idx(pid: NodeId) -> usize {
-        (pid - 1) as usize
+    fn idx(&self, pid: NodeId) -> usize {
+        *self
+            .pid_to_idx
+            .get(&pid)
+            .unwrap_or_else(|| panic!("Unknown PID {} in LeaderState", pid))
     }
 
-    // Resets `pid`'s accept sequence to indicate they are in the next session of accepts
     pub fn increment_seq_num_session(&mut self, pid: NodeId) {
-        let idx = Self::pid_to_idx(pid);
+        let idx = self.idx(pid);
         self.follower_seq_nums[idx].session += 1;
         self.follower_seq_nums[idx].counter = 0;
     }
 
     pub fn next_seq_num(&mut self, pid: NodeId) -> SequenceNumber {
-        let idx = Self::pid_to_idx(pid);
+        let idx = self.idx(pid);
         self.follower_seq_nums[idx].counter += 1;
         self.follower_seq_nums[idx]
     }
 
     pub fn get_seq_num(&mut self, pid: NodeId) -> SequenceNumber {
-        self.follower_seq_nums[Self::pid_to_idx(pid)]
+        self.follower_seq_nums[self.idx(pid)]
     }
 
     pub fn set_promise(&mut self, prom: Promise<T>, from: NodeId, check_max_prom: bool) -> bool {
@@ -139,7 +153,9 @@ where
             self.max_promise_meta = promise_meta.clone();
             self.max_promise_sync = prom.log_sync;
         }
-        self.promises_meta[Self::pid_to_idx(from)] = PromiseState::Promised(promise_meta);
+        let idx = self.idx(from);
+        self.promises_meta[idx] = PromiseState::Promised(promise_meta);
+        self.rebuild_promised_followers();
         let num_promised = self
             .promises_meta
             .iter()
@@ -149,12 +165,31 @@ where
     }
 
     pub fn reset_promise(&mut self, pid: NodeId) {
-        self.promises_meta[Self::pid_to_idx(pid)] = PromiseState::NotPromised;
+        let idx = self.idx(pid);
+        self.promises_meta[idx] = PromiseState::NotPromised;
+        self.rebuild_promised_followers();
     }
 
-    /// Node `pid` seen with ballot greater than my ballot
     pub fn lost_promise(&mut self, pid: NodeId) {
-        self.promises_meta[Self::pid_to_idx(pid)] = PromiseState::PromisedHigher;
+        let idx = self.idx(pid);
+        self.promises_meta[idx] = PromiseState::PromisedHigher;
+        self.rebuild_promised_followers();
+    }
+
+    fn rebuild_promised_followers(&mut self) {
+        let leader_idx = self.idx(self.n_leader.pid);
+        self.promised_followers = self
+            .promises_meta
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                if i != leader_idx && matches!(p, PromiseState::Promised(_)) {
+                    Some(self.peers[i])
+                } else {
+                    None
+                }
+            })
+            .collect();
     }
 
     pub fn take_max_promise_sync(&mut self) -> Option<LogSync<T>> {
@@ -177,43 +212,40 @@ where
     }
 
     pub fn get_promise_meta(&self, pid: NodeId) -> &PromiseMetaData {
-        match &self.promises_meta[Self::pid_to_idx(pid)] {
+        let idx = self.idx(pid);
+        match &self.promises_meta[idx] {
             PromiseState::Promised(metadata) => metadata,
-            _ => panic!("No Metadata found for promised follower"),
+            _ => panic!("No Metadata found for promised follower {}", pid),
         }
     }
 
-    pub fn get_min_all_accepted_idx(&self) -> &usize {
-        self.accepted_indexes
-            .iter()
-            .min()
-            .expect("Should be all initialised to 0!")
-    }
-
-    pub fn reset_latest_accept_meta(&mut self) {
-        self.latest_accept_meta = vec![None; self.max_pid];
-    }
-
-    pub fn get_promised_followers(&self) -> Vec<NodeId> {
+    /// Returns the minimum accepted index across all promised nodes (including self).
+    pub fn get_min_all_accepted_idx(&self) -> usize {
         self.promises_meta
             .iter()
             .enumerate()
-            .filter_map(|(idx, x)| match x {
-                PromiseState::Promised(_) if idx != Self::pid_to_idx(self.n_leader.pid) => {
-                    Some((idx + 1) as NodeId)
-                }
+            .filter_map(|(i, p)| match p {
+                PromiseState::Promised(_) => Some(self.accepted_indexes[i]),
                 _ => None,
             })
-            .collect()
+            .min()
+            .unwrap_or(0)
     }
 
-    /// The pids of peers which have not promised a higher ballot than mine.
+    pub fn reset_latest_accept_meta(&mut self) {
+        self.latest_accept_meta.fill(None);
+    }
+
+    pub fn get_promised_followers(&self) -> &[NodeId] {
+        &self.promised_followers
+    }
+
     pub(crate) fn get_preparable_peers(&self, peers: &[NodeId]) -> Vec<NodeId> {
         peers
             .iter()
             .filter_map(|pid| {
-                let idx = Self::pid_to_idx(*pid);
-                match self.promises_meta.get(idx).unwrap() {
+                let idx = self.idx(*pid);
+                match &self.promises_meta[idx] {
                     PromiseState::NotPromised => Some(*pid),
                     _ => None,
                 }
@@ -223,39 +255,43 @@ where
 
     pub fn set_latest_accept_meta(&mut self, pid: NodeId, idx: Option<usize>) {
         let meta = idx.map(|x| (self.n_leader, x));
-        self.latest_accept_meta[Self::pid_to_idx(pid)] = meta;
+        let pidx = self.idx(pid);
+        self.latest_accept_meta[pidx] = meta;
     }
 
     pub fn set_accepted_idx(&mut self, pid: NodeId, idx: usize) {
-        self.accepted_indexes[Self::pid_to_idx(pid)] = idx;
+        let pidx = self.idx(pid);
+        self.accepted_indexes[pidx] = idx;
     }
 
     pub fn get_latest_accept_meta(&self, pid: NodeId) -> Option<(Ballot, usize)> {
-        self.latest_accept_meta
-            .get(Self::pid_to_idx(pid))
-            .unwrap()
-            .as_ref()
-            .copied()
+        self.latest_accept_meta[self.idx(pid)]
     }
 
     pub fn get_decided_idx(&self, pid: NodeId) -> Option<usize> {
-        match self.promises_meta.get(Self::pid_to_idx(pid)).unwrap() {
+        let idx = self.idx(pid);
+        match &self.promises_meta[idx] {
             PromiseState::Promised(metadata) => Some(metadata.decided_idx),
             _ => None,
         }
     }
 
     pub fn get_accepted_idx(&self, pid: NodeId) -> usize {
-        *self.accepted_indexes.get(Self::pid_to_idx(pid)).unwrap()
+        self.accepted_indexes[self.idx(pid)]
     }
 
+    /// Returns true if a quorum of *promised* nodes have accepted up to `idx`.
     pub fn is_chosen(&self, idx: usize) -> bool {
-        let num_accepted = self
-            .accepted_indexes
-            .iter()
-            .filter(|la| **la >= idx)
-            .count();
-        self.quorum.is_accept_quorum(num_accepted)
+        let mut count = 0;
+        for (i, p) in self.promises_meta.iter().enumerate() {
+            if matches!(p, PromiseState::Promised(_)) && self.accepted_indexes[i] >= idx {
+                count += 1;
+                if self.quorum.is_accept_quorum(count) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -350,11 +386,6 @@ pub type TrimmedIndex = usize;
 pub type NodeId = u64;
 /// ID for an OmniPaxos configuration (i.e., the set of servers in an OmniPaxos cluster)
 pub type ConfigurationId = u32;
-
-/// Error message to display when there was an error reading to the storage implementation.
-pub const READ_ERROR_MSG: &str = "Error reading from storage.";
-/// Error message to display when there was an error writing to the storage implementation.
-pub const WRITE_ERROR_MSG: &str = "Error writing to storage.";
 
 /// Used for checking the ordering of message sequences in the accept phase
 #[derive(PartialEq, Eq)]
@@ -464,39 +495,79 @@ impl Quorum {
 /// The entries flushed due to an append operation
 pub(crate) struct AcceptedMetaData<T: Entry> {
     pub accepted_idx: usize,
-    #[cfg(not(feature = "unicache"))]
-    pub entries: Vec<T>,
-    #[cfg(feature = "unicache")]
-    pub entries: Vec<T::EncodeResult>,
+    pub entries: Arc<Vec<T>>,
 }
 
-#[cfg(not(feature = "unicache"))]
 #[cfg(test)]
 mod tests {
-    use super::*; // Import functions and types from this module
+    use super::*;
     use crate::storage::NoSnapshot;
+
+    type Value = ();
+
+    impl Entry for Value {
+        type Snapshot = NoSnapshot;
+    }
+
     #[test]
     fn preparable_peers_test() {
-        type Value = ();
-
-        impl Entry for Value {
-            type Snapshot = NoSnapshot;
-        }
-
-        let nodes = vec![6, 7, 8];
+        let self_pid = 5;
+        let peers = vec![6, 7, 8];
         let quorum = Quorum::Majority(2);
-        let max_pid = 8;
-        let leader_state =
-            LeaderState::<Value>::with(Ballot::with(1, 1, 1, max_pid), max_pid as usize, quorum);
-        let prep_peers = leader_state.get_preparable_peers(&nodes);
-        assert_eq!(prep_peers, nodes);
+        let leader_state = LeaderState::<Value>::with(
+            Ballot::with(1, 1, 1, self_pid),
+            &peers,
+            self_pid,
+            quorum,
+        );
+        let prep_peers = leader_state.get_preparable_peers(&peers);
+        assert_eq!(prep_peers, peers);
 
-        let nodes = vec![7, 1, 100, 4, 6];
+        let self_pid = 2;
+        let peers = vec![7, 1, 100, 4, 6];
         let quorum = Quorum::Majority(3);
-        let max_pid = 100;
-        let leader_state =
-            LeaderState::<Value>::with(Ballot::with(1, 1, 1, max_pid), max_pid as usize, quorum);
-        let prep_peers = leader_state.get_preparable_peers(&nodes);
-        assert_eq!(prep_peers, nodes);
+        let leader_state = LeaderState::<Value>::with(
+            Ballot::with(1, 1, 1, self_pid),
+            &peers,
+            self_pid,
+            quorum,
+        );
+        let prep_peers = leader_state.get_preparable_peers(&peers);
+        assert_eq!(prep_peers, peers);
+    }
+
+    #[test]
+    fn non_contiguous_pid_is_chosen() {
+        let self_pid = 3;
+        let peers = vec![7, 100];
+        let quorum = Quorum::Majority(2);
+        let mut ls = LeaderState::<Value>::with(
+            Ballot::with(1, 1, 1, self_pid),
+            &peers,
+            self_pid,
+            quorum,
+        );
+        // Self promised
+        let prom = crate::messages::sequence_paxos::Promise {
+            n: Ballot::with(1, 1, 1, self_pid),
+            n_accepted: Ballot::default(),
+            decided_idx: 0,
+            accepted_idx: 0,
+            log_sync: None,
+        };
+        ls.set_promise(prom, self_pid, true);
+        ls.set_accepted_idx(self_pid, 5);
+        // Node 7 promised
+        let prom7 = crate::messages::sequence_paxos::Promise {
+            n: Ballot::with(1, 1, 1, self_pid),
+            n_accepted: Ballot::default(),
+            decided_idx: 0,
+            accepted_idx: 0,
+            log_sync: None,
+        };
+        ls.set_promise(prom7, 7, true);
+        ls.set_accepted_idx(7, 5);
+        assert!(ls.is_chosen(5));
+        assert!(!ls.is_chosen(6));
     }
 }

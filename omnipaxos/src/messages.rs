@@ -16,6 +16,7 @@ pub mod sequence_paxos {
     #[cfg(feature = "serde")]
     use serde::{Deserialize, Serialize};
     use std::fmt::Debug;
+    use std::sync::Arc;
 
     /// Message sent by a follower on crash-recovery or dropped messages to request its leader to re-prepare them.
     #[derive(Copy, Clone, Debug)]
@@ -75,9 +76,6 @@ pub mod sequence_paxos {
         /// The log update which the follower applies to its log in order to sync
         /// with the leader.
         pub log_sync: LogSync<T>,
-        #[cfg(feature = "unicache")]
-        /// The UniCache of the leader
-        pub unicache: T::UniCache,
     }
 
     /// Message with entries to be replicated and the latest decided index sent by the leader in the accept phase.
@@ -93,12 +91,8 @@ pub mod sequence_paxos {
         pub seq_num: SequenceNumber,
         /// The decided index.
         pub decided_idx: usize,
-        #[cfg(not(feature = "unicache"))]
         /// Entries to be replicated.
-        pub entries: Vec<T>,
-        #[cfg(feature = "unicache")]
-        /// Entries to be replicated.
-        pub entries: Vec<T::EncodeResult>,
+        pub entries: Arc<Vec<T>>,
     }
 
     /// Message sent by follower to leader when entries has been accepted.

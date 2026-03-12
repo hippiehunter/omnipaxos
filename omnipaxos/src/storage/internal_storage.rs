@@ -5,12 +5,11 @@ use crate::{
     util::{AcceptedMetaData, IndexEntry, LogEntry, LogSync, SnapshottedEntry},
     CompactionErr,
 };
-#[cfg(feature = "unicache")]
-use crate::{unicache::*, util::NodeId};
 use std::{
     cmp::Ordering,
     marker::PhantomData,
     ops::{Bound, RangeBounds},
+    sync::Arc,
 };
 
 pub(crate) struct InternalStorageConfig {
@@ -34,60 +33,54 @@ where
     I: Storage<T>,
     T: Entry,
 {
-    pub(crate) fn with(
-        storage: I,
-        config: InternalStorageConfig,
-        #[cfg(feature = "unicache")] pid: NodeId,
-    ) -> Self {
+    pub(crate) async fn with(storage: I, config: InternalStorageConfig) -> Self {
         let mut internal_store = InternalStorage {
             storage,
-            state_cache: StateCache::new(
-                config,
-                #[cfg(feature = "unicache")]
-                pid,
-            ),
+            state_cache: StateCache::new(config),
             _t: Default::default(),
         };
-        internal_store.load_cache();
+        internal_store.load_cache().await;
         internal_store
     }
 
-    fn load_cache(&mut self) {
+    async fn load_cache(&mut self) {
         self.state_cache.promise = self
             .storage
             .get_promise()
+            .await
             .expect("Failed to load cache from storage.")
             .unwrap_or_default();
-        self.state_cache.decided_idx = self.storage.get_decided_idx().unwrap();
+        self.state_cache.decided_idx = self.storage.get_decided_idx().await.unwrap();
         self.state_cache.accepted_round = self
             .storage
             .get_accepted_round()
+            .await
             .unwrap()
             .unwrap_or_default();
-        self.state_cache.compacted_idx = self.storage.get_compacted_idx().unwrap();
-        self.state_cache.stopsign = self.storage.get_stopsign().unwrap();
+        self.state_cache.compacted_idx = self.storage.get_compacted_idx().await.unwrap();
+        self.state_cache.stopsign = self.storage.get_stopsign().await.unwrap();
         self.state_cache.accepted_idx =
-            self.storage.get_log_len().unwrap() + self.state_cache.compacted_idx;
+            self.storage.get_log_len().await.unwrap() + self.state_cache.compacted_idx;
         if self.state_cache.stopsign.is_some() {
             self.state_cache.accepted_idx += 1;
         }
     }
 
     /// Read all decided entries from `from_idx` in the log. Returns `None` if `from_idx` is out of bounds.
-    pub(crate) fn read_decided_suffix(
+    pub(crate) async fn read_decided_suffix(
         &self,
         from_idx: usize,
     ) -> StorageResult<Option<Vec<LogEntry<T>>>> {
         let decided_idx = self.get_decided_idx();
         if from_idx < decided_idx {
-            self.read(from_idx..decided_idx)
+            self.read(from_idx..decided_idx).await
         } else {
             Ok(None)
         }
     }
 
     /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.
-    pub(crate) fn read<R>(&self, r: R) -> StorageResult<Option<Vec<LogEntry<T>>>>
+    pub(crate) async fn read<R>(&self, r: R) -> StorageResult<Option<Vec<LogEntry<T>>>>
     where
         R: RangeBounds<usize>,
     {
@@ -109,7 +102,7 @@ where
         // use to_idx-1 when getting the entry type as to_idx is exclusive
         let to_type = match self.get_entry_type(to_idx - 1, compacted_idx, accepted_idx)? {
             Some(IndexEntry::Compacted) => {
-                return Ok(Some(vec![self.create_compacted_entry(compacted_idx)?]))
+                return Ok(Some(vec![self.create_compacted_entry(compacted_idx).await?]))
             }
             Some(from_type) => from_type,
             _ => return Ok(None),
@@ -120,26 +113,26 @@ where
         };
         match (from_type, to_type) {
             (IndexEntry::Entry, IndexEntry::Entry) => {
-                Ok(Some(self.create_read_log_entries(from_idx, to_idx)?))
+                Ok(Some(self.create_read_log_entries(from_idx, to_idx).await?))
             }
             (IndexEntry::Entry, IndexEntry::StopSign(ss)) => {
-                let mut entries = self.create_read_log_entries(from_idx, to_idx - 1)?;
+                let mut entries = self.create_read_log_entries(from_idx, to_idx - 1).await?;
                 entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));
                 Ok(Some(entries))
             }
             (IndexEntry::Compacted, IndexEntry::Entry) => {
                 let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);
-                let compacted = self.create_compacted_entry(compacted_idx)?;
+                let compacted = self.create_compacted_entry(compacted_idx).await?;
                 entries.push(compacted);
-                let mut e = self.create_read_log_entries(compacted_idx, to_idx)?;
+                let mut e = self.create_read_log_entries(compacted_idx, to_idx).await?;
                 entries.append(&mut e);
                 Ok(Some(entries))
             }
             (IndexEntry::Compacted, IndexEntry::StopSign(ss)) => {
                 let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);
-                let compacted = self.create_compacted_entry(compacted_idx)?;
+                let compacted = self.create_compacted_entry(compacted_idx).await?;
                 entries.push(compacted);
-                let mut e = self.create_read_log_entries(compacted_idx, to_idx - 1)?;
+                let mut e = self.create_read_log_entries(compacted_idx, to_idx - 1).await?;
                 entries.append(&mut e);
                 entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));
                 Ok(Some(entries))
@@ -150,9 +143,7 @@ where
                     self.stopsign_is_decided(),
                 )]))
             }
-            e => {
-                unimplemented!("{}", format!("Unexpected read combination: {:?}", e))
-            }
+            _ => Ok(None),
         }
     }
 
@@ -176,10 +167,10 @@ where
         }
     }
 
-    fn create_read_log_entries(&self, from: usize, to: usize) -> StorageResult<Vec<LogEntry<T>>> {
+    async fn create_read_log_entries(&self, from: usize, to: usize) -> StorageResult<Vec<LogEntry<T>>> {
         let decided_idx = self.get_decided_idx();
         let entries = self
-            .get_entries(from, to)?
+            .get_entries(from, to).await?
             .into_iter()
             .enumerate()
             .map(|(idx, e)| {
@@ -194,8 +185,8 @@ where
         Ok(entries)
     }
 
-    fn create_compacted_entry(&self, compacted_idx: usize) -> StorageResult<LogEntry<T>> {
-        self.storage.get_snapshot().map(|snap| match snap {
+    async fn create_compacted_entry(&self, compacted_idx: usize) -> StorageResult<LogEntry<T>> {
+        self.storage.get_snapshot().await.map(|snap| match snap {
             Some(s) => LogEntry::Snapshotted(SnapshottedEntry::with(compacted_idx, s)),
             None => LogEntry::Trimmed(compacted_idx),
         })
@@ -203,49 +194,47 @@ where
 
     // Append entry, if the batch size is reached, flush the batch and return the actual
     // accepted index (not including the batched entries)
-    pub(crate) fn append_entry_with_batching(
+    pub(crate) async fn append_entry_with_batching(
         &mut self,
         entry: T,
     ) -> StorageResult<Option<AcceptedMetaData<T>>> {
         let append_res = self.state_cache.append_entry(entry);
-        self.flush_if_full_batch(append_res)
+        self.flush_if_full_batch(append_res).await
     }
 
     // Append entries in batch, if the batch size is reached, flush the batch and return the
     // accepted index and the flushed entries. If the batch size is not reached, return None.
-    pub(crate) fn append_entries_with_batching(
+    pub(crate) async fn append_entries_with_batching(
         &mut self,
         entries: Vec<T>,
     ) -> StorageResult<Option<AcceptedMetaData<T>>> {
         let append_res = self.state_cache.append_entries(entries);
-        self.flush_if_full_batch(append_res)
+        self.flush_if_full_batch(append_res).await
     }
 
     // Flushes batched entries and appends a stopsign to the log. Returns the AcceptedMetaData
     // associated with any flushed entries if there were any.
-    pub(crate) fn append_stopsign(
+    pub(crate) async fn append_stopsign(
         &mut self,
         ss: StopSign,
     ) -> StorageResult<Option<AcceptedMetaData<T>>> {
         let append_res = self.state_cache.append_stopsign(ss.clone());
-        let accepted_entries_metadata = self.flush_if_full_batch(append_res)?;
-        self.storage.set_stopsign(Some(ss))?;
+        let accepted_entries_metadata = self.flush_if_full_batch(append_res).await?;
+        self.storage.set_stopsign(Some(ss)).await?;
         self.state_cache.accepted_idx += 1;
         Ok(accepted_entries_metadata)
     }
 
-    fn flush_if_full_batch(
+    async fn flush_if_full_batch(
         &mut self,
         append_res: Option<Vec<T>>,
     ) -> StorageResult<Option<AcceptedMetaData<T>>> {
         if let Some(flushed_entries) = append_res {
-            let accepted_idx = self.append_entries_without_batching(flushed_entries.clone())?;
+            let shared = Arc::new(flushed_entries);
+            let accepted_idx = self.append_entries_without_batching((*shared).clone()).await?;
             Ok(Some(AcceptedMetaData {
                 accepted_idx,
-                #[cfg(not(feature = "unicache"))]
-                entries: flushed_entries,
-                #[cfg(feature = "unicache")]
-                entries: self.state_cache.take_batched_processed(),
+                entries: shared,
             }))
         } else {
             Ok(None)
@@ -254,41 +243,25 @@ where
 
     // Append entries in batch, if the batch size is reached, flush the batch and return the
     // accepted index. If the batch size is not reached, return None.
-    pub(crate) fn append_entries_and_get_accepted_idx(
+    pub(crate) async fn append_entries_and_get_accepted_idx(
         &mut self,
         entries: Vec<T>,
     ) -> StorageResult<Option<usize>> {
         let append_res = self.state_cache.append_entries(entries);
         if let Some(flushed_entries) = append_res {
-            let accepted_idx = self.append_entries_without_batching(flushed_entries)?;
+            let accepted_idx = self.append_entries_without_batching(flushed_entries).await?;
             Ok(Some(accepted_idx))
         } else {
             Ok(None)
         }
     }
 
-    #[cfg(feature = "unicache")]
-    pub(crate) fn decode_entries(
-        &mut self,
-        encoded_entries: Vec<<T as Entry>::EncodeResult>,
-    ) -> Vec<T> {
-        encoded_entries
-            .into_iter()
-            .map(|x| self.state_cache.unicache.decode(x))
-            .collect()
-    }
-
-    pub(crate) fn flush_batch(&mut self) -> StorageResult<usize> {
-        #[cfg(feature = "unicache")]
-        {
-            // clear the processed batch
-            self.state_cache.batched_processed_by_leader.clear();
-        }
+    pub(crate) async fn flush_batch(&mut self) -> StorageResult<usize> {
         let flushed_entries = self.state_cache.take_batched_entries();
-        self.append_entries_without_batching(flushed_entries)
+        self.append_entries_without_batching(flushed_entries).await
     }
 
-    pub(crate) fn flush_batch_and_get_entries(
+    pub(crate) async fn flush_batch_and_get_entries(
         &mut self,
     ) -> StorageResult<Option<AcceptedMetaData<T>>> {
         let flushed_entries = if !self.state_cache.batched_entries.is_empty() {
@@ -296,28 +269,33 @@ where
         } else {
             None
         };
-        self.flush_if_full_batch(flushed_entries)
+        self.flush_if_full_batch(flushed_entries).await
     }
 
     // Append entries without batching, return the accepted index
-    pub(crate) fn append_entries_without_batching(
+    pub(crate) async fn append_entries_without_batching(
         &mut self,
         entries: Vec<T>,
     ) -> StorageResult<usize> {
         let num_new_entries = entries.len();
-        self.storage.append_entries(entries)?;
+        self.storage.append_entries(entries).await?;
         self.state_cache.accepted_idx += num_new_entries;
         Ok(self.state_cache.accepted_idx)
     }
 
-    pub(crate) fn sync_log(
+    pub(crate) async fn sync_log(
         &mut self,
         accepted_round: Ballot,
         decided_idx: usize,
         log_sync: Option<LogSync<T>>,
     ) -> StorageResult<usize> {
-        self.state_cache.accepted_round = accepted_round;
-        self.state_cache.decided_idx = decided_idx;
+        // Compute new cache values before writing to storage (fix B2: cache-before-write)
+        let new_accepted_round = accepted_round;
+        let new_decided_idx = decided_idx;
+        let mut new_compacted_idx = self.state_cache.compacted_idx;
+        let mut new_stopsign = self.state_cache.stopsign.clone();
+        let mut new_accepted_idx = self.state_cache.accepted_idx;
+
         let mut sync_txn: Vec<StorageOp<T>> = vec![
             StorageOp::SetAcceptedRound(accepted_round),
             StorageOp::SetDecidedIndex(decided_idx),
@@ -325,55 +303,61 @@ where
         if let Some(sync) = log_sync {
             match sync.decided_snapshot {
                 Some(SnapshotType::Complete(c)) => {
-                    self.state_cache.compacted_idx = sync.sync_idx;
+                    new_compacted_idx = sync.sync_idx;
                     sync_txn.push(StorageOp::Trim(sync.sync_idx));
                     sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));
                     sync_txn.push(StorageOp::SetSnapshot(Some(c)));
                 }
                 Some(SnapshotType::Delta(d)) => {
-                    let mut snapshot = self.create_decided_snapshot()?;
+                    let mut snapshot = self.create_decided_snapshot().await?;
                     snapshot.merge(d);
-                    self.state_cache.compacted_idx = sync.sync_idx;
+                    new_compacted_idx = sync.sync_idx;
                     sync_txn.push(StorageOp::Trim(sync.sync_idx));
                     sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));
                     sync_txn.push(StorageOp::SetSnapshot(Some(snapshot)));
                 }
                 None => (),
             }
-            self.state_cache.accepted_idx = sync.sync_idx + sync.suffix.len();
+            new_accepted_idx = sync.sync_idx + sync.suffix.len();
             sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix));
             match sync.stopsign {
                 Some(ss) => {
-                    self.state_cache.stopsign = Some(ss.clone());
-                    self.state_cache.accepted_idx += 1;
+                    new_stopsign = Some(ss.clone());
+                    new_accepted_idx += 1;
                     sync_txn.push(StorageOp::SetStopsign(Some(ss)));
                 }
-                None if self.state_cache.stopsign.is_some() => {
-                    self.state_cache.stopsign = None;
+                None if new_stopsign.is_some() => {
+                    new_stopsign = None;
                     sync_txn.push(StorageOp::SetStopsign(None));
                 }
                 None => (),
             }
         }
-        self.storage.write_atomically(sync_txn)?;
+        // Write atomically first, only update cache on success
+        self.storage.write_atomically(sync_txn).await?;
+        self.state_cache.accepted_round = new_accepted_round;
+        self.state_cache.decided_idx = new_decided_idx;
+        self.state_cache.compacted_idx = new_compacted_idx;
+        self.state_cache.stopsign = new_stopsign;
+        self.state_cache.accepted_idx = new_accepted_idx;
         Ok(self.state_cache.accepted_idx)
     }
 
-    fn create_decided_snapshot(&mut self) -> StorageResult<T::Snapshot> {
+    async fn create_decided_snapshot(&mut self) -> StorageResult<T::Snapshot> {
         let log_decided_idx = self.get_decided_idx_without_stopsign();
-        self.create_snapshot(log_decided_idx)
+        self.create_snapshot(log_decided_idx).await
     }
 
-    pub(crate) fn create_snapshot(&self, compact_idx: usize) -> StorageResult<T::Snapshot> {
+    pub(crate) async fn create_snapshot(&self, compact_idx: usize) -> StorageResult<T::Snapshot> {
         let current_compacted_idx = self.get_compacted_idx();
         if compact_idx < current_compacted_idx {
             Err(CompactionErr::TrimmedIndex(current_compacted_idx))?
         }
         let entries = self
             .storage
-            .get_entries(current_compacted_idx, compact_idx)?;
+            .get_entries(current_compacted_idx, compact_idx).await?;
         let delta = T::Snapshot::create(entries.as_slice());
-        match self.storage.get_snapshot()? {
+        match self.storage.get_snapshot().await? {
             Some(mut s) => {
                 s.merge(delta);
                 Ok(s)
@@ -386,7 +370,7 @@ where
     // returns the compacted idx of the created snapshot. If the range of entries contains entries
     // which have already been compacted a valid delta cannot be created, so creates a Complete
     // snapshot of the entire decided log instead.
-    pub(crate) fn create_diff_snapshot(
+    pub(crate) async fn create_diff_snapshot(
         &self,
         from_idx: usize,
     ) -> StorageResult<(Option<SnapshotType<T>>, usize)> {
@@ -396,14 +380,14 @@ where
             // Some entries in range are compacted, snapshot entire decided log
             if compacted_idx < log_decided_idx {
                 Some(SnapshotType::Complete(
-                    self.create_snapshot(log_decided_idx)?,
+                    self.create_snapshot(log_decided_idx).await?,
                 ))
             } else {
                 // Entire decided log already snapshotted
-                self.get_snapshot()?.map(|s| SnapshotType::Complete(s))
+                self.get_snapshot().await?.map(|s| SnapshotType::Complete(s))
             }
         } else {
-            let diff_entries = self.get_entries(from_idx, log_decided_idx)?;
+            let diff_entries = self.get_entries(from_idx, log_decided_idx).await?;
             Some(SnapshotType::Delta(T::Snapshot::create(
                 diff_entries.as_slice(),
             )))
@@ -411,7 +395,7 @@ where
         Ok((snapshot, log_decided_idx))
     }
 
-    pub(crate) fn try_trim(&mut self, idx: usize) -> StorageResult<()> {
+    pub(crate) async fn try_trim(&mut self, idx: usize) -> StorageResult<()> {
         let decided_idx = self.get_decided_idx();
         let log_decided_idx = self.get_decided_idx_without_stopsign();
         let new_compacted_idx = match idx.cmp(&decided_idx) {
@@ -423,13 +407,13 @@ where
             self.storage.write_atomically(vec![
                 StorageOp::Trim(new_compacted_idx),
                 StorageOp::SetCompactedIdx(new_compacted_idx),
-            ])?;
+            ]).await?;
             self.state_cache.compacted_idx = new_compacted_idx;
         }
         Ok(())
     }
 
-    pub(crate) fn try_snapshot(&mut self, snapshot_idx: Option<usize>) -> StorageResult<()> {
+    pub(crate) async fn try_snapshot(&mut self, snapshot_idx: Option<usize>) -> StorageResult<()> {
         let decided_idx = self.get_decided_idx();
         let log_decided_idx = self.get_decided_idx_without_stopsign();
         let new_compacted_idx = match snapshot_idx {
@@ -441,25 +425,88 @@ where
             None => log_decided_idx,
         };
         if new_compacted_idx > self.get_compacted_idx() {
-            let snapshot = self.create_snapshot(new_compacted_idx)?;
+            let snapshot = self.create_snapshot(new_compacted_idx).await?;
             self.storage.write_atomically(vec![
                 StorageOp::Trim(new_compacted_idx),
                 StorageOp::SetCompactedIdx(new_compacted_idx),
                 StorageOp::SetSnapshot(Some(snapshot)),
-            ])?;
+            ]).await?;
             self.state_cache.compacted_idx = new_compacted_idx;
         }
         Ok(())
     }
 
-    pub(crate) fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()> {
+    pub(crate) async fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()> {
         self.state_cache.promise = n_prom;
-        self.storage.set_promise(n_prom)
+        self.storage.set_promise(n_prom).await
     }
 
-    pub(crate) fn set_decided_idx(&mut self, idx: usize) -> StorageResult<()> {
+    /// Atomically flush batched entries and set promise (fix B1).
+    pub(crate) async fn flush_batch_and_set_promise(
+        &mut self,
+        n_prom: Ballot,
+    ) -> StorageResult<usize> {
+        let entries = self.state_cache.take_batched_entries();
+        let num_new = entries.len();
+        let mut ops = Vec::with_capacity(2);
+        if !entries.is_empty() {
+            ops.push(StorageOp::AppendEntries(entries));
+        }
+        ops.push(StorageOp::SetPromise(n_prom));
+        self.storage.write_atomically(ops).await?;
+        self.state_cache.accepted_idx += num_new;
+        self.state_cache.promise = n_prom;
+        Ok(self.state_cache.accepted_idx)
+    }
+
+    /// Atomically flush batched entries and set decided index (fix B3).
+    /// The decided_idx is clamped to the new accepted_idx after flushing.
+    pub(crate) async fn flush_batch_and_set_decided_idx(
+        &mut self,
+        decided_idx: usize,
+    ) -> StorageResult<usize> {
+        let entries = self.state_cache.take_batched_entries();
+        let num_new = entries.len();
+        let new_accepted_idx = self.state_cache.accepted_idx + num_new;
+        let clamped_decided_idx = decided_idx.min(new_accepted_idx);
+        let mut ops = Vec::with_capacity(2);
+        if !entries.is_empty() {
+            ops.push(StorageOp::AppendEntries(entries));
+        }
+        ops.push(StorageOp::SetDecidedIndex(clamped_decided_idx));
+        self.storage.write_atomically(ops).await?;
+        self.state_cache.accepted_idx = new_accepted_idx;
+        self.state_cache.decided_idx = clamped_decided_idx;
+        Ok(new_accepted_idx)
+    }
+
+    /// Atomically flush batched entries and set stopsign (fix B4).
+    pub(crate) async fn flush_batch_and_set_stopsign(
+        &mut self,
+        ss: Option<StopSign>,
+    ) -> StorageResult<usize> {
+        let entries = self.state_cache.take_batched_entries();
+        let num_new = entries.len();
+        let mut ops = Vec::with_capacity(2);
+        if !entries.is_empty() {
+            ops.push(StorageOp::AppendEntries(entries));
+        }
+        ops.push(StorageOp::SetStopsign(ss.clone()));
+        self.storage.write_atomically(ops).await?;
+        self.state_cache.accepted_idx += num_new;
+        // Update stopsign-related accepted_idx
+        if ss.is_some() && self.state_cache.stopsign.is_none() {
+            self.state_cache.accepted_idx += 1;
+        } else if ss.is_none() && self.state_cache.stopsign.is_some() {
+            self.state_cache.accepted_idx -= 1;
+        }
+        self.state_cache.stopsign = ss;
+        Ok(self.state_cache.accepted_idx)
+    }
+
+    pub(crate) async fn set_decided_idx(&mut self, idx: usize) -> StorageResult<()> {
         self.state_cache.decided_idx = idx;
-        self.storage.set_decided_idx(idx)
+        self.storage.set_decided_idx(idx).await
     }
 
     pub(crate) fn get_decided_idx(&self) -> usize {
@@ -477,8 +524,8 @@ where
         self.state_cache.accepted_round
     }
 
-    pub(crate) fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>> {
-        self.storage.get_entries(from, to)
+    pub(crate) async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>> {
+        self.storage.get_entries(from, to).await
     }
 
     /// The length of the replicated log, as if log was never compacted.
@@ -486,23 +533,12 @@ where
         self.state_cache.accepted_idx
     }
 
-    pub(crate) fn get_suffix(&self, from: usize) -> StorageResult<Vec<T>> {
-        self.storage.get_suffix(from)
+    pub(crate) async fn get_suffix(&self, from: usize) -> StorageResult<Vec<T>> {
+        self.storage.get_suffix(from).await
     }
 
     pub(crate) fn get_promise(&self) -> Ballot {
         self.state_cache.promise
-    }
-
-    pub(crate) fn set_stopsign(&mut self, ss: Option<StopSign>) -> StorageResult<usize> {
-        if ss.is_some() && self.state_cache.stopsign.is_none() {
-            self.state_cache.accepted_idx += 1;
-        } else if ss.is_none() && self.state_cache.stopsign.is_some() {
-            self.state_cache.accepted_idx -= 1;
-        }
-        self.state_cache.stopsign.clone_from(&ss);
-        self.storage.set_stopsign(ss)?;
-        Ok(self.state_cache.accepted_idx)
     }
 
     pub(crate) fn get_stopsign(&self) -> Option<StopSign> {
@@ -514,21 +550,12 @@ where
         self.state_cache.stopsign_is_decided()
     }
 
-    pub(crate) fn get_snapshot(&self) -> StorageResult<Option<T::Snapshot>> {
-        self.storage.get_snapshot()
+    pub(crate) async fn get_snapshot(&self) -> StorageResult<Option<T::Snapshot>> {
+        self.storage.get_snapshot().await
     }
 
     pub(crate) fn get_compacted_idx(&self) -> usize {
         self.state_cache.compacted_idx
     }
 
-    #[cfg(feature = "unicache")]
-    pub(crate) fn get_unicache(&self) -> T::UniCache {
-        self.state_cache.unicache.clone()
-    }
-
-    #[cfg(feature = "unicache")]
-    pub(crate) fn set_unicache(&mut self, unicache: T::UniCache) {
-        self.state_cache.unicache = unicache;
-    }
 }

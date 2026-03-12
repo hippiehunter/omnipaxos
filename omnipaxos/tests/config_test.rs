@@ -1,15 +1,20 @@
 #![cfg(feature = "toml_config")]
-pub mod utils;
 
 use omnipaxos::{util::FlexibleQuorum, OmniPaxosConfig};
-use omnipaxos_storage::memory_storage::MemoryStorage;
-use serial_test::serial;
-use utils::Value;
+use omnipaxos::storage::memory_storage::MemoryStorage;
+
+#[derive(Clone, Debug)]
+struct Value {
+    id: u64,
+}
+
+impl omnipaxos::storage::Entry for Value {
+    type Snapshot = omnipaxos::storage::NoSnapshot;
+}
 
 /// Tests that all the fields of OmniPaxosConfig can be deserialized
 /// from a TOML file.
 #[test]
-#[serial]
 fn config_all_fields_test() {
     let file_path = "tests/config/node1.toml";
     match OmniPaxosConfig::with_toml(file_path) {
@@ -38,7 +43,9 @@ fn config_all_fields_test() {
             assert_eq!(config.server_config.leader_priority, 2);
 
             // Make sure we pass asserts in build
-            config.build(MemoryStorage::<Value>::default()).unwrap();
+            smol::block_on(async {
+                config.build(MemoryStorage::<Value>::default()).await.unwrap();
+            });
         }
     }
 }

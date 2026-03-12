@@ -1,6 +1,6 @@
 use crate::{
     ballot_leader_election::{Ballot, BallotLeaderElection},
-    errors::{valid_config, ConfigError},
+    errors::{valid_config, ConfigError, OmniPaxosError},
     messages::Message,
     sequence_paxos::{Phase, SequencePaxos},
     storage::{Entry, StopSign, Storage},
@@ -8,7 +8,6 @@ use crate::{
         defaults::{BUFFER_SIZE, ELECTION_TIMEOUT, FLUSH_BATCH_TIMEOUT, RESEND_MESSAGE_TIMEOUT},
         ConfigurationId, FlexibleQuorum, LogEntry, LogicalClock, NodeId,
     },
-    utils::{ui, ui::ClusterState},
 };
 #[cfg(any(feature = "toml_config", feature = "serde"))]
 use serde::Deserialize;
@@ -58,16 +57,14 @@ impl OmniPaxosConfig {
     }
 
     /// Checks all configuration fields and returns the local OmniPaxos node if successful.
-    pub fn build<T, B>(self, storage: B) -> Result<OmniPaxos<T, B>, ConfigError>
+    pub async fn build<T, B>(self, storage: B) -> Result<OmniPaxos<T, B>, OmniPaxosError>
     where
         T: Entry,
         B: Storage<T>,
     {
         self.validate()?;
         // Use stored ballot as initial BLE leader
-        let recovered_leader = storage
-            .get_promise()
-            .expect("storage error while trying to read promise");
+        let recovered_leader = storage.get_promise().await?;
         Ok(OmniPaxos {
             ble: BallotLeaderElection::with(self.clone().into(), recovered_leader),
             election_clock: LogicalClock::with(self.server_config.election_tick_timeout),
@@ -75,7 +72,7 @@ impl OmniPaxosConfig {
                 self.server_config.resend_message_tick_timeout,
             ),
             flush_batch_clock: LogicalClock::with(self.server_config.flush_batch_tick_timeout),
-            seq_paxos: SequencePaxos::with(self.into(), storage),
+            seq_paxos: SequencePaxos::with(self.into(), storage).await?,
         })
     }
 }
@@ -122,21 +119,18 @@ impl ClusterConfig {
                 write_quorum_size >= 2 && write_quorum_size <= num_nodes,
                 "Write quorum must be in range 2 to # of nodes in the cluster"
             );
-            valid_config!(
-                read_quorum_size >= write_quorum_size,
-                "Read quorum size must be >= the write quorum size."
-            );
+            // No constraint that read >= write; the overlap constraint above is sufficient.
         }
         Ok(())
     }
 
     /// Checks all configuration fields and builds a local OmniPaxos node with settings for this
     /// node defined in `server_config` and using storage `with_storage`.
-    pub fn build_for_server<T, B>(
+    pub async fn build_for_server<T, B>(
         self,
         server_config: ServerConfig,
         with_storage: B,
-    ) -> Result<OmniPaxos<T, B>, ConfigError>
+    ) -> Result<OmniPaxos<T, B>, OmniPaxosError>
     where
         T: Entry,
         B: Storage<T>,
@@ -145,7 +139,7 @@ impl ClusterConfig {
             cluster_config: self,
             server_config,
         };
-        op_config.build(with_storage)
+        op_config.build(with_storage).await
     }
 }
 
@@ -242,20 +236,20 @@ where
     /// Initiates the trim process.
     /// # Arguments
     /// * `trim_index` - Deletes all entries up to [`trim_index`], if the [`trim_index`] is `None` then the minimum index accepted by **ALL** servers will be used as the [`trim_index`].
-    pub fn trim(&mut self, trim_index: Option<usize>) -> Result<(), CompactionErr> {
-        self.seq_paxos.trim(trim_index)
+    pub async fn trim(&mut self, trim_index: Option<usize>) -> Result<(), CompactionErr> {
+        self.seq_paxos.trim(trim_index).await
     }
 
     /// Trim the log and create a snapshot. ** Note: only up to the `decided_idx` can be snapshotted **
     /// # Arguments
     /// `compact_idx` - Snapshots all entries < [`compact_idx`], if the [`compact_idx`] is None then the decided index will be used.
     /// `local_only` - If `true`, only this server snapshots the log. If `false` all servers performs the snapshot.
-    pub fn snapshot(
+    pub async fn snapshot(
         &mut self,
         compact_idx: Option<usize>,
         local_only: bool,
     ) -> Result<(), CompactionErr> {
-        self.seq_paxos.snapshot(compact_idx, local_only)
+        self.seq_paxos.snapshot(compact_idx, local_only).await
     }
 
     /// Return the decided index. 0 means that no entry has been decided.
@@ -296,43 +290,33 @@ where
     }
 
     /// Read entry at index `idx` in the log. Returns `None` if `idx` is out of bounds.
-    pub fn read(&self, idx: usize) -> Option<LogEntry<T>> {
-        match self
-            .seq_paxos
-            .internal_storage
-            .read(idx..idx + 1)
-            .expect("storage error while trying to read log entries")
-        {
-            Some(mut v) => v.pop(),
-            None => None,
+    pub async fn read(&self, idx: usize) -> Result<Option<LogEntry<T>>, OmniPaxosError> {
+        match self.seq_paxos.internal_storage.read(idx..idx + 1).await? {
+            Some(mut v) => Ok(v.pop()),
+            None => Ok(None),
         }
     }
 
     /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.
-    pub fn read_entries<R>(&self, r: R) -> Option<Vec<LogEntry<T>>>
+    pub async fn read_entries<R>(&self, r: R) -> Result<Option<Vec<LogEntry<T>>>, OmniPaxosError>
     where
         R: RangeBounds<usize>,
     {
-        self.seq_paxos
-            .internal_storage
-            .read(r)
-            .expect("storage error while trying to read log entries")
+        Ok(self.seq_paxos.internal_storage.read(r).await?)
     }
 
     /// Read all decided entries starting at `from_idx` (inclusive) in the log. Returns `None` if `from_idx` is out of bounds.
-    pub fn read_decided_suffix(&self, from_idx: usize) -> Option<Vec<LogEntry<T>>> {
-        self.seq_paxos
-            .internal_storage
-            .read_decided_suffix(from_idx)
-            .expect("storage error while trying to read decided log suffix")
+    pub async fn read_decided_suffix(&self, from_idx: usize) -> Result<Option<Vec<LogEntry<T>>>, OmniPaxosError> {
+        Ok(self.seq_paxos.internal_storage.read_decided_suffix(from_idx).await?)
     }
 
     /// Handle an incoming message
-    pub fn handle_incoming(&mut self, m: Message<T>) {
+    pub async fn handle_incoming(&mut self, m: Message<T>) -> Result<(), OmniPaxosError> {
         match m {
-            Message::SequencePaxos(p) => self.seq_paxos.handle(p),
+            Message::SequencePaxos(p) => self.seq_paxos.handle(p).await?,
             Message::BLE(b) => self.ble.handle(b),
         }
+        Ok(())
     }
 
     /// Returns whether this Sequence Paxos has been reconfigured
@@ -341,15 +325,15 @@ where
     }
 
     /// Append an entry to the replicated log.
-    pub fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {
-        self.seq_paxos.append(entry)
+    pub async fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {
+        self.seq_paxos.append(entry).await
     }
 
     /// Propose a cluster reconfiguration. Returns an error if the current configuration has already been stopped
     /// by a previous reconfiguration request or if the `new_configuration` is invalid.
     /// `new_configuration` defines the cluster-wide configuration settings for the **next** cluster.
     /// `metadata` is optional data to commit alongside the reconfiguration.
-    pub fn reconfigure(
+    pub async fn reconfigure(
         &mut self,
         new_configuration: ClusterConfig,
         metadata: Option<Vec<u8>>,
@@ -361,7 +345,7 @@ where
                 metadata,
             ));
         }
-        self.seq_paxos.reconfigure(new_configuration, metadata)
+        self.seq_paxos.reconfigure(new_configuration, metadata).await
     }
 
     /// Handles re-establishing a connection to a previously disconnected peer.
@@ -373,26 +357,31 @@ where
     /// Increments the internal logical clock. This drives the processes for leader changes, resending dropped messages, and flushing batched log entries.
     /// Each of these is triggered every `election_tick_timeout`, `resend_message_tick_timeout`, and `flush_batch_tick_timeout` number of calls to this function
     /// (See how to configure these timeouts in `ServerConfig`).
-    pub fn tick(&mut self) {
+    pub async fn tick(&mut self) -> Result<(), OmniPaxosError> {
         if self.election_clock.tick_and_check_timeout() {
-            self.election_timeout();
+            self.election_timeout().await?;
         }
         if self.resend_message_clock.tick_and_check_timeout() {
             self.seq_paxos.resend_message_timeout();
         }
         if self.flush_batch_clock.tick_and_check_timeout() {
-            self.seq_paxos.flush_batch_timeout();
+            self.seq_paxos.flush_batch_timeout().await?;
         }
+        Ok(())
     }
 
     /// Manually attempt to become the leader by incrementing this instance's Ballot. Calling this
     /// function may not result in gainig leadership if other instances are competing for
     /// leadership with higher Ballots.
-    pub fn try_become_leader(&mut self) {
+    pub async fn try_become_leader(&mut self) -> Result<(), OmniPaxosError> {
         let mut my_ballot = self.ble.get_current_ballot();
         let promise = self.seq_paxos.get_promise();
         my_ballot.n = promise.n + 1;
-        self.seq_paxos.handle_leader(my_ballot);
+        // Sync BLE state so it's aware of the new ballot
+        self.ble.set_current_ballot(my_ballot);
+        self.ble.set_leader(my_ballot);
+        self.seq_paxos.handle_leader(my_ballot).await?;
+        Ok(())
     }
 
     /*** BLE calls ***/
@@ -405,28 +394,16 @@ where
     /// If the heartbeat of a leader is not received when election_timeout() is called, the server might attempt to become the leader.
     /// It is also used for the election process, where the server checks if it can become the leader.
     /// For instance if `election_timeout()` is called every 100ms, then if the leader fails, the servers will detect it after 100ms and elect a new server after another 100ms if possible.
-    fn election_timeout(&mut self) {
+    async fn election_timeout(&mut self) -> Result<(), OmniPaxosError> {
         if let Some(new_leader) = self
             .ble
             .hb_timeout(self.seq_paxos.get_state(), self.seq_paxos.get_promise())
         {
-            self.seq_paxos.handle_leader(new_leader);
+            self.seq_paxos.handle_leader(new_leader).await?;
         }
+        Ok(())
     }
 
-    /// Returns the current states of the OmniPaxos instance for OmniPaxos UI to display.
-    pub fn get_ui_states(&self) -> ui::OmniPaxosStates {
-        let mut cluster_state = ClusterState::from(self.seq_paxos.get_leader_state());
-        cluster_state.heartbeats = self.ble.get_ballots();
-
-        ui::OmniPaxosStates {
-            current_ballot: self.ble.get_current_ballot(),
-            current_leader: self.get_current_leader().map(|(leader, _)| leader),
-            decided_idx: self.get_decided_idx(),
-            heartbeats: self.ble.get_ballots(),
-            cluster_state,
-        }
-    }
 }
 
 /// An error indicating a failed proposal due to the current cluster configuration being already stopped
@@ -444,6 +421,31 @@ where
     /// Couldn't propose reconfiguration because of an invalid cluster config. Contains the config
     /// error and the failed, proposed cluster config and metadata.
     ConfigError(ConfigError, ClusterConfig, Option<Vec<u8>>),
+}
+
+impl<T: Entry> Display for ProposeErr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ProposeErr::PendingReconfigEntry(_) => {
+                write!(f, "proposal rejected: reconfiguration is pending")
+            }
+            ProposeErr::PendingReconfigConfig(_, _) => {
+                write!(f, "reconfiguration rejected: a reconfiguration is already pending")
+            }
+            ProposeErr::ConfigError(e, _, _) => {
+                write!(f, "reconfiguration rejected: {}", e)
+            }
+        }
+    }
+}
+
+impl<T: Entry> std::error::Error for ProposeErr<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ProposeErr::ConfigError(e, _, _) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 /// An error returning the proposal that was failed due to that the current configuration is stopped.

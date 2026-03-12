@@ -52,7 +52,8 @@ impl Ballot {
 
 impl Ord for Ballot {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.n, self.priority, self.pid).cmp(&(other.n, other.priority, other.pid))
+        (self.config_id, self.n, self.priority, self.pid)
+            .cmp(&(other.config_id, other.n, other.priority, other.pid))
     }
 }
 
@@ -264,11 +265,20 @@ impl BallotLeaderElection {
                 .quorum
                 .is_prepare_quorum(self.heartbeat_replies.len() + 1);
             if all_neighbors_unhappy && im_quorum_connected {
-                // We increment past our leader instead of max of unhappy ballots because we
-                // assume we have already checked leader for this round so they should be equal
-                self.current_ballot.n = self.leader.n + 1;
-                self.leader = self.current_ballot;
-                self.happy = true;
+                // Randomized backoff: stagger takeover attempts across nodes to prevent
+                // simultaneous leader elections. Use pid and hb_round as a deterministic
+                // seed so that higher-priority / lower-pid nodes attempt takeover sooner.
+                // The delay is in units of heartbeat rounds.
+                let backoff_hash = (self.pid as u32).wrapping_mul(7).wrapping_add(self.hb_round);
+                let delay_rounds = backoff_hash % (self.peers.len() as u32 + 1);
+                if delay_rounds == 0 {
+                    // We increment past our leader instead of max of unhappy ballots because we
+                    // assume we have already checked leader for this round so they should be equal
+                    self.current_ballot.n = self.leader.n + 1;
+                    self.leader = self.current_ballot;
+                    self.happy = true;
+                }
+                // else: wait for a future round (delay_rounds != 0 means skip this round)
             }
         }
     }
@@ -297,8 +307,12 @@ impl BallotLeaderElection {
         self.current_ballot
     }
 
-    pub(crate) fn get_ballots(&self) -> Vec<HeartbeatReply> {
-        self.prev_replies.clone()
+    pub(crate) fn set_current_ballot(&mut self, ballot: Ballot) {
+        self.current_ballot = ballot;
+    }
+
+    pub(crate) fn set_leader(&mut self, ballot: Ballot) {
+        self.leader = ballot;
     }
 }
 

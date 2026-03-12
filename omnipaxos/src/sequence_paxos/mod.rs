@@ -5,11 +5,9 @@ use crate::{
     messages::Message,
     storage::{
         internal_storage::{InternalStorage, InternalStorageConfig},
-        Entry, Snapshot, StopSign, Storage,
+        Entry, Snapshot, StopSign, Storage, StorageResult,
     },
-    util::{
-        FlexibleQuorum, LogSync, NodeId, Quorum, SequenceNumber, READ_ERROR_MSG, WRITE_ERROR_MSG,
-    },
+    util::{FlexibleQuorum, LogSync, NodeId, Quorum, SequenceNumber},
     ClusterConfig, CompactionErr, OmniPaxosConfig, ProposeErr,
 };
 #[cfg(feature = "logging")]
@@ -34,6 +32,7 @@ where
     buffered_proposals: Vec<T>,
     buffered_stopsign: Option<StopSign>,
     outgoing: Vec<Message<T>>,
+    buffer_size: usize,
     leader_state: LeaderState<T>,
     latest_accepted_meta: Option<(Ballot, usize)>,
     // Keeps track of sequence of accepts from leader where AcceptSync = 1
@@ -50,18 +49,13 @@ where
 {
     /*** User functions ***/
     /// Creates a Sequence Paxos replica.
-    pub(crate) fn with(config: SequencePaxosConfig, storage: B) -> Self {
+    pub(crate) async fn with(config: SequencePaxosConfig, storage: B) -> StorageResult<Self> {
         let pid = config.pid;
         let peers = config.peers;
         let num_nodes = &peers.len() + 1;
         let quorum = Quorum::with(config.flexible_quorum, num_nodes);
-        let max_peer_pid = peers.iter().max().unwrap();
-        let max_pid = *std::cmp::max(max_peer_pid, &pid) as usize;
         let mut outgoing = Vec::with_capacity(config.buffer_size);
-        let (state, leader) = match storage
-            .get_promise()
-            .expect("storage error while trying to read promise")
-        {
+        let (state, leader) = match storage.get_promise().await? {
             // if we recover a promise from storage then we must do failure recovery
             Some(b) => {
                 let state = (Role::Follower, Phase::Recover);
@@ -80,20 +74,17 @@ where
         let internal_storage_config = InternalStorageConfig {
             batch_size: config.batch_size,
         };
+        let leader_state = LeaderState::<T>::with(leader, &peers, pid, quorum);
         let mut paxos = SequencePaxos {
-            internal_storage: InternalStorage::with(
-                storage,
-                internal_storage_config,
-                #[cfg(feature = "unicache")]
-                pid,
-            ),
+            internal_storage: InternalStorage::with(storage, internal_storage_config).await,
             pid,
             peers,
             state,
             buffered_proposals: vec![],
             buffered_stopsign: None,
             outgoing,
-            leader_state: LeaderState::<T>::with(leader, max_pid, quorum),
+            buffer_size: config.buffer_size,
+            leader_state,
             latest_accepted_meta: None,
             current_seq_num: SequenceNumber::default(),
             cached_promise_message: None,
@@ -109,10 +100,9 @@ where
                 }
             },
         };
-        paxos
-            .internal_storage
-            .set_promise(leader)
-            .expect(WRITE_ERROR_MSG);
+        if leader != Ballot::default() {
+            paxos.internal_storage.set_promise(leader).await?;
+        }
         #[cfg(feature = "logging")]
         {
             info!(paxos.logger, "Paxos component pid: {} created!", pid);
@@ -124,7 +114,7 @@ where
                 }
             }
         }
-        paxos
+        Ok(paxos)
     }
 
     pub(crate) fn get_state(&self) -> &(Role, Phase) {
@@ -138,12 +128,12 @@ where
     /// Initiates the trim process.
     /// # Arguments
     /// * `trim_idx` - Deletes all entries up to [`trim_idx`], if the [`trim_idx`] is `None` then the minimum index accepted by **ALL** servers will be used as the [`trim_idx`].
-    pub(crate) fn trim(&mut self, trim_idx: Option<usize>) -> Result<(), CompactionErr> {
+    pub(crate) async fn trim(&mut self, trim_idx: Option<usize>) -> Result<(), CompactionErr> {
         match self.state {
             (Role::Leader, _) => {
                 let min_all_accepted_idx = self.leader_state.get_min_all_accepted_idx();
                 let trimmed_idx = match trim_idx {
-                    Some(idx) if idx <= *min_all_accepted_idx => idx,
+                    Some(idx) if idx <= min_all_accepted_idx => idx,
                     None => {
                         #[cfg(feature = "logging")]
                         trace!(
@@ -151,13 +141,13 @@ where
                             "No trim index provided, using min_las_idx: {:?}",
                             min_all_accepted_idx
                         );
-                        *min_all_accepted_idx
+                        min_all_accepted_idx
                     }
                     _ => {
-                        return Err(CompactionErr::NotAllDecided(*min_all_accepted_idx));
+                        return Err(CompactionErr::NotAllDecided(min_all_accepted_idx));
                     }
                 };
-                let result = self.internal_storage.try_trim(trimmed_idx);
+                let result = self.internal_storage.try_trim(trimmed_idx).await;
                 if result.is_ok() {
                     for pid in &self.peers {
                         let msg = PaxosMsg::Compaction(Compaction::Trim(trimmed_idx));
@@ -169,7 +159,7 @@ where
                     }
                 }
                 result.map_err(|e| {
-                    *e.downcast()
+                    *e.0.downcast()
                         .expect("storage error while trying to trim log")
                 })
             }
@@ -181,12 +171,12 @@ where
     /// # Arguments
     /// `idx` - Snapshots all entries with index < [`idx`], if the [`idx`] is None then the decided index will be used.
     /// `local_only` - If `true`, only this server snapshots the log. If `false` all servers performs the snapshot.
-    pub(crate) fn snapshot(
+    pub(crate) async fn snapshot(
         &mut self,
         idx: Option<usize>,
         local_only: bool,
     ) -> Result<(), CompactionErr> {
-        let result = self.internal_storage.try_snapshot(idx);
+        let result = self.internal_storage.try_snapshot(idx).await;
         if !local_only && result.is_ok() {
             // since it is decided, it is ok even for a follower to send this
             for pid in &self.peers {
@@ -199,7 +189,7 @@ where
             }
         }
         result.map_err(|e| {
-            *e.downcast()
+            *e.0.downcast()
                 .expect("storage error while trying to snapshot log")
         })
     }
@@ -214,14 +204,14 @@ where
         self.internal_storage.get_compacted_idx()
     }
 
-    fn handle_compaction(&mut self, c: Compaction) {
+    async fn handle_compaction(&mut self, c: Compaction) {
         // try trimming and snapshotting forwarded compaction. Errors are ignored as that the data will still be kept.
         match c {
             Compaction::Trim(idx) => {
-                let _ = self.internal_storage.try_trim(idx);
+                let _ = self.internal_storage.try_trim(idx).await;
             }
             Compaction::Snapshot(idx) => {
-                let _ = self.snapshot(idx, true);
+                let _ = self.snapshot(idx, true).await;
             }
         }
     }
@@ -237,11 +227,11 @@ where
     }
 
     /// Flushes any batched log entries and sends their corresponding Accept or Accepted messages.
-    pub(crate) fn flush_batch_timeout(&mut self) {
+    pub(crate) async fn flush_batch_timeout(&mut self) -> StorageResult<()> {
         match self.state {
-            (Role::Leader, Phase::Accept) => self.flush_batch_leader(),
-            (Role::Follower, Phase::Accept) => self.flush_batch_follower(),
-            _ => (),
+            (Role::Leader, Phase::Accept) => self.flush_batch_leader().await,
+            (Role::Follower, Phase::Accept) => self.flush_batch_follower().await,
+            _ => Ok(()),
         }
     }
 
@@ -259,25 +249,50 @@ where
         self.latest_accepted_meta = None;
     }
 
+    /// Try to push a message to the outgoing buffer. Returns `true` if pushed,
+    /// `false` if the buffer is full and the message was dropped.
+    fn try_push_message(&mut self, msg: Message<T>) -> bool {
+        if self.outgoing.len() >= self.buffer_size {
+            #[cfg(feature = "logging")]
+            warn!(
+                self.logger,
+                "Outgoing message buffer full (cap {}), dropping message", self.buffer_size
+            );
+            false
+        } else {
+            self.outgoing.push(msg);
+            true
+        }
+    }
+
     /// Handle an incoming message.
-    pub(crate) fn handle(&mut self, m: PaxosMessage<T>) {
+    pub(crate) async fn handle(&mut self, m: PaxosMessage<T>) -> StorageResult<()> {
         match m.msg {
-            PaxosMsg::PrepareReq(prepreq) => self.handle_preparereq(prepreq, m.from),
-            PaxosMsg::Prepare(prep) => self.handle_prepare(prep, m.from),
+            PaxosMsg::PrepareReq(prepreq) => {
+                self.handle_preparereq(prepreq, m.from);
+                Ok(())
+            }
+            PaxosMsg::Prepare(prep) => self.handle_prepare(prep, m.from).await,
             PaxosMsg::Promise(prom) => match &self.state {
-                (Role::Leader, Phase::Prepare) => self.handle_promise_prepare(prom, m.from),
-                (Role::Leader, Phase::Accept) => self.handle_promise_accept(prom, m.from),
-                _ => {}
+                (Role::Leader, Phase::Prepare) => self.handle_promise_prepare(prom, m.from).await,
+                (Role::Leader, Phase::Accept) => self.handle_promise_accept(prom, m.from).await,
+                _ => Ok(()),
             },
-            PaxosMsg::AcceptSync(acc_sync) => self.handle_acceptsync(acc_sync, m.from),
-            PaxosMsg::AcceptDecide(acc) => self.handle_acceptdecide(acc),
-            PaxosMsg::NotAccepted(not_acc) => self.handle_notaccepted(not_acc, m.from),
-            PaxosMsg::Accepted(accepted) => self.handle_accepted(accepted, m.from),
-            PaxosMsg::Decide(d) => self.handle_decide(d),
-            PaxosMsg::ProposalForward(proposals) => self.handle_forwarded_proposal(proposals),
-            PaxosMsg::Compaction(c) => self.handle_compaction(c),
-            PaxosMsg::AcceptStopSign(acc_ss) => self.handle_accept_stopsign(acc_ss),
-            PaxosMsg::ForwardStopSign(f_ss) => self.handle_forwarded_stopsign(f_ss),
+            PaxosMsg::AcceptSync(acc_sync) => self.handle_acceptsync(acc_sync, m.from).await,
+            PaxosMsg::AcceptDecide(acc) => self.handle_acceptdecide(acc).await,
+            PaxosMsg::NotAccepted(not_acc) => {
+                self.handle_notaccepted(not_acc, m.from);
+                Ok(())
+            }
+            PaxosMsg::Accepted(accepted) => self.handle_accepted(accepted, m.from).await,
+            PaxosMsg::Decide(d) => self.handle_decide(d).await,
+            PaxosMsg::ProposalForward(proposals) => self.handle_forwarded_proposal(proposals).await,
+            PaxosMsg::Compaction(c) => {
+                self.handle_compaction(c).await;
+                Ok(())
+            }
+            PaxosMsg::AcceptStopSign(acc_ss) => self.handle_accept_stopsign(acc_ss).await,
+            PaxosMsg::ForwardStopSign(f_ss) => self.handle_forwarded_stopsign(f_ss).await,
         }
     }
 
@@ -295,11 +310,13 @@ where
     }
 
     /// Append an entry to the replicated log.
-    pub(crate) fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {
+    pub(crate) async fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {
         if self.accepted_reconfiguration() {
             Err(ProposeErr::PendingReconfigEntry(entry))
         } else {
-            self.propose_entry(entry);
+            // Storage errors in the propose path are not recoverable through ProposeErr.
+            // If storage fails here, subsequent handle_incoming/tick calls will surface the error.
+            let _ = self.propose_entry(entry).await;
             Ok(())
         }
     }
@@ -307,7 +324,7 @@ where
     /// Propose a reconfiguration. Returns an error if already stopped or `new_config` is invalid.
     /// `new_config` defines the cluster-wide configuration settings for the next cluster.
     /// `metadata` is optional data to commit alongside the reconfiguration.
-    pub(crate) fn reconfigure(
+    pub(crate) async fn reconfigure(
         &mut self,
         new_config: ClusterConfig,
         metadata: Option<Vec<u8>>,
@@ -323,7 +340,10 @@ where
         let ss = StopSign::with(new_config, metadata);
         match self.state {
             (Role::Leader, Phase::Prepare) => self.buffered_stopsign = Some(ss),
-            (Role::Leader, Phase::Accept) => self.accept_stopsign_leader(ss),
+            (Role::Leader, Phase::Accept) => {
+                // Storage errors in the reconfigure path are not recoverable through ProposeErr.
+                let _ = self.accept_stopsign_leader(ss).await;
+            }
             _ => self.forward_stopsign(ss),
         }
         Ok(())
@@ -338,29 +358,37 @@ where
     pub(crate) fn reconnected(&mut self, pid: NodeId) {
         if pid == self.pid {
             return;
-        } else if pid == self.get_current_leader() {
-            self.state = (Role::Follower, Phase::Recover);
         }
-        let prepreq = PrepareReq {
-            n: self.get_promise(),
-        };
-        self.outgoing.push(Message::SequencePaxos(PaxosMessage {
-            from: self.pid,
-            to: pid,
-            msg: PaxosMsg::PrepareReq(prepreq),
-        }));
+        let leader = self.get_current_leader();
+        if pid == leader || leader == 0 {
+            // Reconnected to the leader or no leader known — request re-prepare
+            if pid == leader {
+                self.state = (Role::Follower, Phase::Recover);
+            }
+            let prepreq = PrepareReq {
+                n: self.get_promise(),
+            };
+            self.try_push_message(Message::SequencePaxos(PaxosMessage {
+                from: self.pid,
+                to: pid,
+                msg: PaxosMsg::PrepareReq(prepreq),
+            }));
+        }
+        // If pid is an arbitrary follower, don't send PrepareReq
     }
 
-    fn propose_entry(&mut self, entry: T) {
+    async fn propose_entry(&mut self, entry: T) -> StorageResult<()> {
         match self.state {
-            (Role::Leader, Phase::Prepare) => self.buffered_proposals.push(entry),
-            (Role::Leader, Phase::Accept) => self.accept_entry_leader(entry),
-            _ => self.forward_proposals(vec![entry]),
+            (Role::Leader, Phase::Prepare) => {
+                self.buffered_proposals.push(entry);
+                Ok(())
+            }
+            (Role::Leader, Phase::Accept) => self.accept_entry_leader(entry).await,
+            _ => {
+                self.forward_proposals(vec![entry]);
+                Ok(())
+            }
         }
-    }
-
-    pub(crate) fn get_leader_state(&self) -> &LeaderState<T> {
-        &self.leader_state
     }
 
     pub(crate) fn forward_proposals(&mut self, mut entries: Vec<T>) {
@@ -372,7 +400,7 @@ where
                 to: leader,
                 msg: pf,
             });
-            self.outgoing.push(msg);
+            self.try_push_message(msg);
         } else {
             self.buffered_proposals.append(&mut entries);
         }
@@ -389,7 +417,7 @@ where
                 to: leader,
                 msg: fs,
             });
-            self.outgoing.push(msg);
+            self.try_push_message(msg);
         } else if self.buffered_stopsign.as_mut().is_none() {
             self.buffered_stopsign = Some(ss);
         }
@@ -397,11 +425,11 @@ where
     /// Returns `LogSync`, a struct to help other servers synchronize their log to correspond to the
     /// current state of our own log. The `common_prefix_idx` marks where in the log the other server
     /// needs to be sync from.
-    fn create_log_sync(
+    async fn create_log_sync(
         &self,
         common_prefix_idx: usize,
         other_logs_decided_idx: usize,
-    ) -> LogSync<T> {
+    ) -> StorageResult<LogSync<T>> {
         let decided_idx = self.internal_storage.get_decided_idx();
         let (decided_snapshot, suffix, sync_idx) =
             if T::Snapshot::use_snapshots() && decided_idx > common_prefix_idx {
@@ -409,26 +437,23 @@ where
                 // snapshots currently only work on decided entries.
                 let (delta_snapshot, compacted_idx) = self
                     .internal_storage
-                    .create_diff_snapshot(other_logs_decided_idx)
-                    .expect(READ_ERROR_MSG);
+                    .create_diff_snapshot(other_logs_decided_idx).await?;
                 let suffix = self
                     .internal_storage
-                    .get_suffix(decided_idx)
-                    .expect(READ_ERROR_MSG);
+                    .get_suffix(decided_idx).await?;
                 (delta_snapshot, suffix, compacted_idx)
             } else {
                 let suffix = self
                     .internal_storage
-                    .get_suffix(common_prefix_idx)
-                    .expect(READ_ERROR_MSG);
+                    .get_suffix(common_prefix_idx).await?;
                 (None, suffix, common_prefix_idx)
             };
-        LogSync {
+        Ok(LogSync {
             decided_snapshot,
             suffix,
             sync_idx,
             stopsign: self.internal_storage.get_stopsign(),
-        }
+        })
     }
 }
 

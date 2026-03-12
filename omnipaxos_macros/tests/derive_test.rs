@@ -1,7 +1,7 @@
 #[test]
 fn build_op_test() {
     use omnipaxos::{macros::Entry, ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig};
-    use omnipaxos_storage::memory_storage::MemoryStorage;
+    use omnipaxos::storage::memory_storage::MemoryStorage;
 
     #[derive(Clone, Debug, Entry)]
     struct TestEntry {
@@ -23,6 +23,8 @@ fn build_op_test() {
         server_config,
     };
 
-    let _omnipaxos: OmniPaxos<TestEntry, MemoryStorage<TestEntry>> =
-        config.build(MemoryStorage::default()).unwrap();
+    smol::block_on(async {
+        let _omnipaxos: OmniPaxos<TestEntry, MemoryStorage<TestEntry>> =
+            config.build(MemoryStorage::default()).await.unwrap();
+    });
 }
