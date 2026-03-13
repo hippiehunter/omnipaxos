@@ -55,16 +55,8 @@ where
         self.take_entries_if_batch_is_full()
     }
 
-    // Flushes batched entries and appends a stopsign to the log. Returns the flushed
-    // entries if there were any
-    pub(super) fn append_stopsign(&mut self, ss: StopSign) -> Option<Vec<T>> {
-        self.stopsign = Some(ss);
-        if self.batched_entries.is_empty() {
-            None
-        } else {
-            Some(self.take_batched_entries())
-        }
-    }
+    // Removed: append_stopsign moved to internal_storage to ensure
+    // the stopsign cache is only updated after successful storage write.
 
     // Return batched entries if the batch is full that need to be flushed in to storage.
     fn take_entries_if_batch_is_full(&mut self) -> Option<Vec<T>> {

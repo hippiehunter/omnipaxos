@@ -105,8 +105,11 @@ where
     }
 
     async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>> {
-        let from = from - self.trimmed_idx;
-        let to = to - self.trimmed_idx;
+        let from = from.saturating_sub(self.trimmed_idx);
+        let to = to.saturating_sub(self.trimmed_idx);
+        if from >= self.log.len() {
+            return Ok(vec![]);
+        }
         Ok(self
             .log
             .range(from..to.min(self.log.len()))

@@ -37,8 +37,7 @@ where
                 accepted_idx,
                 log_sync: None,
             };
-            let received_majority =
-                self.leader_state.set_promise(my_promise, self.pid, true);
+            let received_majority = self.leader_state.set_promise(my_promise, self.pid, true);
             /* initialise longest chosen sequence and update state */
             self.state = (Role::Leader, Phase::Prepare);
             if received_majority {
@@ -52,10 +51,11 @@ where
                     accepted_idx,
                 };
                 /* send prepare */
-                for pid in &self.peers {
-                    self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                for i in 0..self.peers.len() {
+                    let pid = self.peers[i];
+                    self.try_push_message(Message::SequencePaxos(PaxosMessage {
                         from: self.pid,
-                        to: *pid,
+                        to: pid,
                         msg: PaxosMsg::Prepare(prep),
                     }));
                 }
@@ -80,7 +80,10 @@ where
         }
     }
 
-    pub(crate) async fn handle_forwarded_proposal(&mut self, mut entries: Vec<T>) -> StorageResult<()> {
+    pub(crate) async fn handle_forwarded_proposal(
+        &mut self,
+        mut entries: Vec<T>,
+    ) -> StorageResult<()> {
         if !self.accepted_reconfiguration() {
             match self.state {
                 (Role::Leader, Phase::Prepare) => self.buffered_proposals.append(&mut entries),
@@ -110,7 +113,7 @@ where
             n_accepted: self.internal_storage.get_accepted_round(),
             accepted_idx: self.internal_storage.get_accepted_idx(),
         };
-        self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+        self.try_push_message(Message::SequencePaxos(PaxosMessage {
             from: self.pid,
             to,
             msg: PaxosMsg::Prepare(prep),
@@ -120,7 +123,8 @@ where
     pub(crate) async fn accept_entry_leader(&mut self, entry: T) -> StorageResult<()> {
         let accepted_metadata = self
             .internal_storage
-            .append_entry_with_batching(entry).await?;
+            .append_entry_with_batching(entry)
+            .await?;
         if let Some(metadata) = accepted_metadata {
             self.leader_state
                 .set_accepted_idx(self.pid, metadata.accepted_idx);
@@ -133,7 +137,8 @@ where
     pub(crate) async fn accept_entries_leader(&mut self, entries: Vec<T>) -> StorageResult<()> {
         let accepted_metadata = self
             .internal_storage
-            .append_entries_with_batching(entries).await?;
+            .append_entries_with_batching(entries)
+            .await?;
         if let Some(metadata) = accepted_metadata {
             self.leader_state
                 .set_accepted_idx(self.pid, metadata.accepted_idx);
@@ -144,9 +149,7 @@ where
     }
 
     pub(crate) async fn accept_stopsign_leader(&mut self, ss: StopSign) -> StorageResult<()> {
-        let accepted_metadata = self
-            .internal_storage
-            .append_stopsign(ss.clone()).await?;
+        let accepted_metadata = self.internal_storage.append_stopsign(ss.clone()).await?;
         if let Some(metadata) = accepted_metadata {
             self.send_acceptdecide(metadata);
         }
@@ -185,7 +188,9 @@ where
         } else {
             followers_decided_idx
         };
-        let log_sync = self.create_log_sync(followers_valid_entries_idx, followers_decided_idx).await?;
+        let log_sync = self
+            .create_log_sync(followers_valid_entries_idx, followers_decided_idx)
+            .await?;
         self.leader_state.increment_seq_num_session(to);
         let acc_sync = AcceptSync {
             n: current_n,
@@ -198,7 +203,7 @@ where
             to,
             msg: PaxosMsg::AcceptSync(acc_sync),
         });
-        self.outgoing.push(msg);
+        self.try_push_message(msg);
         Ok(())
     }
 
@@ -215,19 +220,22 @@ where
                 }
                 // Add new AcceptDecide message to follower
                 None => {
-                    self.leader_state
-                        .set_latest_accept_meta(pid, Some(self.outgoing.len()));
+                    let outgoing_idx = self.outgoing.len();
                     let acc = AcceptDecide {
                         n: self.leader_state.n_leader,
                         seq_num: self.leader_state.next_seq_num(pid),
                         decided_idx,
                         entries: Arc::clone(&accepted.entries),
                     };
-                    self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                    let pushed = self.try_push_message(Message::SequencePaxos(PaxosMessage {
                         from: self.pid,
                         to: pid,
                         msg: PaxosMsg::AcceptDecide(acc),
                     }));
+                    if pushed {
+                        self.leader_state
+                            .set_latest_accept_meta(pid, Some(outgoing_idx));
+                    }
                 }
             }
         }
@@ -243,7 +251,7 @@ where
             n: self.leader_state.n_leader,
             ss,
         });
-        self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+        self.try_push_message(Message::SequencePaxos(PaxosMessage {
             from: self.pid,
             to,
             msg: acc_ss,
@@ -260,7 +268,7 @@ where
             seq_num,
             decided_idx,
         };
-        self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+        self.try_push_message(Message::SequencePaxos(PaxosMessage {
             from: self.pid,
             to,
             msg: PaxosMsg::Decide(d),
@@ -272,13 +280,15 @@ where
         let decided_idx = self.leader_state.get_max_decided_idx();
         let mut new_accepted_idx = self
             .internal_storage
-            .sync_log(self.leader_state.n_leader, decided_idx, max_promise_sync).await?;
+            .sync_log(self.leader_state.n_leader, decided_idx, max_promise_sync)
+            .await?;
         if !self.accepted_reconfiguration() {
             if !self.buffered_proposals.is_empty() {
                 let entries = std::mem::take(&mut self.buffered_proposals);
                 new_accepted_idx = self
                     .internal_storage
-                    .append_entries_without_batching(entries).await?;
+                    .append_entries_without_batching(entries)
+                    .await?;
             }
             if let Some(ss) = self.buffered_stopsign.take() {
                 self.internal_storage.append_stopsign(ss).await?;
@@ -296,7 +306,11 @@ where
         Ok(())
     }
 
-    pub(crate) async fn handle_promise_prepare(&mut self, prom: Promise<T>, from: NodeId) -> StorageResult<()> {
+    pub(crate) async fn handle_promise_prepare(
+        &mut self,
+        prom: Promise<T>,
+        from: NodeId,
+    ) -> StorageResult<()> {
         #[cfg(feature = "logging")]
         debug!(
             self.logger,
@@ -311,7 +325,11 @@ where
         Ok(())
     }
 
-    pub(crate) async fn handle_promise_accept(&mut self, prom: Promise<T>, from: NodeId) -> StorageResult<()> {
+    pub(crate) async fn handle_promise_accept(
+        &mut self,
+        prom: Promise<T>,
+        from: NodeId,
+    ) -> StorageResult<()> {
         #[cfg(feature = "logging")]
         {
             let (r, p) = &self.state;
@@ -327,7 +345,11 @@ where
         Ok(())
     }
 
-    pub(crate) async fn handle_accepted(&mut self, accepted: Accepted, from: NodeId) -> StorageResult<()> {
+    pub(crate) async fn handle_accepted(
+        &mut self,
+        accepted: Accepted,
+        from: NodeId,
+    ) -> StorageResult<()> {
         #[cfg(feature = "logging")]
         trace!(
             self.logger,
@@ -344,8 +366,7 @@ where
             {
                 let decided_idx = accepted.accepted_idx;
                 self.internal_storage.set_decided_idx(decided_idx).await?;
-                let followers: Vec<NodeId> =
-                    self.leader_state.get_promised_followers().to_vec();
+                let followers: Vec<NodeId> = self.leader_state.get_promised_followers().to_vec();
                 for pid in followers {
                     let latest_accdec = self.get_latest_accdec_message(pid);
                     match latest_accdec {
@@ -431,15 +452,42 @@ where
     }
 
     pub(crate) async fn flush_batch_leader(&mut self) -> StorageResult<()> {
-        let accepted_metadata = self
-            .internal_storage
-            .flush_batch_and_get_entries().await?;
-        if let Some(metadata) = accepted_metadata {
-            self.leader_state
-                .set_accepted_idx(self.pid, metadata.accepted_idx);
-            self.send_acceptdecide(metadata);
-            self.try_decide_self_accepted().await?;
+        if self.internal_storage.get_batched_count() == 0 {
+            return Ok(());
         }
-        Ok(())
+        let projected_accepted_idx =
+            self.internal_storage.get_accepted_idx() + self.internal_storage.get_batched_count();
+        // Temporarily set projected accepted_idx so is_chosen() can see it.
+        let old_accepted_idx = self.leader_state.get_accepted_idx(self.pid);
+        self.leader_state
+            .set_accepted_idx(self.pid, projected_accepted_idx);
+        // If the leader alone forms a quorum (e.g. single-node), decided_idx
+        // advances immediately. Otherwise it stays at the current value and
+        // followers' Accepted messages will advance it via handle_accepted.
+        let decided_idx = if projected_accepted_idx > self.internal_storage.get_decided_idx()
+            && self.leader_state.is_chosen(projected_accepted_idx)
+        {
+            projected_accepted_idx
+        } else {
+            self.internal_storage.get_decided_idx()
+        };
+        let result = self
+            .internal_storage
+            .flush_batch_and_decide_with_entries(decided_idx)
+            .await;
+        match result {
+            Ok(accepted_metadata) => {
+                if let Some(metadata) = accepted_metadata {
+                    self.send_acceptdecide(metadata);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Revert leader_state on failure — entries were not persisted
+                self.leader_state
+                    .set_accepted_idx(self.pid, old_accepted_idx);
+                Err(e)
+            }
+        }
     }
 }

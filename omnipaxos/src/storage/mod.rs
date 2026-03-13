@@ -4,8 +4,8 @@ pub mod memory_storage;
 mod state_cache;
 
 use super::ballot_leader_election::Ballot;
-use crate::ClusterConfig;
 pub use crate::errors::StorageError;
+use crate::ClusterConfig;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;

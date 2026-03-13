@@ -1,6 +1,6 @@
 use crate::{
     ballot_leader_election::{Ballot, BallotLeaderElection},
-    errors::{valid_config, ConfigError, OmniPaxosError},
+    errors::{valid_config, ConfigError, OmniPaxosError, StorageError},
     messages::Message,
     sequence_paxos::{Phase, SequencePaxos},
     storage::{Entry, StopSign, Storage},
@@ -306,8 +306,15 @@ where
     }
 
     /// Read all decided entries starting at `from_idx` (inclusive) in the log. Returns `None` if `from_idx` is out of bounds.
-    pub async fn read_decided_suffix(&self, from_idx: usize) -> Result<Option<Vec<LogEntry<T>>>, OmniPaxosError> {
-        Ok(self.seq_paxos.internal_storage.read_decided_suffix(from_idx).await?)
+    pub async fn read_decided_suffix(
+        &self,
+        from_idx: usize,
+    ) -> Result<Option<Vec<LogEntry<T>>>, OmniPaxosError> {
+        Ok(self
+            .seq_paxos
+            .internal_storage
+            .read_decided_suffix(from_idx)
+            .await?)
     }
 
     /// Handle an incoming message
@@ -345,7 +352,9 @@ where
                 metadata,
             ));
         }
-        self.seq_paxos.reconfigure(new_configuration, metadata).await
+        self.seq_paxos
+            .reconfigure(new_configuration, metadata)
+            .await
     }
 
     /// Handles re-establishing a connection to a previously disconnected peer.
@@ -384,6 +393,11 @@ where
         Ok(())
     }
 
+    /// Returns the total number of outgoing messages that were dropped due to buffer overflow.
+    pub fn get_dropped_message_count(&self) -> u64 {
+        self.seq_paxos.get_dropped_message_count()
+    }
+
     /*** BLE calls ***/
     /// Update the custom priority used in the Ballot for this server. Note that changing the
     /// priority triggers a leader re-election.
@@ -403,7 +417,6 @@ where
         }
         Ok(())
     }
-
 }
 
 /// An error indicating a failed proposal due to the current cluster configuration being already stopped
@@ -421,6 +434,8 @@ where
     /// Couldn't propose reconfiguration because of an invalid cluster config. Contains the config
     /// error and the failed, proposed cluster config and metadata.
     ConfigError(ConfigError, ClusterConfig, Option<Vec<u8>>),
+    /// Storage backend error during proposal. The entry may not have been persisted.
+    StorageErr(StorageError),
 }
 
 impl<T: Entry> Display for ProposeErr<T> {
@@ -430,10 +445,16 @@ impl<T: Entry> Display for ProposeErr<T> {
                 write!(f, "proposal rejected: reconfiguration is pending")
             }
             ProposeErr::PendingReconfigConfig(_, _) => {
-                write!(f, "reconfiguration rejected: a reconfiguration is already pending")
+                write!(
+                    f,
+                    "reconfiguration rejected: a reconfiguration is already pending"
+                )
             }
             ProposeErr::ConfigError(e, _, _) => {
                 write!(f, "reconfiguration rejected: {}", e)
+            }
+            ProposeErr::StorageErr(e) => {
+                write!(f, "storage error during proposal: {}", e)
             }
         }
     }
@@ -443,13 +464,14 @@ impl<T: Entry> std::error::Error for ProposeErr<T> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ProposeErr::ConfigError(e, _, _) => Some(e),
+            ProposeErr::StorageErr(e) => Some(e),
             _ => None,
         }
     }
 }
 
 /// An error returning the proposal that was failed due to that the current configuration is stopped.
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub enum CompactionErr {
     /// Snapshot was called with an index that is not decided yet. Returns the currently decided index.
     UndecidedIndex(usize),
@@ -459,11 +481,23 @@ pub enum CompactionErr {
     NotAllDecided(usize),
     /// Trim was called at a follower node. Trim must be called by the leader, which is the returned NodeId.
     NotCurrentLeader(NodeId),
+    /// A storage backend error occurred during the compaction operation.
+    StorageError(StorageError),
 }
 
-impl Error for CompactionErr {}
+impl Error for CompactionErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            CompactionErr::StorageError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 impl Display for CompactionErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Debug::fmt(self, f)
+        match self {
+            CompactionErr::StorageError(e) => write!(f, "storage error during compaction: {}", e),
+            other => Debug::fmt(other, f),
+        }
     }
 }

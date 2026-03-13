@@ -9,11 +9,11 @@ mod docs_integration_test {
     #![cfg(feature = "macros")]
     #![cfg(feature = "toml_config")]
 
+    use omnipaxos::storage::memory_storage::MemoryStorage;
     use omnipaxos::{
         messages::Message, storage::Snapshot, util::LogEntry, ClusterConfig, OmniPaxos,
         OmniPaxosConfig, ServerConfig,
     };
-    use omnipaxos::storage::memory_storage::MemoryStorage;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
@@ -79,8 +79,8 @@ mod docs_integration_test {
     // https://github.com/haraldng/omnipaxos/blob/master/docs/omnipaxos/index.md#creating-a-node
     async fn creating_a_node() -> OmniPaxos<KeyValue, MemoryStorage<KeyValue>> {
         // CODE_EXAMPLE
-        use omnipaxos::{ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig};
         use omnipaxos::storage::memory_storage::MemoryStorage;
+        use omnipaxos::{ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig};
 
         // configuration with id 1 and a cluster with 3 nodes
         let cluster_config = ClusterConfig {
@@ -173,7 +173,10 @@ mod docs_integration_test {
             key: String::from("a"),
             value: 123,
         };
-        omni_paxos.append(write_entry).await.expect("Failed to append");
+        omni_paxos
+            .append(write_entry)
+            .await
+            .expect("Failed to append");
         // END_CODE_EXAMPLE
     }
 
@@ -299,7 +302,8 @@ mod docs_integration_test {
         let my_pid = current_config.pid;
 
         let idx: usize = 2; // some index we last read from
-        let decided_entries: Option<Vec<LogEntry<KeyValue>>> = omni_paxos.read_decided_suffix(idx).await.unwrap();
+        let decided_entries: Option<Vec<LogEntry<KeyValue>>> =
+            omni_paxos.read_decided_suffix(idx).await.unwrap();
 
         if let Some(de) = decided_entries {
             for d in de {

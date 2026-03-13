@@ -33,37 +33,29 @@ where
     I: Storage<T>,
     T: Entry,
 {
-    pub(crate) async fn with(storage: I, config: InternalStorageConfig) -> Self {
+    pub(crate) async fn with(storage: I, config: InternalStorageConfig) -> StorageResult<Self> {
         let mut internal_store = InternalStorage {
             storage,
             state_cache: StateCache::new(config),
             _t: Default::default(),
         };
-        internal_store.load_cache().await;
-        internal_store
+        internal_store.load_cache().await?;
+        Ok(internal_store)
     }
 
-    async fn load_cache(&mut self) {
-        self.state_cache.promise = self
-            .storage
-            .get_promise()
-            .await
-            .expect("Failed to load cache from storage.")
-            .unwrap_or_default();
-        self.state_cache.decided_idx = self.storage.get_decided_idx().await.unwrap();
-        self.state_cache.accepted_round = self
-            .storage
-            .get_accepted_round()
-            .await
-            .unwrap()
-            .unwrap_or_default();
-        self.state_cache.compacted_idx = self.storage.get_compacted_idx().await.unwrap();
-        self.state_cache.stopsign = self.storage.get_stopsign().await.unwrap();
+    async fn load_cache(&mut self) -> StorageResult<()> {
+        self.state_cache.promise = self.storage.get_promise().await?.unwrap_or_default();
+        self.state_cache.decided_idx = self.storage.get_decided_idx().await?;
+        self.state_cache.accepted_round =
+            self.storage.get_accepted_round().await?.unwrap_or_default();
+        self.state_cache.compacted_idx = self.storage.get_compacted_idx().await?;
+        self.state_cache.stopsign = self.storage.get_stopsign().await?;
         self.state_cache.accepted_idx =
-            self.storage.get_log_len().await.unwrap() + self.state_cache.compacted_idx;
+            self.storage.get_log_len().await? + self.state_cache.compacted_idx;
         if self.state_cache.stopsign.is_some() {
             self.state_cache.accepted_idx += 1;
         }
+        Ok(())
     }
 
     /// Read all decided entries from `from_idx` in the log. Returns `None` if `from_idx` is out of bounds.
@@ -102,7 +94,9 @@ where
         // use to_idx-1 when getting the entry type as to_idx is exclusive
         let to_type = match self.get_entry_type(to_idx - 1, compacted_idx, accepted_idx)? {
             Some(IndexEntry::Compacted) => {
-                return Ok(Some(vec![self.create_compacted_entry(compacted_idx).await?]))
+                return Ok(Some(vec![
+                    self.create_compacted_entry(compacted_idx).await?,
+                ]))
             }
             Some(from_type) => from_type,
             _ => return Ok(None),
@@ -132,7 +126,9 @@ where
                 let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);
                 let compacted = self.create_compacted_entry(compacted_idx).await?;
                 entries.push(compacted);
-                let mut e = self.create_read_log_entries(compacted_idx, to_idx - 1).await?;
+                let mut e = self
+                    .create_read_log_entries(compacted_idx, to_idx - 1)
+                    .await?;
                 entries.append(&mut e);
                 entries.push(LogEntry::StopSign(ss, self.stopsign_is_decided()));
                 Ok(Some(entries))
@@ -167,10 +163,15 @@ where
         }
     }
 
-    async fn create_read_log_entries(&self, from: usize, to: usize) -> StorageResult<Vec<LogEntry<T>>> {
+    async fn create_read_log_entries(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> StorageResult<Vec<LogEntry<T>>> {
         let decided_idx = self.get_decided_idx();
         let entries = self
-            .get_entries(from, to).await?
+            .get_entries(from, to)
+            .await?
             .into_iter()
             .enumerate()
             .map(|(idx, e)| {
@@ -212,15 +213,35 @@ where
         self.flush_if_full_batch(append_res).await
     }
 
-    // Flushes batched entries and appends a stopsign to the log. Returns the AcceptedMetaData
-    // associated with any flushed entries if there were any.
+    // Flushes batched entries and appends a stopsign to the log atomically.
+    // Returns the AcceptedMetaData associated with any flushed entries if there were any.
     pub(crate) async fn append_stopsign(
         &mut self,
         ss: StopSign,
     ) -> StorageResult<Option<AcceptedMetaData<T>>> {
-        let append_res = self.state_cache.append_stopsign(ss.clone());
-        let accepted_entries_metadata = self.flush_if_full_batch(append_res).await?;
-        self.storage.set_stopsign(Some(ss)).await?;
+        let has_batched = !self.state_cache.batched_entries.is_empty();
+        let num_new = self.state_cache.batched_entries.len();
+        // Build atomic transaction: flush entries + set stopsign in one write
+        let mut ops = Vec::with_capacity(2);
+        if has_batched {
+            ops.push(StorageOp::AppendEntries(
+                self.state_cache.batched_entries.clone(),
+            ));
+        }
+        ops.push(StorageOp::SetStopsign(Some(ss.clone())));
+        self.storage.write_atomically(ops).await?;
+        // Only update cache after successful atomic write
+        let accepted_entries_metadata = if has_batched {
+            let entries = self.state_cache.take_batched_entries();
+            self.state_cache.accepted_idx += num_new;
+            Some(AcceptedMetaData {
+                accepted_idx: self.state_cache.accepted_idx,
+                entries: Arc::new(entries),
+            })
+        } else {
+            None
+        };
+        self.state_cache.stopsign = Some(ss);
         self.state_cache.accepted_idx += 1;
         Ok(accepted_entries_metadata)
     }
@@ -231,7 +252,9 @@ where
     ) -> StorageResult<Option<AcceptedMetaData<T>>> {
         if let Some(flushed_entries) = append_res {
             let shared = Arc::new(flushed_entries);
-            let accepted_idx = self.append_entries_without_batching((*shared).clone()).await?;
+            let accepted_idx = self
+                .append_entries_without_batching((*shared).clone())
+                .await?;
             Ok(Some(AcceptedMetaData {
                 accepted_idx,
                 entries: shared,
@@ -249,7 +272,9 @@ where
     ) -> StorageResult<Option<usize>> {
         let append_res = self.state_cache.append_entries(entries);
         if let Some(flushed_entries) = append_res {
-            let accepted_idx = self.append_entries_without_batching(flushed_entries).await?;
+            let accepted_idx = self
+                .append_entries_without_batching(flushed_entries)
+                .await?;
             Ok(Some(accepted_idx))
         } else {
             Ok(None)
@@ -257,10 +282,19 @@ where
     }
 
     pub(crate) async fn flush_batch(&mut self) -> StorageResult<usize> {
-        let flushed_entries = self.state_cache.take_batched_entries();
-        self.append_entries_without_batching(flushed_entries).await
+        if self.state_cache.batched_entries.is_empty() {
+            return Ok(self.state_cache.accepted_idx);
+        }
+        let entries = self.state_cache.batched_entries.clone();
+        let num_new = entries.len();
+        self.storage.append_entries(entries).await?;
+        // Only clear cache after successful write
+        self.state_cache.batched_entries.clear();
+        self.state_cache.accepted_idx += num_new;
+        Ok(self.state_cache.accepted_idx)
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn flush_batch_and_get_entries(
         &mut self,
     ) -> StorageResult<Option<AcceptedMetaData<T>>> {
@@ -355,7 +389,8 @@ where
         }
         let entries = self
             .storage
-            .get_entries(current_compacted_idx, compact_idx).await?;
+            .get_entries(current_compacted_idx, compact_idx)
+            .await?;
         let delta = T::Snapshot::create(entries.as_slice());
         match self.storage.get_snapshot().await? {
             Some(mut s) => {
@@ -384,7 +419,9 @@ where
                 ))
             } else {
                 // Entire decided log already snapshotted
-                self.get_snapshot().await?.map(|s| SnapshotType::Complete(s))
+                self.get_snapshot()
+                    .await?
+                    .map(|s| SnapshotType::Complete(s))
             }
         } else {
             let diff_entries = self.get_entries(from_idx, log_decided_idx).await?;
@@ -404,10 +441,12 @@ where
             Ordering::Greater => Err(CompactionErr::UndecidedIndex(decided_idx))?,
         };
         if new_compacted_idx > self.get_compacted_idx() {
-            self.storage.write_atomically(vec![
-                StorageOp::Trim(new_compacted_idx),
-                StorageOp::SetCompactedIdx(new_compacted_idx),
-            ]).await?;
+            self.storage
+                .write_atomically(vec![
+                    StorageOp::Trim(new_compacted_idx),
+                    StorageOp::SetCompactedIdx(new_compacted_idx),
+                ])
+                .await?;
             self.state_cache.compacted_idx = new_compacted_idx;
         }
         Ok(())
@@ -426,73 +465,120 @@ where
         };
         if new_compacted_idx > self.get_compacted_idx() {
             let snapshot = self.create_snapshot(new_compacted_idx).await?;
-            self.storage.write_atomically(vec![
-                StorageOp::Trim(new_compacted_idx),
-                StorageOp::SetCompactedIdx(new_compacted_idx),
-                StorageOp::SetSnapshot(Some(snapshot)),
-            ]).await?;
+            self.storage
+                .write_atomically(vec![
+                    StorageOp::Trim(new_compacted_idx),
+                    StorageOp::SetCompactedIdx(new_compacted_idx),
+                    StorageOp::SetSnapshot(Some(snapshot)),
+                ])
+                .await?;
             self.state_cache.compacted_idx = new_compacted_idx;
         }
         Ok(())
     }
 
     pub(crate) async fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()> {
+        self.storage.set_promise(n_prom).await?;
         self.state_cache.promise = n_prom;
-        self.storage.set_promise(n_prom).await
+        Ok(())
     }
 
-    /// Atomically flush batched entries and set promise (fix B1).
+    /// Atomically flush batched entries and set promise.
     pub(crate) async fn flush_batch_and_set_promise(
         &mut self,
         n_prom: Ballot,
     ) -> StorageResult<usize> {
-        let entries = self.state_cache.take_batched_entries();
-        let num_new = entries.len();
+        let num_new = self.state_cache.batched_entries.len();
         let mut ops = Vec::with_capacity(2);
-        if !entries.is_empty() {
-            ops.push(StorageOp::AppendEntries(entries));
+        if num_new > 0 {
+            ops.push(StorageOp::AppendEntries(
+                self.state_cache.batched_entries.clone(),
+            ));
         }
         ops.push(StorageOp::SetPromise(n_prom));
         self.storage.write_atomically(ops).await?;
+        // Only clear cache after successful write
+        if num_new > 0 {
+            self.state_cache.batched_entries.clear();
+        }
         self.state_cache.accepted_idx += num_new;
         self.state_cache.promise = n_prom;
         Ok(self.state_cache.accepted_idx)
     }
 
-    /// Atomically flush batched entries and set decided index (fix B3).
+    /// Atomically flush batched entries and set decided index.
     /// The decided_idx is clamped to the new accepted_idx after flushing.
     pub(crate) async fn flush_batch_and_set_decided_idx(
         &mut self,
         decided_idx: usize,
     ) -> StorageResult<usize> {
-        let entries = self.state_cache.take_batched_entries();
-        let num_new = entries.len();
+        let num_new = self.state_cache.batched_entries.len();
         let new_accepted_idx = self.state_cache.accepted_idx + num_new;
         let clamped_decided_idx = decided_idx.min(new_accepted_idx);
         let mut ops = Vec::with_capacity(2);
-        if !entries.is_empty() {
-            ops.push(StorageOp::AppendEntries(entries));
+        if num_new > 0 {
+            ops.push(StorageOp::AppendEntries(
+                self.state_cache.batched_entries.clone(),
+            ));
         }
         ops.push(StorageOp::SetDecidedIndex(clamped_decided_idx));
         self.storage.write_atomically(ops).await?;
+        // Only clear cache after successful write
+        if num_new > 0 {
+            self.state_cache.batched_entries.clear();
+        }
         self.state_cache.accepted_idx = new_accepted_idx;
         self.state_cache.decided_idx = clamped_decided_idx;
         Ok(new_accepted_idx)
     }
 
-    /// Atomically flush batched entries and set stopsign (fix B4).
+    /// Atomically flush batched entries and set decided index, returning the
+    /// flushed entries as AcceptedMetaData for sending AcceptDecide messages.
+    /// Returns None if there are no batched entries.
+    pub(crate) async fn flush_batch_and_decide_with_entries(
+        &mut self,
+        decided_idx: usize,
+    ) -> StorageResult<Option<AcceptedMetaData<T>>> {
+        if self.state_cache.batched_entries.is_empty() {
+            return Ok(None);
+        }
+        let entries_for_op = self.state_cache.batched_entries.clone();
+        let num_new = entries_for_op.len();
+        let new_accepted_idx = self.state_cache.accepted_idx + num_new;
+        let clamped_decided_idx = decided_idx.min(new_accepted_idx);
+        let ops = vec![
+            StorageOp::AppendEntries(entries_for_op),
+            StorageOp::SetDecidedIndex(clamped_decided_idx),
+        ];
+        self.storage.write_atomically(ops).await?;
+        // Only take entries from cache after successful write
+        let entries = self.state_cache.take_batched_entries();
+        self.state_cache.accepted_idx = new_accepted_idx;
+        self.state_cache.decided_idx = clamped_decided_idx;
+        Ok(Some(AcceptedMetaData {
+            accepted_idx: new_accepted_idx,
+            entries: Arc::new(entries),
+        }))
+    }
+
+    /// Atomically flush batched entries and set stopsign.
     pub(crate) async fn flush_batch_and_set_stopsign(
         &mut self,
         ss: Option<StopSign>,
     ) -> StorageResult<usize> {
-        let entries = self.state_cache.take_batched_entries();
-        let num_new = entries.len();
+        let num_new = self.state_cache.batched_entries.len();
         let mut ops = Vec::with_capacity(2);
-        if !entries.is_empty() {
-            ops.push(StorageOp::AppendEntries(entries));
+        if num_new > 0 {
+            ops.push(StorageOp::AppendEntries(
+                self.state_cache.batched_entries.clone(),
+            ));
         }
         ops.push(StorageOp::SetStopsign(ss.clone()));
         self.storage.write_atomically(ops).await?;
+        // Only clear cache after successful write
+        if num_new > 0 {
+            self.state_cache.batched_entries.clear();
+        }
         self.state_cache.accepted_idx += num_new;
         // Update stopsign-related accepted_idx
         if ss.is_some() && self.state_cache.stopsign.is_none() {
@@ -505,8 +591,9 @@ where
     }
 
     pub(crate) async fn set_decided_idx(&mut self, idx: usize) -> StorageResult<()> {
+        self.storage.set_decided_idx(idx).await?;
         self.state_cache.decided_idx = idx;
-        self.storage.set_decided_idx(idx).await
+        Ok(())
     }
 
     pub(crate) fn get_decided_idx(&self) -> usize {
@@ -550,6 +637,10 @@ where
         self.state_cache.stopsign_is_decided()
     }
 
+    pub(crate) fn get_batched_count(&self) -> usize {
+        self.state_cache.batched_entries.len()
+    }
+
     pub(crate) async fn get_snapshot(&self) -> StorageResult<Option<T::Snapshot>> {
         self.storage.get_snapshot().await
     }
@@ -557,5 +648,4 @@ where
     pub(crate) fn get_compacted_idx(&self) -> usize {
         self.state_cache.compacted_idx
     }
-
 }

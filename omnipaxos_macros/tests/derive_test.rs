@@ -1,7 +1,7 @@
 #[test]
 fn build_op_test() {
-    use omnipaxos::{macros::Entry, ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig};
     use omnipaxos::storage::memory_storage::MemoryStorage;
+    use omnipaxos::{macros::Entry, ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig};
 
     #[derive(Clone, Debug, Entry)]
     struct TestEntry {

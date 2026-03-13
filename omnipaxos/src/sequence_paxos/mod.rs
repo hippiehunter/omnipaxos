@@ -5,7 +5,7 @@ use crate::{
     messages::Message,
     storage::{
         internal_storage::{InternalStorage, InternalStorageConfig},
-        Entry, Snapshot, StopSign, Storage, StorageResult,
+        Entry, Snapshot, StopSign, Storage, StorageError, StorageResult,
     },
     util::{FlexibleQuorum, LogSync, NodeId, Quorum, SequenceNumber},
     ClusterConfig, CompactionErr, OmniPaxosConfig, ProposeErr,
@@ -38,6 +38,7 @@ where
     // Keeps track of sequence of accepts from leader where AcceptSync = 1
     current_seq_num: SequenceNumber,
     cached_promise_message: Option<Promise<T>>,
+    dropped_messages: u64,
     #[cfg(feature = "logging")]
     logger: Logger,
 }
@@ -82,7 +83,7 @@ where
         };
         let leader_state = LeaderState::<T>::with(leader, &peers, pid, quorum);
         let mut paxos = SequencePaxos {
-            internal_storage: InternalStorage::with(storage, internal_storage_config).await,
+            internal_storage: InternalStorage::with(storage, internal_storage_config).await?,
             pid,
             peers,
             state,
@@ -94,6 +95,7 @@ where
             latest_accepted_meta: None,
             current_seq_num: SequenceNumber::default(),
             cached_promise_message: None,
+            dropped_messages: 0,
             #[cfg(feature = "logging")]
             logger: {
                 if let Some(logger) = config.custom_logger {
@@ -155,18 +157,19 @@ where
                 };
                 let result = self.internal_storage.try_trim(trimmed_idx).await;
                 if result.is_ok() {
-                    for pid in &self.peers {
+                    for i in 0..self.peers.len() {
+                        let pid = self.peers[i];
                         let msg = PaxosMsg::Compaction(Compaction::Trim(trimmed_idx));
-                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                        self.try_push_message(Message::SequencePaxos(PaxosMessage {
                             from: self.pid,
-                            to: *pid,
+                            to: pid,
                             msg,
                         }));
                     }
                 }
-                result.map_err(|e| {
-                    *e.0.downcast()
-                        .expect("storage error while trying to trim log")
+                result.map_err(|e| match e.0.downcast::<CompactionErr>() {
+                    Ok(ce) => *ce,
+                    Err(other) => CompactionErr::StorageError(StorageError(other)),
                 })
             }
             _ => Err(CompactionErr::NotCurrentLeader(self.get_current_leader())),
@@ -185,18 +188,19 @@ where
         let result = self.internal_storage.try_snapshot(idx).await;
         if !local_only && result.is_ok() {
             // since it is decided, it is ok even for a follower to send this
-            for pid in &self.peers {
+            for i in 0..self.peers.len() {
+                let pid = self.peers[i];
                 let msg = PaxosMsg::Compaction(Compaction::Snapshot(idx));
-                self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                self.try_push_message(Message::SequencePaxos(PaxosMessage {
                     from: self.pid,
-                    to: *pid,
+                    to: pid,
                     msg,
                 }));
             }
         }
-        result.map_err(|e| {
-            *e.0.downcast()
-                .expect("storage error while trying to snapshot log")
+        result.map_err(|e| match e.0.downcast::<CompactionErr>() {
+            Ok(ce) => *ce,
+            Err(other) => CompactionErr::StorageError(StorageError(other)),
         })
     }
 
@@ -259,10 +263,13 @@ where
     /// `false` if the buffer is full and the message was dropped.
     fn try_push_message(&mut self, msg: Message<T>) -> bool {
         if self.outgoing.len() >= self.buffer_size {
+            self.dropped_messages += 1;
             #[cfg(feature = "logging")]
             warn!(
                 self.logger,
-                "Outgoing message buffer full (cap {}), dropping message", self.buffer_size
+                "Outgoing message buffer full (cap {}), dropping message (total dropped: {})",
+                self.buffer_size,
+                self.dropped_messages
             );
             false
         } else {
@@ -271,8 +278,21 @@ where
         }
     }
 
+    /// Returns the total number of messages dropped due to buffer overflow.
+    pub(crate) fn get_dropped_message_count(&self) -> u64 {
+        self.dropped_messages
+    }
+
+    /// Returns whether the given PID belongs to this cluster (self or a peer).
+    fn is_known_peer(&self, pid: NodeId) -> bool {
+        pid == self.pid || self.peers.contains(&pid)
+    }
+
     /// Handle an incoming message.
     pub(crate) async fn handle(&mut self, m: PaxosMessage<T>) -> StorageResult<()> {
+        if !self.is_known_peer(m.from) {
+            return Ok(());
+        }
         match m.msg {
             PaxosMsg::PrepareReq(prepreq) => {
                 self.handle_preparereq(prepreq, m.from);
@@ -320,9 +340,9 @@ where
         if self.accepted_reconfiguration() {
             Err(ProposeErr::PendingReconfigEntry(entry))
         } else {
-            // Storage errors in the propose path are not recoverable through ProposeErr.
-            // If storage fails here, subsequent handle_incoming/tick calls will surface the error.
-            let _ = self.propose_entry(entry).await;
+            self.propose_entry(entry)
+                .await
+                .map_err(|e| ProposeErr::StorageErr(e))?;
             Ok(())
         }
     }
@@ -347,8 +367,9 @@ where
         match self.state {
             (Role::Leader, Phase::Prepare) => self.buffered_stopsign = Some(ss),
             (Role::Leader, Phase::Accept) => {
-                // Storage errors in the reconfigure path are not recoverable through ProposeErr.
-                let _ = self.accept_stopsign_leader(ss).await;
+                self.accept_stopsign_leader(ss)
+                    .await
+                    .map_err(|e| ProposeErr::StorageErr(e))?;
             }
             _ => self.forward_stopsign(ss),
         }
@@ -443,15 +464,12 @@ where
                 // snapshots currently only work on decided entries.
                 let (delta_snapshot, compacted_idx) = self
                     .internal_storage
-                    .create_diff_snapshot(other_logs_decided_idx).await?;
-                let suffix = self
-                    .internal_storage
-                    .get_suffix(decided_idx).await?;
+                    .create_diff_snapshot(other_logs_decided_idx)
+                    .await?;
+                let suffix = self.internal_storage.get_suffix(decided_idx).await?;
                 (delta_snapshot, suffix, compacted_idx)
             } else {
-                let suffix = self
-                    .internal_storage
-                    .get_suffix(common_prefix_idx).await?;
+                let suffix = self.internal_storage.get_suffix(common_prefix_idx).await?;
                 (None, suffix, common_prefix_idx)
             };
         Ok(LogSync {

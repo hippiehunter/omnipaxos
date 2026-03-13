@@ -1,7 +1,7 @@
 #![cfg(feature = "toml_config")]
 
-use omnipaxos::{util::FlexibleQuorum, OmniPaxosConfig};
 use omnipaxos::storage::memory_storage::MemoryStorage;
+use omnipaxos::{util::FlexibleQuorum, OmniPaxosConfig};
 
 #[derive(Clone, Debug)]
 struct Value {
@@ -44,7 +44,10 @@ fn config_all_fields_test() {
 
             // Make sure we pass asserts in build
             smol::block_on(async {
-                config.build(MemoryStorage::<Value>::default()).await.unwrap();
+                config
+                    .build(MemoryStorage::<Value>::default())
+                    .await
+                    .unwrap();
             });
         }
     }

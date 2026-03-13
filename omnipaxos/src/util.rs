@@ -514,24 +514,16 @@ mod tests {
         let self_pid = 5;
         let peers = vec![6, 7, 8];
         let quorum = Quorum::Majority(2);
-        let leader_state = LeaderState::<Value>::with(
-            Ballot::with(1, 1, 1, self_pid),
-            &peers,
-            self_pid,
-            quorum,
-        );
+        let leader_state =
+            LeaderState::<Value>::with(Ballot::with(1, 1, 1, self_pid), &peers, self_pid, quorum);
         let prep_peers = leader_state.get_preparable_peers(&peers);
         assert_eq!(prep_peers, peers);
 
         let self_pid = 2;
         let peers = vec![7, 1, 100, 4, 6];
         let quorum = Quorum::Majority(3);
-        let leader_state = LeaderState::<Value>::with(
-            Ballot::with(1, 1, 1, self_pid),
-            &peers,
-            self_pid,
-            quorum,
-        );
+        let leader_state =
+            LeaderState::<Value>::with(Ballot::with(1, 1, 1, self_pid), &peers, self_pid, quorum);
         let prep_peers = leader_state.get_preparable_peers(&peers);
         assert_eq!(prep_peers, peers);
     }
@@ -541,12 +533,8 @@ mod tests {
         let self_pid = 3;
         let peers = vec![7, 100];
         let quorum = Quorum::Majority(2);
-        let mut ls = LeaderState::<Value>::with(
-            Ballot::with(1, 1, 1, self_pid),
-            &peers,
-            self_pid,
-            quorum,
-        );
+        let mut ls =
+            LeaderState::<Value>::with(Ballot::with(1, 1, 1, self_pid), &peers, self_pid, quorum);
         // Self promised
         let prom = crate::messages::sequence_paxos::Promise {
             n: Ballot::with(1, 1, 1, self_pid),

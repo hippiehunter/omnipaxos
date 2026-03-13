@@ -212,7 +212,11 @@ fn test_basic_replication() {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(ids.len(), num_entries as usize, "all entries should be decided");
+            assert_eq!(
+                ids.len(),
+                num_entries as usize,
+                "all entries should be decided"
+            );
             logs.push(ids);
         }
 
@@ -352,10 +356,7 @@ fn test_trim() {
         let entry = leader_node.read(1).await.unwrap();
         match entry {
             Some(LogEntry::Trimmed(_)) => {} // expected
-            other => panic!(
-                "expected Trimmed entry at index 1, got {:?}",
-                other
-            ),
+            other => panic!("expected Trimmed entry at index 1, got {:?}", other),
         }
     });
 }
@@ -406,10 +407,7 @@ fn test_snapshot() {
                     "snapshot map should not be empty"
                 );
             }
-            other => panic!(
-                "expected Snapshotted entry at index 1, got {:?}",
-                other
-            ),
+            other => panic!("expected Snapshotted entry at index 1, got {:?}", other),
         }
     });
 }

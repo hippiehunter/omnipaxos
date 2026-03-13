@@ -12,22 +12,35 @@ where
     B: Storage<T>,
 {
     /*** Follower ***/
-    pub(crate) async fn handle_prepare(&mut self, prep: Prepare, from: NodeId) -> StorageResult<()> {
+    pub(crate) async fn handle_prepare(
+        &mut self,
+        prep: Prepare,
+        from: NodeId,
+    ) -> StorageResult<()> {
         let old_promise = self.internal_storage.get_promise();
         if old_promise < prep.n || (old_promise == prep.n && self.state.1 == Phase::Recover) {
             // Atomically flush pending writes and set promise (fix B1)
-            let _ = self.internal_storage.flush_batch_and_set_promise(prep.n).await?;
+            let _ = self
+                .internal_storage
+                .flush_batch_and_set_promise(prep.n)
+                .await?;
             self.state = (Role::Follower, Phase::Prepare);
             self.current_seq_num = SequenceNumber::default();
             let na = self.internal_storage.get_accepted_round();
             let accepted_idx = self.internal_storage.get_accepted_idx();
             let log_sync = if na > prep.n_accepted {
                 // I'm more up to date: send leader what he is missing after his decided index.
-                Some(self.create_log_sync(prep.decided_idx, prep.decided_idx).await?)
+                Some(
+                    self.create_log_sync(prep.decided_idx, prep.decided_idx)
+                        .await?,
+                )
             } else if na == prep.n_accepted && accepted_idx > prep.accepted_idx {
                 // I'm more up to date and in same round: send leader what he is missing after his
                 // accepted index.
-                Some(self.create_log_sync(prep.accepted_idx, prep.decided_idx).await?)
+                Some(
+                    self.create_log_sync(prep.accepted_idx, prep.decided_idx)
+                        .await?,
+                )
             } else {
                 // I'm equally or less up to date
                 None
@@ -40,7 +53,7 @@ where
                 log_sync,
             };
             self.cached_promise_message = Some(promise.clone());
-            self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+            self.try_push_message(Message::SequencePaxos(PaxosMessage {
                 from: self.pid,
                 to: from,
                 msg: PaxosMsg::Promise(promise),
@@ -49,12 +62,17 @@ where
         Ok(())
     }
 
-    pub(crate) async fn handle_acceptsync(&mut self, accsync: AcceptSync<T>, from: NodeId) -> StorageResult<()> {
+    pub(crate) async fn handle_acceptsync(
+        &mut self,
+        accsync: AcceptSync<T>,
+        from: NodeId,
+    ) -> StorageResult<()> {
         if self.check_valid_ballot(accsync.n) && self.state == (Role::Follower, Phase::Prepare) {
             self.cached_promise_message = None;
             let new_accepted_idx = self
                 .internal_storage
-                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync)).await?;
+                .sync_log(accsync.n, accsync.decided_idx, Some(accsync.log_sync))
+                .await?;
             if self.internal_storage.get_stopsign().is_none() {
                 self.forward_buffered_proposals();
             }
@@ -65,12 +83,14 @@ where
             self.state = (Role::Follower, Phase::Accept);
             self.current_seq_num = accsync.seq_num;
             let cached_idx = self.outgoing.len();
-            self.latest_accepted_meta = Some((accsync.n, cached_idx));
-            self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+            let pushed = self.try_push_message(Message::SequencePaxos(PaxosMessage {
                 from: self.pid,
                 to: from,
                 msg: PaxosMsg::Accepted(accepted),
             }));
+            if pushed {
+                self.latest_accepted_meta = Some((accsync.n, cached_idx));
+            }
         }
         Ok(())
     }
@@ -82,7 +102,10 @@ where
         }
     }
 
-    pub(crate) async fn handle_acceptdecide(&mut self, acc_dec: AcceptDecide<T>) -> StorageResult<()> {
+    pub(crate) async fn handle_acceptdecide(
+        &mut self,
+        acc_dec: AcceptDecide<T>,
+    ) -> StorageResult<()> {
         if self.check_valid_ballot(acc_dec.n)
             && self.state == (Role::Follower, Phase::Accept)
             && self.handle_sequence_num(acc_dec.seq_num, acc_dec.n.pid) == MessageStatus::Expected
@@ -90,9 +113,11 @@ where
             let entries = Arc::try_unwrap(acc_dec.entries).unwrap_or_else(|arc| (*arc).clone());
             let mut new_accepted_idx = self
                 .internal_storage
-                .append_entries_and_get_accepted_idx(entries).await?;
-            let flushed_after_decide =
-                self.update_decided_idx_and_get_accepted_idx(acc_dec.decided_idx).await?;
+                .append_entries_and_get_accepted_idx(entries)
+                .await?;
+            let flushed_after_decide = self
+                .update_decided_idx_and_get_accepted_idx(acc_dec.decided_idx)
+                .await?;
             if flushed_after_decide.is_some() {
                 new_accepted_idx = flushed_after_decide;
             }
@@ -103,7 +128,10 @@ where
         Ok(())
     }
 
-    pub(crate) async fn handle_accept_stopsign(&mut self, acc_ss: AcceptStopSign) -> StorageResult<()> {
+    pub(crate) async fn handle_accept_stopsign(
+        &mut self,
+        acc_ss: AcceptStopSign,
+    ) -> StorageResult<()> {
         if self.check_valid_ballot(acc_ss.n)
             && self.state == (Role::Follower, Phase::Accept)
             && self.handle_sequence_num(acc_ss.seq_num, acc_ss.n.pid) == MessageStatus::Expected
@@ -111,7 +139,8 @@ where
             // Atomically flush entries and set stopsign (fix B4)
             let new_accepted_idx = self
                 .internal_storage
-                .flush_batch_and_set_stopsign(Some(acc_ss.ss)).await?;
+                .flush_batch_and_set_stopsign(Some(acc_ss.ss))
+                .await?;
             self.reply_accepted(acc_ss.n, new_accepted_idx);
         }
         Ok(())
@@ -122,7 +151,9 @@ where
             && self.state.1 == Phase::Accept
             && self.handle_sequence_num(dec.seq_num, dec.n.pid) == MessageStatus::Expected
         {
-            let new_accepted_idx = self.update_decided_idx_and_get_accepted_idx(dec.decided_idx).await?;
+            let new_accepted_idx = self
+                .update_decided_idx_and_get_accepted_idx(dec.decided_idx)
+                .await?;
             if let Some(idx) = new_accepted_idx {
                 self.reply_accepted(dec.n, idx);
             }
@@ -132,7 +163,10 @@ where
 
     /// To maintain decided index <= accepted index, batched entries may be flushed.
     /// Returns `Some(new_accepted_idx)` if entries are flushed, otherwise `None`.
-    async fn update_decided_idx_and_get_accepted_idx(&mut self, new_decided_idx: usize) -> StorageResult<Option<usize>> {
+    async fn update_decided_idx_and_get_accepted_idx(
+        &mut self,
+        new_decided_idx: usize,
+    ) -> StorageResult<Option<usize>> {
         if new_decided_idx <= self.internal_storage.get_decided_idx() {
             return Ok(None);
         }
@@ -141,11 +175,13 @@ where
             // Clamping to new accepted_idx is handled inside the method
             let new_accepted_idx = self
                 .internal_storage
-                .flush_batch_and_set_decided_idx(new_decided_idx).await?;
+                .flush_batch_and_set_decided_idx(new_decided_idx)
+                .await?;
             Ok(Some(new_accepted_idx))
         } else {
             self.internal_storage
-                .set_decided_idx(new_decided_idx).await?;
+                .set_decided_idx(new_decided_idx)
+                .await?;
             Ok(None)
         }
     }
@@ -157,12 +193,14 @@ where
             None => {
                 let accepted = Accepted { n, accepted_idx };
                 let cached_idx = self.outgoing.len();
-                self.latest_accepted_meta = Some((n, cached_idx));
-                self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                let pushed = self.try_push_message(Message::SequencePaxos(PaxosMessage {
                     from: self.pid,
                     to: n.pid,
                     msg: PaxosMsg::Accepted(accepted),
                 }));
+                if pushed {
+                    self.latest_accepted_meta = Some((n, cached_idx));
+                }
             }
         }
     }
@@ -199,7 +237,7 @@ where
                     my_promise,
                     message_ballot
                 );
-                self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                self.try_push_message(Message::SequencePaxos(PaxosMessage {
                     from: self.pid,
                     to: message_ballot.pid,
                     msg: PaxosMsg::NotAccepted(not_acc),
@@ -239,7 +277,7 @@ where
                 // Resend Promise
                 match &self.cached_promise_message {
                     Some(promise) => {
-                        self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+                        self.try_push_message(Message::SequencePaxos(PaxosMessage {
                             from: self.pid,
                             to: promise.n.pid,
                             msg: PaxosMsg::Promise(promise.clone()),
@@ -268,10 +306,11 @@ where
         let prepreq = PrepareReq {
             n: self.get_promise(),
         };
-        for peer in &self.peers {
-            self.outgoing.push(Message::SequencePaxos(PaxosMessage {
+        for i in 0..self.peers.len() {
+            let peer = self.peers[i];
+            self.try_push_message(Message::SequencePaxos(PaxosMessage {
                 from: self.pid,
-                to: *peer,
+                to: peer,
                 msg: PaxosMsg::PrepareReq(prepreq),
             }));
         }

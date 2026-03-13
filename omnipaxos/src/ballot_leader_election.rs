@@ -52,8 +52,12 @@ impl Ballot {
 
 impl Ord for Ballot {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.config_id, self.n, self.priority, self.pid)
-            .cmp(&(other.config_id, other.n, other.priority, other.pid))
+        (self.config_id, self.n, self.priority, self.pid).cmp(&(
+            other.config_id,
+            other.n,
+            other.priority,
+            other.pid,
+        ))
     }
 }
 
@@ -90,6 +94,9 @@ pub(crate) struct BallotLeaderElection {
     /// A happy node either sees that it is, is connected to, or sees evidence of a potential leader
     /// for the cluster. If a node is unhappy then it is seeking a new leader.
     happy: bool,
+    /// Number of consecutive rounds this node has been unhappy. Takeover requires
+    /// sustained unhappiness to avoid false positives from stale heartbeat data.
+    consecutive_unhappy_rounds: u32,
     /// The number of replicas inside the cluster whose heartbeats are needed to become and remain the leader.
     quorum: Quorum,
     /// Vector which holds all the outgoing messages of the BLE instance.
@@ -126,6 +133,7 @@ impl BallotLeaderElection {
             current_ballot: initial_ballot,
             leader: initial_leader,
             happy: true,
+            consecutive_unhappy_rounds: 0,
             quorum,
             outgoing: Vec::with_capacity(config.buffer_size),
             #[cfg(feature = "logging")]
@@ -225,6 +233,9 @@ impl BallotLeaderElection {
         if let Some(max) = max_reply_ballot {
             if max > self.leader {
                 self.leader = max;
+                // New leader discovered — reset unhappy counter to give it time
+                // to stabilize before any takeover attempt.
+                self.consecutive_unhappy_rounds = 0;
             }
         }
     }
@@ -256,27 +267,48 @@ impl BallotLeaderElection {
                 .iter()
                 .any(|r| r.ballot == self.leader && r.happy)
         };
+        // Track consecutive unhappy rounds. Takeover requires sustained
+        // unhappiness to filter out transient unhappiness from stale heartbeat
+        // data (previous-round replies may carry outdated happy flags).
+        if !self.happy {
+            self.consecutive_unhappy_rounds += 1;
+        } else {
+            self.consecutive_unhappy_rounds = 0;
+        }
     }
 
     fn check_takeover(&mut self) {
-        if !self.happy {
-            let all_neighbors_unhappy = self.heartbeat_replies.iter().all(|r| !r.happy);
+        // Require sustained unhappiness before attempting takeover. Previous-round
+        // heartbeat replies may carry stale happy flags, so we need multiple rounds
+        // to confirm the situation is genuine.
+        if !self.happy && self.consecutive_unhappy_rounds >= 2 {
+            // Check if the leader is directly reachable: look for a heartbeat reply
+            // with the leader's ballot. If the leader is alive, it will respond to
+            // our heartbeat requests. If it has crashed, we won't see its ballot.
+            // This avoids the stale-happy-flag problem entirely — we don't check
+            // happiness, only reachability.
+            let leader_is_reachable = self.leader == self.current_ballot
+                || self
+                    .heartbeat_replies
+                    .iter()
+                    .any(|r| r.ballot == self.leader);
             let im_quorum_connected = self
                 .quorum
                 .is_prepare_quorum(self.heartbeat_replies.len() + 1);
-            if all_neighbors_unhappy && im_quorum_connected {
+            if !leader_is_reachable && im_quorum_connected {
                 // Randomized backoff: stagger takeover attempts across nodes to prevent
                 // simultaneous leader elections. Use pid and hb_round as a deterministic
                 // seed so that higher-priority / lower-pid nodes attempt takeover sooner.
                 // The delay is in units of heartbeat rounds.
-                let backoff_hash = (self.pid as u32).wrapping_mul(7).wrapping_add(self.hb_round);
+                let backoff_hash = (self.pid as u32)
+                    .wrapping_mul(7)
+                    .wrapping_add(self.hb_round);
                 let delay_rounds = backoff_hash % (self.peers.len() as u32 + 1);
                 if delay_rounds == 0 {
-                    // We increment past our leader instead of max of unhappy ballots because we
-                    // assume we have already checked leader for this round so they should be equal
                     self.current_ballot.n = self.leader.n + 1;
                     self.leader = self.current_ballot;
                     self.happy = true;
+                    self.consecutive_unhappy_rounds = 0;
                 }
                 // else: wait for a future round (delay_rounds != 0 means skip this round)
             }
@@ -298,7 +330,14 @@ impl BallotLeaderElection {
     }
 
     fn handle_reply(&mut self, rep: HeartbeatReply) {
-        if rep.round == self.hb_round && rep.ballot.config_id == self.configuration_id {
+        // Accept replies from the current round OR the previous round. Due to
+        // the tick-route-tick-route pattern, replies to round N's requests
+        // typically arrive after round N+1 has started. Without accepting
+        // previous-round replies, BLE heartbeats are non-functional at
+        // election_tick_timeout=1.
+        let is_current_or_previous =
+            rep.round == self.hb_round || (self.hb_round > 0 && rep.round == self.hb_round - 1);
+        if is_current_or_previous && rep.ballot.config_id == self.configuration_id {
             self.heartbeat_replies.push(rep);
         }
     }
