@@ -119,7 +119,12 @@ impl ClusterConfig {
                 write_quorum_size >= 1 && write_quorum_size <= num_nodes,
                 "Write quorum must be in range 1 to # of nodes in the cluster"
             );
-            // No constraint that read >= write; the overlap constraint above is sufficient.
+            if num_nodes > 1 {
+                valid_config!(
+                    write_quorum_size >= 2,
+                    "Write quorum must be at least 2 for multi-node clusters to ensure durability"
+                );
+            }
         }
         Ok(())
     }
@@ -493,6 +498,20 @@ impl Error for CompactionErr {
         }
     }
 }
+impl Clone for CompactionErr {
+    fn clone(&self) -> Self {
+        match self {
+            CompactionErr::UndecidedIndex(idx) => CompactionErr::UndecidedIndex(*idx),
+            CompactionErr::TrimmedIndex(idx) => CompactionErr::TrimmedIndex(*idx),
+            CompactionErr::NotAllDecided(idx) => CompactionErr::NotAllDecided(*idx),
+            CompactionErr::NotCurrentLeader(pid) => CompactionErr::NotCurrentLeader(*pid),
+            CompactionErr::StorageError(e) => {
+                CompactionErr::StorageError(StorageError(e.to_string().into()))
+            }
+        }
+    }
+}
+
 impl Display for CompactionErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

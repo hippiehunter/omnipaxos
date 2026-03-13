@@ -120,10 +120,12 @@ where
     }
 
     fn idx(&self, pid: NodeId) -> usize {
-        *self
-            .pid_to_idx
-            .get(&pid)
-            .unwrap_or_else(|| panic!("Unknown PID {} in LeaderState", pid))
+        *self.pid_to_idx.get(&pid).unwrap_or_else(|| {
+            panic!(
+                "BUG: Unknown PID {} in LeaderState (leader: {:?}, known PIDs: {:?})",
+                pid, self.n_leader, self.peers
+            )
+        })
     }
 
     pub fn increment_seq_num_session(&mut self, pid: NodeId) {
@@ -219,17 +221,12 @@ where
         }
     }
 
-    /// Returns the minimum accepted index across all promised nodes (including self).
+    /// Returns the minimum accepted index across ALL nodes in the cluster (not just
+    /// promised ones). This is conservative: disconnected nodes retain their last-known
+    /// accepted_idx (initialized to 0), so trim is blocked until all nodes catch up.
+    /// This prevents trimming entries that a disconnected node still needs.
     pub fn get_min_all_accepted_idx(&self) -> usize {
-        self.promises_meta
-            .iter()
-            .enumerate()
-            .filter_map(|(i, p)| match p {
-                PromiseState::Promised(_) => Some(self.accepted_indexes[i]),
-                _ => None,
-            })
-            .min()
-            .unwrap_or(0)
+        self.accepted_indexes.iter().copied().min().unwrap_or(0)
     }
 
     pub fn reset_latest_accept_meta(&mut self) {

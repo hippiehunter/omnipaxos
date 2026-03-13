@@ -76,7 +76,7 @@ where
     }
 
     async fn append_on_prefix(&mut self, from_idx: usize, entries: Vec<T>) -> StorageResult<()> {
-        self.log.truncate(from_idx - self.trimmed_idx);
+        self.log.truncate(from_idx.saturating_sub(self.trimmed_idx));
         self.log.extend(entries);
         Ok(())
     }

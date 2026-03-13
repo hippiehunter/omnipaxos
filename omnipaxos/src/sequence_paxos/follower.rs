@@ -262,10 +262,13 @@ where
         let msg_status = self.current_seq_num.check_msg_status(seq_num);
         match msg_status {
             MessageStatus::Expected => self.current_seq_num = seq_num,
-            // Instead of triggering a full re-sync via reconnected(), simply ignore
-            // dropped messages and let the normal resend timeout mechanism handle
-            // recovery. This avoids unnecessary full re-syncs on transient drops.
-            MessageStatus::DroppedPreceding => (),
+            // A gap in the accept sequence means we missed one or more messages.
+            // Trigger re-sync from the leader: transition to Recover phase and
+            // send PrepareReq, which causes the leader to re-prepare us via
+            // Prepare → Promise → AcceptSync with the missing entries.
+            MessageStatus::DroppedPreceding => {
+                self.reconnected(_from);
+            }
             MessageStatus::Outdated => (),
         };
         msg_status

@@ -99,6 +99,8 @@ pub(crate) struct BallotLeaderElection {
     consecutive_unhappy_rounds: u32,
     /// The number of replicas inside the cluster whose heartbeats are needed to become and remain the leader.
     quorum: Quorum,
+    /// Maximum size of the outgoing message buffer.
+    buffer_size: usize,
     /// Vector which holds all the outgoing messages of the BLE instance.
     outgoing: Vec<BLEMessage>,
     /// Logger used to output the status of the component.
@@ -117,8 +119,16 @@ impl BallotLeaderElection {
         let mut initial_ballot = Ballot::with(config_id, INITIAL_ROUND, config.priority, pid);
         let initial_leader = match recovered_leader {
             Some(b) if b != Ballot::default() => {
-                // Prevents a recovered server from retaining BLE leadership with the same ballot.
-                initial_ballot.n = RECOVERY_ROUND;
+                if peers.is_empty() {
+                    // Single-node: no peers to recover from, skip recovery round.
+                    // Set ballot higher than the recovered leader so we self-elect
+                    // immediately on the next hb_timeout.
+                    initial_ballot.n = b.n + 1;
+                } else {
+                    // Prevents a recovered server from retaining BLE leadership
+                    // with the same ballot.
+                    initial_ballot.n = RECOVERY_ROUND;
+                }
                 b
             }
             _ => initial_ballot,
@@ -135,6 +145,7 @@ impl BallotLeaderElection {
             happy: true,
             consecutive_unhappy_rounds: 0,
             quorum,
+            buffer_size: config.buffer_size,
             outgoing: Vec::with_capacity(config.buffer_size),
             #[cfg(feature = "logging")]
             logger: {
@@ -157,6 +168,17 @@ impl BallotLeaderElection {
         }
         ble.new_hb_round();
         ble
+    }
+
+    /// Try to push a BLE message to the outgoing buffer. Returns false if the
+    /// buffer is full (message dropped).
+    fn try_push(&mut self, msg: BLEMessage) -> bool {
+        if self.outgoing.len() >= self.buffer_size {
+            false
+        } else {
+            self.outgoing.push(msg);
+            true
+        }
     }
 
     /// Update the custom priority used in the Ballot for this server. Note that changing the
@@ -190,13 +212,14 @@ impl BallotLeaderElection {
             "Initiate new heartbeat round: {}",
             self.hb_round
         );
-        for peer in &self.peers {
+        for i in 0..self.peers.len() {
+            let peer = self.peers[i];
             let hb_request = HeartbeatRequest {
                 round: self.hb_round,
             };
-            self.outgoing.push(BLEMessage {
+            self.try_push(BLEMessage {
                 from: self.pid,
-                to: *peer,
+                to: peer,
                 msg: HeartbeatMsg::Request(hb_request),
             });
         }
@@ -271,7 +294,7 @@ impl BallotLeaderElection {
         // unhappiness to filter out transient unhappiness from stale heartbeat
         // data (previous-round replies may carry outdated happy flags).
         if !self.happy {
-            self.consecutive_unhappy_rounds += 1;
+            self.consecutive_unhappy_rounds = self.consecutive_unhappy_rounds.saturating_add(1);
         } else {
             self.consecutive_unhappy_rounds = 0;
         }
@@ -285,17 +308,22 @@ impl BallotLeaderElection {
             // Check if the leader is directly reachable: look for a heartbeat reply
             // with the leader's ballot. If the leader is alive, it will respond to
             // our heartbeat requests. If it has crashed, we won't see its ballot.
-            // This avoids the stale-happy-flag problem entirely — we don't check
-            // happiness, only reachability.
             let leader_is_reachable = self.leader == self.current_ballot
                 || self
                     .heartbeat_replies
                     .iter()
                     .any(|r| r.ballot == self.leader);
+            // Check if any neighbor is happy with the current leader. If so, the
+            // leader is likely alive and we are asymmetrically partitioned from it.
+            // Attempting takeover in this case would cause a spurious election.
+            let neighbor_happy_with_leader = self
+                .heartbeat_replies
+                .iter()
+                .any(|r| r.leader == self.leader && r.happy);
             let im_quorum_connected = self
                 .quorum
                 .is_prepare_quorum(self.heartbeat_replies.len() + 1);
-            if !leader_is_reachable && im_quorum_connected {
+            if !leader_is_reachable && !neighbor_happy_with_leader && im_quorum_connected {
                 // Randomized backoff: stagger takeover attempts across nodes to prevent
                 // simultaneous leader elections. Use pid and hb_round as a deterministic
                 // seed so that higher-priority / lower-pid nodes attempt takeover sooner.
@@ -322,7 +350,7 @@ impl BallotLeaderElection {
             leader: self.leader,
             happy: self.happy,
         };
-        self.outgoing.push(BLEMessage {
+        self.try_push(BLEMessage {
             from: self.pid,
             to: from,
             msg: HeartbeatMsg::Reply(hb_reply),
@@ -335,10 +363,22 @@ impl BallotLeaderElection {
         // typically arrive after round N+1 has started. Without accepting
         // previous-round replies, BLE heartbeats are non-functional at
         // election_tick_timeout=1.
-        let is_current_or_previous =
-            rep.round == self.hb_round || (self.hb_round > 0 && rep.round == self.hb_round - 1);
-        if is_current_or_previous && rep.ballot.config_id == self.configuration_id {
-            self.heartbeat_replies.push(rep);
+        let is_current = rep.round == self.hb_round;
+        let is_previous = self.hb_round > 0 && rep.round == self.hb_round - 1;
+        if (is_current || is_previous) && rep.ballot.config_id == self.configuration_id {
+            // Previous-round replies have stale `happy` flags: the sender's
+            // happiness may have changed since then. Override to false so that
+            // stale happiness doesn't mask a leader failure. Ballot/leader
+            // fields remain valid for leader discovery.
+            let adjusted = if is_previous {
+                HeartbeatReply {
+                    happy: false,
+                    ..rep
+                }
+            } else {
+                rep
+            };
+            self.heartbeat_replies.push(adjusted);
         }
     }
 

@@ -155,11 +155,13 @@ where
         }
         let accepted_idx = self.internal_storage.get_accepted_idx();
         self.leader_state.set_accepted_idx(self.pid, accepted_idx);
-        self.try_decide_self_accepted().await?;
+        // Send AcceptStopSign to followers BEFORE potentially deciding, so followers
+        // receive the stopsign before any Decide message from try_decide_self_accepted.
         let followers: Vec<NodeId> = self.leader_state.get_promised_followers().to_vec();
         for pid in followers {
             self.send_accept_stopsign(pid, ss.clone(), false);
         }
+        self.try_decide_self_accepted().await?;
         Ok(())
     }
 
@@ -439,14 +441,20 @@ where
         }
     }
 
-    /// Check if the leader's own accept is sufficient to form a quorum (single-node case)
-    /// and advance decided_idx if so.
+    /// Check if the leader's own accept is sufficient to form a quorum (single-node case
+    /// or flexible quorum) and advance decided_idx if so. Also notifies followers of the
+    /// new decided index so they don't have to wait for the resend timeout.
     async fn try_decide_self_accepted(&mut self) -> StorageResult<()> {
         let accepted_idx = self.leader_state.get_accepted_idx(self.pid);
         if accepted_idx > self.internal_storage.get_decided_idx()
             && self.leader_state.is_chosen(accepted_idx)
         {
             self.internal_storage.set_decided_idx(accepted_idx).await?;
+            let decided_idx = self.internal_storage.get_decided_idx();
+            let followers: Vec<NodeId> = self.leader_state.get_promised_followers().to_vec();
+            for pid in followers {
+                self.send_decide(pid, decided_idx, false);
+            }
         }
         Ok(())
     }
