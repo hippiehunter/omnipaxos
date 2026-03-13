@@ -5,58 +5,17 @@ use omnipaxos::{
         Message,
     },
     storage::{
-        memory_storage::MemoryStorage, Entry, Snapshot, StopSign, Storage, StorageOp, StorageResult,
+        memory_storage::MemoryStorage, StopSign, Storage, StorageOp, StorageResult,
     },
     util::{FlexibleQuorum, LogEntry},
-    ClusterConfig, OmniPaxos, OmniPaxosConfig, ProposeErr, ServerConfig,
+    ClusterConfig, CompactionErr, OmniPaxos, OmniPaxosConfig, ProposeErr, ServerConfig,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-// ===========================================================================
-// Entry + Snapshot types (same as omnipaxos_test.rs)
-// ===========================================================================
-
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-struct Value {
-    id: u64,
-}
-
-impl Value {
-    fn with_id(id: u64) -> Self {
-        Value { id }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-struct ValueSnapshot {
-    map: HashMap<u64, u64>,
-}
-
-impl Snapshot<Value> for ValueSnapshot {
-    fn create(entries: &[Value]) -> Self {
-        let mut map = HashMap::new();
-        for e in entries {
-            map.insert(e.id, e.id);
-        }
-        ValueSnapshot { map }
-    }
-
-    fn merge(&mut self, delta: Self) {
-        self.map.extend(delta.map);
-    }
-
-    fn use_snapshots() -> bool {
-        true
-    }
-}
-
-impl Entry for Value {
-    type Snapshot = ValueSnapshot;
-}
+mod test_utils;
+use test_utils::{Value, ValueSnapshot};
 
 // ===========================================================================
 // SharedMemoryStorage — wraps MemoryStorage behind Rc<RefCell<>> so the
@@ -186,6 +145,7 @@ struct SimCluster {
     server_configs: BTreeMap<u64, ServerConfig>,
     filters: Vec<Option<MessageFilter>>,
     dropped_messages: Vec<Message<Value>>,
+    duplication_rng: Option<(SimpleRng, f64)>,
 }
 
 impl SimCluster {
@@ -238,6 +198,7 @@ impl SimCluster {
             server_configs,
             filters: Vec::new(),
             dropped_messages: Vec::new(),
+            duplication_rng: None,
         }
     }
 
@@ -255,6 +216,18 @@ impl SimCluster {
         for node in self.nodes.values_mut() {
             node.take_outgoing_messages(&mut buf);
             all_msgs.append(&mut buf);
+        }
+        // Duplicate messages if duplication_rng is configured
+        if let Some((ref mut rng, rate)) = self.duplication_rng {
+            let mut duplicates = Vec::new();
+            for msg in &all_msgs {
+                // Use rng to decide whether to duplicate
+                let r = (rng.next() % 1000) as f64 / 1000.0;
+                if r < rate {
+                    duplicates.push(msg.clone());
+                }
+            }
+            all_msgs.extend(duplicates);
         }
         for msg in all_msgs {
             let dominated = self
@@ -380,6 +353,9 @@ impl SimCluster {
     }
 
     async fn logs_are_consistent(&self) -> bool {
+        if self.nodes.is_empty() {
+            return true;
+        }
         // After crash recovery with snapshots, some nodes may have compacted
         // entries that others still have as Decided. We can only compare
         // entries above the highest compacted index across all nodes.
@@ -390,21 +366,22 @@ impl SimCluster {
         let mut reference: Option<Vec<u64>> = None;
         for node in self.nodes.values() {
             let decided_idx = node.get_decided_idx();
-            if decided_idx == 0 {
-                continue;
-            }
-            let entries = node
-                .read_decided_suffix(max_compacted)
-                .await
-                .unwrap()
-                .unwrap_or_default();
-            let ids: Vec<u64> = entries
-                .iter()
-                .filter_map(|e| match e {
-                    LogEntry::Decided(v) => Some(v.id),
-                    _ => None,
-                })
-                .collect();
+            let ids: Vec<u64> = if decided_idx == 0 {
+                vec![]
+            } else {
+                let entries = node
+                    .read_decided_suffix(max_compacted)
+                    .await
+                    .unwrap()
+                    .unwrap_or_default();
+                entries
+                    .iter()
+                    .filter_map(|e| match e {
+                        LogEntry::Decided(v) => Some(v.id),
+                        _ => None,
+                    })
+                    .collect()
+            };
             match &reference {
                 None => reference = Some(ids),
                 Some(ref_ids) => {
@@ -429,6 +406,27 @@ impl SimCluster {
     async fn try_propose(&mut self, node_id: u64, entry: Value) -> Result<(), ProposeErr<Value>> {
         let node = self.nodes.get_mut(&node_id).expect("node not found");
         node.append(entry).await
+    }
+
+    #[allow(dead_code)]
+    async fn assert_logs_consistent_and_converged(&self) {
+        assert!(
+            self.logs_are_consistent().await,
+            "decided logs are not consistent across nodes"
+        );
+        let decided_indices: Vec<usize> = self
+            .nodes
+            .values()
+            .map(|node| node.get_decided_idx())
+            .collect();
+        if let (Some(&min), Some(&max)) = (decided_indices.iter().min(), decided_indices.iter().max())
+        {
+            assert_eq!(
+                min, max,
+                "not all live nodes have converged: decided indices range from {} to {}",
+                min, max
+            );
+        }
     }
 }
 
@@ -990,13 +988,13 @@ fn test_proposals_during_leader_change() {
             }
         }
 
-        if let Some(nl) = new_leader {
-            // Propose through new leader.
-            for i in 6..=10 {
-                cluster.propose(nl, Value::with_id(i)).await;
-            }
-            cluster.tick_and_route(200).await;
+        let nl = new_leader.expect("new leader must be elected among survivors");
+
+        // Propose through new leader.
+        for i in 6..=10 {
+            cluster.propose(nl, Value::with_id(i)).await;
         }
+        cluster.tick_and_route(200).await;
 
         // Heal and converge.
         cluster.remove_filter(filter_handle);
@@ -1004,7 +1002,7 @@ fn test_proposals_during_leader_change() {
             .nodes
             .get_mut(&old_leader)
             .unwrap()
-            .reconnected(new_leader.unwrap_or(survivors[0]));
+            .reconnected(nl);
         cluster.tick_and_route(300).await;
 
         assert_logs_consistent(&cluster).await;
@@ -1395,7 +1393,27 @@ fn test_trim_then_catchup() {
         }
         cluster.tick_and_route(200).await;
 
-        // Trim the first 15 entries on the leader.
+        // Trim while follower is crashed should fail: trim is conservative and
+        // requires ALL nodes (including disconnected ones) to have accepted entries.
+        let trim_result = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .trim(Some(15))
+            .await;
+        assert!(
+            matches!(trim_result, Err(CompactionErr::NotAllDecided(0))),
+            "trim must fail while a disconnected node hasn't accepted the entries"
+        );
+
+        // Recover the follower and let it catch up.
+        cluster.recover_node(follower).await;
+        cluster.tick_and_route(300).await;
+
+        let follower_decided = cluster.nodes[&follower].get_decided_idx();
+        assert_eq!(follower_decided, 20, "follower should catch up to 20");
+
+        // Now trim should succeed since all nodes have accepted.
         cluster
             .nodes
             .get_mut(&leader)
@@ -1411,13 +1429,6 @@ fn test_trim_then_catchup() {
             matches!(entry, Some(LogEntry::Trimmed(_))),
             "trimmed entry should be Trimmed"
         );
-
-        // Recover the follower.
-        cluster.recover_node(follower).await;
-        cluster.tick_and_route(300).await;
-
-        let follower_decided = cluster.nodes[&follower].get_decided_idx();
-        assert_eq!(follower_decided, 20, "follower should catch up to 20");
     });
 }
 
@@ -1867,53 +1878,58 @@ fn test_stress_with_leader_crashes() {
 // Coverage gap: Decided entries never lost or reordered
 // ===========================================================================
 
-/// Verifies that decided entries are never lost or reordered across
-/// leader changes. Each entry has a unique ID; after all leader changes,
-/// the decided log must contain a strict subsequence of proposed IDs
-/// with no gaps or reordering.
+/// Verifies that decided entries from the same proposer are never
+/// reordered relative to each other, even when multiple nodes propose
+/// concurrently with non-monotonic IDs across proposers.
 #[test]
 fn test_decided_entries_never_reorder() {
     smol::block_on(async {
         let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
-        let leader1 = elect_leader(&mut cluster).await;
+        let _leader = elect_leader(&mut cluster).await;
+        // Extra rounds to ensure leader is in Accept phase.
+        cluster.tick_and_route(20).await;
 
-        // Propose entries under leader 1
-        for i in 1..=10 {
-            cluster.propose(leader1, Value::with_id(i)).await;
+        let live = cluster.live_nodes();
+        assert!(live.len() >= 3, "need at least 3 live nodes");
+
+        // Each node proposes entries with unique IDs that are NOT globally
+        // monotonic. The IDs within each proposer ARE in order.
+        // Node live[0] proposes 100, 200, 300
+        // Node live[1] proposes 150, 250, 350
+        // Node live[2] proposes 175, 275, 375
+        let proposals: Vec<(u64, Vec<u64>)> = vec![
+            (live[0], vec![100, 200, 300]),
+            (live[1], vec![150, 250, 350]),
+            (live[2], vec![175, 275, 375]),
+        ];
+
+        for (node_id, ids) in &proposals {
+            for &id in ids {
+                cluster.propose(*node_id, Value::with_id(id)).await;
+            }
         }
-        cluster.tick_and_route(200).await;
-        assert_all_decided(&cluster, 10);
 
-        // Crash leader 1, elect new leader
-        cluster.crash_node(leader1);
-        let leader2 = elect_leader(&mut cluster).await;
-        assert_ne!(leader2, leader1);
+        cluster.tick_and_route(300).await;
 
-        // Propose entries under leader 2
-        for i in 11..=20 {
-            cluster.propose(leader2, Value::with_id(i)).await;
-        }
-        cluster.tick_and_route(200).await;
-
-        // Recover leader 1, converge
-        cluster.recover_node(leader1).await;
-        cluster.tick_and_route(500).await;
-
-        // Verify: all nodes have identical decided logs
+        // All 9 entries should be decided.
+        assert_all_decided(&cluster, 9);
         assert_logs_consistent(&cluster).await;
 
-        // Verify: the decided log on each node is a monotonically
-        // ordered sequence — no reordering, no gaps in what was decided
+        // Verify: entries from the SAME proposer appear in the same
+        // relative order in the decided log across ALL nodes.
         for (&pid, node) in &cluster.nodes {
             let values = get_decided_values(node);
-            // Check strict ordering: each entry must appear in proposal order
-            for window in values.windows(2) {
-                assert!(
-                    window[0] < window[1],
-                    "node {}: decided entries are not in order: {:?} appears before {:?}",
-                    pid,
-                    window[0],
-                    window[1]
+            for (proposer, expected_order) in &proposals {
+                // Extract the subsequence of entries from this proposer
+                let actual_order: Vec<u64> = values
+                    .iter()
+                    .copied()
+                    .filter(|id| expected_order.contains(id))
+                    .collect();
+                assert_eq!(
+                    actual_order, *expected_order,
+                    "node {}: entries from proposer {} are reordered: got {:?}, expected {:?}",
+                    pid, proposer, actual_order, expected_order
                 );
             }
         }
@@ -2105,6 +2121,13 @@ impl SimCluster {
     }
 }
 
+fn test_seed(default: u64) -> u64 {
+    std::env::var("OMNIPAXOS_TEST_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 /// Simple deterministic LCG PRNG for reproducible tests.
 struct SimpleRng {
     state: u64,
@@ -2138,7 +2161,7 @@ fn test_stress_random_crashes_500() {
     smol::block_on(async {
         let nodes = vec![1, 2, 3, 4, 5, 6, 7];
         let mut cluster = SimCluster::new(nodes.clone()).await;
-        let mut rng = SimpleRng::new(42);
+        let mut rng = SimpleRng::new(test_seed(42));
         let mut proposal_id = 1u64;
 
         for _iter in 0..500 {
@@ -2175,7 +2198,7 @@ fn test_stress_random_crashes_500() {
         }
         cluster.tick_and_route(500).await;
 
-        assert_logs_consistent(&cluster).await;
+        cluster.assert_logs_consistent_and_converged().await;
     });
 }
 
@@ -2184,7 +2207,7 @@ fn test_stress_random_partitions_500() {
     smol::block_on(async {
         let nodes = vec![1, 2, 3, 4, 5];
         let mut cluster = SimCluster::new(nodes.clone()).await;
-        let mut rng = SimpleRng::new(123);
+        let mut rng = SimpleRng::new(test_seed(123));
         let mut proposal_id = 1u64;
         let mut active_filter: Option<usize> = None;
 
@@ -2236,7 +2259,7 @@ fn test_stress_random_partitions_500() {
         }
         cluster.tick_and_route(500).await;
 
-        assert_logs_consistent(&cluster).await;
+        cluster.assert_logs_consistent_and_converged().await;
     });
 }
 
@@ -2273,7 +2296,7 @@ fn test_stress_leader_crashes_during_proposals_100() {
         }
         cluster.tick_and_route(500).await;
 
-        assert_logs_consistent(&cluster).await;
+        cluster.assert_logs_consistent_and_converged().await;
     });
 }
 
@@ -2282,7 +2305,7 @@ fn test_stress_multiple_simultaneous_crashes() {
     smol::block_on(async {
         let nodes = vec![1, 2, 3, 4, 5, 6, 7];
         let mut cluster = SimCluster::new(nodes.clone()).await;
-        let mut rng = SimpleRng::new(999);
+        let mut rng = SimpleRng::new(test_seed(999));
         let mut proposal_id = 1u64;
 
         for _iter in 0..100 {
@@ -2331,7 +2354,7 @@ fn test_stress_multiple_simultaneous_crashes() {
         }
         cluster.tick_and_route(500).await;
 
-        assert_logs_consistent(&cluster).await;
+        cluster.assert_logs_consistent_and_converged().await;
     });
 }
 
@@ -2340,7 +2363,7 @@ fn test_stress_rapid_leader_changes() {
     smol::block_on(async {
         let nodes = vec![1, 2, 3, 4, 5];
         let mut cluster = SimCluster::new(nodes.clone()).await;
-        let mut rng = SimpleRng::new(7777);
+        let mut rng = SimpleRng::new(test_seed(7777));
         let mut proposal_id = 1u64;
 
         elect_leader(&mut cluster).await;
@@ -2369,7 +2392,7 @@ fn test_stress_rapid_leader_changes() {
         // Converge
         cluster.tick_and_route(500).await;
 
-        assert_logs_consistent(&cluster).await;
+        cluster.assert_logs_consistent_and_converged().await;
         // At least some entries decided
         let max_decided = cluster
             .get_decided_indices()
@@ -2378,8 +2401,9 @@ fn test_stress_rapid_leader_changes() {
             .max()
             .unwrap_or(0);
         assert!(
-            max_decided > 0,
-            "some entries should be decided after 100 iterations"
+            max_decided >= 20,
+            "rapid leader changes test should decide at least 20 entries, got {}",
+            max_decided
         );
     });
 }
@@ -2819,6 +2843,11 @@ fn test_concurrent_reconfigure_from_follower_and_leader() {
 
         // All reconfigured nodes should agree on the same stopsign
         let decided_ss: Vec<&StopSign> = stop_signs.iter().filter_map(|s| s.as_ref()).collect();
+        assert!(
+            decided_ss.len() >= 2,
+            "at least 2 nodes must have decided a StopSign, but only {} did",
+            decided_ss.len()
+        );
         if decided_ss.len() >= 2 {
             for ss in &decided_ss[1..] {
                 assert_eq!(
@@ -2985,9 +3014,10 @@ fn test_buffer_overflow_recovered_via_resend() {
             .max()
             .unwrap_or(0);
         assert!(
-            max_decided > 0,
-            "at least some entries should be decided despite potential buffer overflow (drops: {})",
-            drop_count
+            max_decided >= 10,
+            "at least 10 entries should be decided despite potential buffer overflow (drops: {}), got {}",
+            drop_count,
+            max_decided
         );
     });
 }
@@ -3706,5 +3736,417 @@ fn test_batch_size_exact_boundary() {
 
         assert_all_decided(&cluster, 11);
         assert_logs_consistent(&cluster).await;
+    });
+}
+
+// ===========================================================================
+// Group: Replacement coverage for deleted test suites
+// ===========================================================================
+
+#[test]
+fn test_reconnection_triggers_accept_sync() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Pick a follower to crash.
+        let follower = *cluster.live_nodes().iter().find(|&&p| p != leader).unwrap();
+        cluster.crash_node(follower);
+
+        // Propose 10 entries, tick to decide on the 2 live nodes.
+        for i in 1..=10 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(200).await;
+
+        // Verify the 2 live nodes decided all 10 entries.
+        for node in cluster.nodes.values() {
+            assert_eq!(node.get_decided_idx(), 10);
+        }
+
+        // Recover the follower (which calls reconnected()).
+        cluster.recover_node(follower).await;
+
+        // Tick to convergence.
+        cluster.tick_and_route(300).await;
+
+        // Assert the recovered follower has decided all 10 entries.
+        assert_eq!(
+            cluster.nodes[&follower].get_decided_idx(),
+            10,
+            "recovered follower should have decided all 10 entries"
+        );
+
+        // Assert all logs consistent.
+        assert_logs_consistent(&cluster).await;
+    });
+}
+
+#[test]
+fn test_divergent_log_reconciliation() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3, 4, 5]).await;
+        let old_leader = elect_leader(&mut cluster).await;
+
+        // Partition the leader from ALL followers.
+        let followers: Vec<u64> = (1..=5).filter(|&p| p != old_leader).collect();
+        let filter_handle = cluster.partition(vec![old_leader], followers.clone());
+
+        // Have the old leader propose entries 1..=5 (won't decide because leader alone
+        // isn't a quorum).
+        for i in 1..=5 {
+            let _ = cluster.try_propose(old_leader, Value::with_id(i)).await;
+        }
+
+        // Tick so a new leader is elected among the majority partition.
+        let mut new_leader = None;
+        for _ in 0..2000 {
+            cluster.tick_all().await;
+            cluster.route_messages().await;
+            // Check if the four non-isolated nodes agree on a new leader.
+            let mut counts: HashMap<u64, usize> = HashMap::new();
+            for &pid in &followers {
+                if let Some((lpid, _)) = cluster.nodes[&pid].get_current_leader() {
+                    if lpid != old_leader {
+                        *counts.entry(lpid).or_insert(0) += 1;
+                    }
+                }
+            }
+            for (&lpid, &count) in &counts {
+                if count >= 3 {
+                    new_leader = Some(lpid);
+                }
+            }
+            if new_leader.is_some() {
+                break;
+            }
+        }
+        let new_leader = new_leader.expect("new leader should be elected in majority partition");
+        assert_ne!(new_leader, old_leader);
+
+        // Have the new leader propose entries 100..=105.
+        for i in 100..=105 {
+            cluster.propose(new_leader, Value::with_id(i)).await;
+        }
+
+        // Tick to decide in the majority partition.
+        cluster.tick_and_route(300).await;
+
+        // Heal the partition.
+        cluster.remove_filter(filter_handle);
+        for pid in 1..=5 {
+            for other in 1..=5 {
+                if pid != other {
+                    cluster.nodes.get_mut(&pid).unwrap().reconnected(other);
+                }
+            }
+        }
+
+        // Tick to convergence.
+        cluster.tick_and_route(500).await;
+
+        // Assert all 5 nodes have consistent logs.
+        cluster.assert_logs_consistent_and_converged().await;
+
+        // Assert the final decided log contains entries 100..=105 from the new leader.
+        // Note: entries 1..=5 from the old leader may or may not appear in the decided
+        // log depending on whether the reconciliation leader discovers them via Promise.
+        // This is correct Paxos behavior — what matters is that all nodes agree.
+        let reference_node = cluster.nodes.values().next().unwrap();
+        let decided_values = get_decided_values(reference_node);
+        for expected in 100..=105 {
+            assert!(
+                decided_values.contains(&expected),
+                "new leader's entry {} should be in the decided log, got {:?}",
+                expected,
+                decided_values
+            );
+        }
+    });
+}
+
+#[test]
+fn test_leader_crash_recovery_log_consistency() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3, 4, 5]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Propose 10 entries, tick to decide on all nodes.
+        for i in 1..=10 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(200).await;
+        assert_all_decided(&cluster, 10);
+
+        // Crash the leader.
+        cluster.crash_node(leader);
+
+        // Elect a new leader among the remaining 4 nodes.
+        let new_leader = elect_leader(&mut cluster).await;
+        assert_ne!(new_leader, leader, "new leader should differ from crashed leader");
+
+        // Propose 10 more entries to the new leader.
+        for i in 11..=20 {
+            cluster.propose(new_leader, Value::with_id(i)).await;
+        }
+
+        // Tick to decide on remaining nodes.
+        cluster.tick_and_route(300).await;
+
+        // Verify the 4 remaining nodes have decided all 20 entries.
+        for node in cluster.nodes.values() {
+            assert_eq!(
+                node.get_decided_idx(),
+                20,
+                "remaining nodes should have decided all 20 entries"
+            );
+        }
+
+        // Recover the crashed old leader.
+        cluster.recover_node(leader).await;
+
+        // Tick to convergence.
+        cluster.tick_and_route(500).await;
+
+        // Assert the recovered node has all 20 entries decided.
+        assert_eq!(
+            cluster.nodes[&leader].get_decided_idx(),
+            20,
+            "recovered old leader should have all 20 entries decided"
+        );
+
+        // Assert all logs consistent and converged.
+        cluster.assert_logs_consistent_and_converged().await;
+    });
+}
+
+#[test]
+fn test_flexible_quorum_progress_with_failures() {
+    smol::block_on(async {
+        let cluster_config = ClusterConfig {
+            configuration_id: 1,
+            nodes: vec![1, 2, 3, 4, 5],
+            flexible_quorum: Some(FlexibleQuorum {
+                read_quorum_size: 4,
+                write_quorum_size: 2,
+            }),
+        };
+        let mut server_configs = BTreeMap::new();
+        for pid in 1..=5 {
+            server_configs.insert(
+                pid,
+                ServerConfig {
+                    pid,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut cluster = SimCluster::with_configs(cluster_config, server_configs).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Establish the leader in Accept phase by deciding initial entries.
+        for i in 1..=5 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(100).await;
+        assert_all_decided(&cluster, 5);
+
+        // Crash 3 followers (leaving leader + 1 follower = 2, which meets write_quorum_size).
+        let followers: Vec<u64> = cluster
+            .live_nodes()
+            .into_iter()
+            .filter(|&p| p != leader)
+            .collect();
+        let crashed: Vec<u64> = followers[..3].to_vec();
+        for &f in &crashed {
+            cluster.crash_node(f);
+        }
+        assert_eq!(cluster.live_nodes().len(), 2);
+
+        // Propose 5 more entries.
+        for i in 6..=10 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+
+        // Tick to decide on the 2 live nodes.
+        cluster.tick_and_route(200).await;
+
+        // Assert leader's decided_idx == 10 (5 initial + 5 new).
+        assert_eq!(
+            cluster.nodes[&leader].get_decided_idx(),
+            10,
+            "leader should have decided_idx == 10 with write_quorum_size=2"
+        );
+
+        // Recover all crashed nodes, tick to convergence.
+        for &f in &crashed {
+            cluster.recover_node(f).await;
+        }
+        cluster.tick_and_route(500).await;
+
+        // Assert all 5 nodes converged to decided_idx 10.
+        for (&pid, node) in &cluster.nodes {
+            assert_eq!(
+                node.get_decided_idx(),
+                10,
+                "node {} should have converged to decided_idx 10",
+                pid
+            );
+        }
+        cluster.assert_logs_consistent_and_converged().await;
+    });
+}
+
+#[test]
+fn test_reconfig_stopsign_decided_and_append_rejected() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Propose 5 entries, tick to decide.
+        for i in 1..=5 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(200).await;
+        assert_all_decided(&cluster, 5);
+
+        // Call reconfigure with a new config (nodes: [1, 2, 3, 4]).
+        let new_config = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .reconfigure(new_config, None)
+            .await
+            .unwrap();
+
+        // Tick until all nodes have is_reconfigured() returning Some(stopsign).
+        cluster.tick_and_route(300).await;
+
+        let mut stop_signs: Vec<StopSign> = Vec::new();
+        for (&pid, node) in &cluster.nodes {
+            let ss = node.is_reconfigured();
+            assert!(
+                ss.is_some(),
+                "node {} should have is_reconfigured() returning Some",
+                pid
+            );
+            stop_signs.push(ss.unwrap());
+        }
+
+        // Assert all nodes have the same StopSign.
+        for ss in &stop_signs[1..] {
+            assert_eq!(
+                stop_signs[0], *ss,
+                "all nodes must agree on the same StopSign"
+            );
+        }
+
+        // Try appending another entry -- it should return Err(ProposeErr::PendingReconfigEntry(_)).
+        let result = cluster.try_propose(leader, Value::with_id(99)).await;
+        assert!(
+            matches!(result, Err(ProposeErr::PendingReconfigEntry(_))),
+            "appending after reconfiguration should return PendingReconfigEntry, got {:?}",
+            result
+        );
+    });
+}
+
+#[test]
+fn test_message_duplication_safety() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3, 4, 5]).await;
+        // Set duplication rate to 0.3.
+        cluster.duplication_rng = Some((SimpleRng::new(test_seed(55)), 0.3));
+
+        let leader = elect_leader(&mut cluster).await;
+
+        // Propose 20 entries across 5 iterations of tick_and_route.
+        for batch in 0..5 {
+            for j in 0..4 {
+                let id = (batch * 4 + j + 1) as u64;
+                cluster.propose(leader, Value::with_id(id)).await;
+            }
+            cluster.tick_and_route(10).await;
+        }
+
+        // Tick to convergence (500 rounds).
+        cluster.tick_and_route(500).await;
+
+        // Assert logs consistent and converged.
+        cluster.assert_logs_consistent_and_converged().await;
+
+        // Verify all 20 entries decided.
+        let decided_idx = cluster.nodes[&leader].get_decided_idx();
+        assert_eq!(
+            decided_idx, 20,
+            "all 20 entries should be decided, got {}",
+            decided_idx
+        );
+    });
+}
+
+#[test]
+fn test_proposal_ordering_preserved_per_proposer() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3, 4, 5]).await;
+        let _leader = elect_leader(&mut cluster).await;
+        // Extra rounds to ensure leader is in Accept phase.
+        cluster.tick_and_route(20).await;
+
+        // Each of the 5 nodes proposes 5 entries with unique IDs.
+        // Node 1: ids 10, 20, 30, 40, 50
+        // Node 2: ids 11, 21, 31, 41, 51
+        // Node 3: ids 12, 22, 32, 42, 52
+        // Node 4: ids 13, 23, 33, 43, 53
+        // Node 5: ids 14, 24, 34, 44, 54
+        let proposals: Vec<(u64, Vec<u64>)> = vec![
+            (1, vec![10, 20, 30, 40, 50]),
+            (2, vec![11, 21, 31, 41, 51]),
+            (3, vec![12, 22, 32, 42, 52]),
+            (4, vec![13, 23, 33, 43, 53]),
+            (5, vec![14, 24, 34, 44, 54]),
+        ];
+
+        // Interleave: propose one entry from each node per round, then tick_and_route.
+        for round in 0..5 {
+            for &(node_id, ref ids) in &proposals {
+                let _ = cluster
+                    .try_propose(node_id, Value::with_id(ids[round]))
+                    .await;
+            }
+            cluster.tick_and_route(10).await;
+        }
+
+        // Tick to convergence.
+        cluster.tick_and_route(500).await;
+
+        // All 25 entries should be decided.
+        let decided_idx = cluster.nodes.values().next().unwrap().get_decided_idx();
+        assert_eq!(decided_idx, 25, "all 25 entries should be decided");
+
+        // For each node's decided log, verify that entries from the same proposer
+        // appear in the correct relative order.
+        for (&pid, node) in &cluster.nodes {
+            let values = get_decided_values(node);
+
+            for &(proposer_id, ref expected_order) in &proposals {
+                // Extract the subsequence of entries from this proposer
+                let actual_order: Vec<u64> = values
+                    .iter()
+                    .copied()
+                    .filter(|id| expected_order.contains(id))
+                    .collect();
+                assert_eq!(
+                    actual_order, *expected_order,
+                    "node {}: entries from proposer {} are reordered: got {:?}, expected {:?}",
+                    pid, proposer_id, actual_order, expected_order
+                );
+            }
+        }
     });
 }

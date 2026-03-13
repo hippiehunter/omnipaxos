@@ -1,54 +1,13 @@
 use omnipaxos::{
     messages::Message,
-    storage::{memory_storage::MemoryStorage, Entry, Snapshot, Storage},
+    storage::{memory_storage::MemoryStorage, Storage},
     util::LogEntry,
     ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
 };
 use std::collections::HashMap;
 
-// ---------------------------------------------------------------------------
-// Entry + Snapshot types
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-struct Value {
-    id: u64,
-}
-
-impl Value {
-    fn with_id(id: u64) -> Self {
-        Value { id }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-struct ValueSnapshot {
-    map: HashMap<u64, u64>,
-}
-
-impl Snapshot<Value> for ValueSnapshot {
-    fn create(entries: &[Value]) -> Self {
-        let mut map = HashMap::new();
-        for e in entries {
-            map.insert(e.id, e.id);
-        }
-        ValueSnapshot { map }
-    }
-
-    fn merge(&mut self, delta: Self) {
-        self.map.extend(delta.map);
-    }
-
-    fn use_snapshots() -> bool {
-        true
-    }
-}
-
-impl Entry for Value {
-    type Snapshot = ValueSnapshot;
-}
+mod test_utils;
+use test_utils::Value;
 
 // ---------------------------------------------------------------------------
 // TestCluster

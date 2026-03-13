@@ -2,7 +2,7 @@ use omnipaxos::{
     ballot_leader_election::Ballot,
     messages::Message,
     storage::{
-        memory_storage::MemoryStorage, Entry, Snapshot, StopSign, Storage, StorageError, StorageOp,
+        memory_storage::MemoryStorage, StopSign, Storage, StorageError, StorageOp,
         StorageResult,
     },
     ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
@@ -11,49 +11,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-// ===========================================================================
-// Entry + Snapshot types (same as simulation_test.rs)
-// ===========================================================================
-
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-struct Value {
-    id: u64,
-}
-
-impl Value {
-    fn with_id(id: u64) -> Self {
-        Value { id }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-struct ValueSnapshot {
-    map: HashMap<u64, u64>,
-}
-
-impl Snapshot<Value> for ValueSnapshot {
-    fn create(entries: &[Value]) -> Self {
-        let mut map = HashMap::new();
-        for e in entries {
-            map.insert(e.id, e.id);
-        }
-        ValueSnapshot { map }
-    }
-
-    fn merge(&mut self, delta: Self) {
-        self.map.extend(delta.map);
-    }
-
-    fn use_snapshots() -> bool {
-        true
-    }
-}
-
-impl Entry for Value {
-    type Snapshot = ValueSnapshot;
-}
+mod test_utils;
+use test_utils::{Value, ValueSnapshot};
 
 // ===========================================================================
 // FailableStorage — storage wrapper that can inject failures
@@ -177,7 +136,53 @@ impl Storage<Value> for FailableStorage {
         }
 
         check_fail!(self, FailOn::WriteAtomically);
-        self.inner.write_atomically(ops).await
+
+        // Execute ops individually with per-op failure checking and rollback.
+        // We inline the failure check (instead of using check_fail! which does
+        // early return) so that failures go through the rollback path.
+        let backup = self.inner.clone();
+        for op in ops {
+            let fail_op = match &op {
+                StorageOp::AppendEntry(_) => Some(FailOn::AppendEntry),
+                StorageOp::AppendEntries(_) => Some(FailOn::AppendEntries),
+                StorageOp::AppendOnPrefix(_, _) => Some(FailOn::AppendOnPrefix),
+                StorageOp::SetPromise(_) => Some(FailOn::SetPromise),
+                StorageOp::SetDecidedIndex(_) => Some(FailOn::SetDecidedIdx),
+                StorageOp::SetAcceptedRound(_) => Some(FailOn::SetAcceptedRound),
+                StorageOp::SetCompactedIdx(_) => Some(FailOn::SetCompactedIdx),
+                StorageOp::Trim(_) => Some(FailOn::Trim),
+                StorageOp::SetStopsign(_) => Some(FailOn::SetStopsign),
+                StorageOp::SetSnapshot(_) => Some(FailOn::SetSnapshot),
+            };
+            if let Some(ref fop) = fail_op {
+                if self.ctrl.borrow_mut().should_fail(fop) {
+                    self.inner = backup;
+                    return Err(make_storage_error(&format!(
+                        "injected failure: {:?}",
+                        fop
+                    )));
+                }
+            }
+            let result = match op {
+                StorageOp::AppendEntry(entry) => self.inner.append_entry(entry).await,
+                StorageOp::AppendEntries(entries) => self.inner.append_entries(entries).await,
+                StorageOp::AppendOnPrefix(idx, entries) => {
+                    self.inner.append_on_prefix(idx, entries).await
+                }
+                StorageOp::SetPromise(bal) => self.inner.set_promise(bal).await,
+                StorageOp::SetDecidedIndex(idx) => self.inner.set_decided_idx(idx).await,
+                StorageOp::SetAcceptedRound(bal) => self.inner.set_accepted_round(bal).await,
+                StorageOp::SetCompactedIdx(idx) => self.inner.set_compacted_idx(idx).await,
+                StorageOp::Trim(idx) => self.inner.trim(idx).await,
+                StorageOp::SetStopsign(ss) => self.inner.set_stopsign(ss).await,
+                StorageOp::SetSnapshot(snap) => self.inner.set_snapshot(snap).await,
+            };
+            if let Err(e) = result {
+                self.inner = backup;
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     async fn append_entry(&mut self, entry: Value) -> StorageResult<()> {
@@ -364,10 +369,29 @@ fn tick_and_route_cluster(
     nodes: &mut HashMap<u64, OmniPaxos<Value, FailableStorage>>,
     rounds: usize,
 ) {
+    tick_and_route_cluster_impl(nodes, rounds, false)
+}
+
+fn tick_and_route_cluster_tolerant(
+    nodes: &mut HashMap<u64, OmniPaxos<Value, FailableStorage>>,
+    rounds: usize,
+) {
+    tick_and_route_cluster_impl(nodes, rounds, true)
+}
+
+fn tick_and_route_cluster_impl(
+    nodes: &mut HashMap<u64, OmniPaxos<Value, FailableStorage>>,
+    rounds: usize,
+    tolerate_errors: bool,
+) {
     smol::block_on(async {
         for _ in 0..rounds {
             for node in nodes.values_mut() {
-                let _ = node.tick().await; // ignore errors — some tests inject failures
+                match node.tick().await {
+                    Ok(()) => {}
+                    Err(_e) if tolerate_errors => { /* expected in failure-injection tests */ }
+                    Err(e) => panic!("unexpected tick error: {}", e),
+                }
             }
             let mut all_msgs: Vec<Message<Value>> = Vec::new();
             let mut buf = Vec::new();
@@ -378,7 +402,11 @@ fn tick_and_route_cluster(
             for msg in all_msgs {
                 let receiver = msg.get_receiver();
                 if let Some(node) = nodes.get_mut(&receiver) {
-                    let _ = node.handle_incoming(msg).await; // ignore errors
+                    match node.handle_incoming(msg).await {
+                        Ok(()) => {}
+                        Err(_e) if tolerate_errors => { /* expected in failure-injection tests */ }
+                        Err(e) => panic!("unexpected handle_incoming error: {}", e),
+                    }
                 }
             }
         }
@@ -793,7 +821,7 @@ fn test_transient_failure_recovers() {
         }
 
         // Tick and route — the transient failure should not prevent eventual progress
-        tick_and_route_cluster(&mut nodes, 500);
+        tick_and_route_cluster_tolerant(&mut nodes, 500);
 
         // All nodes should eventually decide all entries
         for (&pid, node) in &nodes {
@@ -1228,7 +1256,7 @@ fn test_follower_batch_cache_preserved_on_write_failure() {
                 .await
                 .unwrap();
         }
-        tick_and_route_cluster(&mut nodes, 100);
+        tick_and_route_cluster_tolerant(&mut nodes, 100);
 
         // Clear failure and let node 2 catch up
         failable_ctrl.borrow_mut().permanent_failures.clear();
@@ -1342,7 +1370,7 @@ fn test_leader_state_reverted_on_flush_failure() {
                 .append(Value::with_id(i))
                 .await;
         }
-        tick_and_route_cluster(&mut nodes, 30);
+        tick_and_route_cluster_tolerant(&mut nodes, 30);
 
         // Leader should not have decided beyond 5 because its storage write failed.
         // The fix reverts leader_state.accepted_idx on failure so is_chosen()
@@ -1990,7 +2018,7 @@ fn test_write_atomically_partial_write_demonstrates_inconsistency() {
 /// Verify MemoryStorage's write_atomically rollback on error:
 /// if an op in the middle fails, all preceding ops are rolled back.
 #[test]
-fn test_write_atomically_error_rolls_back() {
+fn test_write_atomically_preflight_error_leaves_state_unchanged() {
     smol::block_on(async {
         let ctrl = Rc::new(RefCell::new(FailCtrl::new()));
         let mut storage = FailableStorage {
@@ -2018,5 +2046,98 @@ fn test_write_atomically_error_rolls_back() {
 
         let decided = storage.get_decided_idx().await.unwrap();
         assert_eq!(decided, 0, "decided_idx should still be 0 after failed write");
+    });
+}
+
+/// Verify write_atomically rollback on mid-operation failure:
+/// if the second op fails, the first op's changes are rolled back.
+#[test]
+fn test_write_atomically_mid_operation_rollback() {
+    smol::block_on(async {
+        let ctrl = Rc::new(RefCell::new(FailCtrl::new()));
+        let mut storage = FailableStorage {
+            inner: MemoryStorage::default(),
+            ctrl: ctrl.clone(),
+        };
+
+        // Pre-populate with one entry
+        storage.append_entry(Value::with_id(1)).await.unwrap();
+        storage.set_decided_idx(0).await.unwrap();
+
+        // Inject failure on SetDecidedIdx -- AppendEntries will succeed but SetDecidedIndex will fail
+        ctrl.borrow_mut().fail_once.insert(FailOn::SetDecidedIdx);
+
+        let ops = vec![
+            StorageOp::AppendEntries(vec![Value::with_id(2), Value::with_id(3)]),
+            StorageOp::SetDecidedIndex(3),
+        ];
+        let result = storage.write_atomically(ops).await;
+        assert!(result.is_err(), "write_atomically should fail when SetDecidedIdx fails");
+
+        // Both operations should be rolled back
+        let len = storage.get_log_len().await.unwrap();
+        assert_eq!(len, 1, "log should still have 1 entry after rollback (AppendEntries was reverted)");
+
+        let decided = storage.get_decided_idx().await.unwrap();
+        assert_eq!(decided, 0, "decided_idx should still be 0 after rollback");
+    });
+}
+
+#[test]
+fn test_crash_recovery_with_torn_write() {
+    smol::block_on(async {
+        // Build a 3-node cluster with FailableStorage on all nodes
+        let (mut nodes, ctrls) = build_cluster_all_failable().await;
+
+        // Elect leader and decide 10 entries
+        tick_and_route_cluster(&mut nodes, 50);
+        let leader = nodes
+            .values()
+            .filter_map(|n| n.get_current_leader().map(|(pid, _)| pid))
+            .next()
+            .unwrap();
+
+        for i in 1..=10 {
+            nodes
+                .get_mut(&leader)
+                .unwrap()
+                .append(Value::with_id(i))
+                .await
+                .unwrap();
+        }
+        tick_and_route_cluster(&mut nodes, 200);
+
+        // Verify all decided
+        for node in nodes.values() {
+            assert_eq!(node.get_decided_idx(), 10);
+        }
+
+        // Set partial_write_limit on the leader to simulate torn write
+        ctrls[&leader].borrow_mut().partial_write_limit = Some(1);
+
+        // Propose more entries (the leader's write_atomically will be partial)
+        for i in 11..=15 {
+            let _ = nodes
+                .get_mut(&leader)
+                .unwrap()
+                .append(Value::with_id(i))
+                .await;
+        }
+        tick_and_route_cluster_tolerant(&mut nodes, 50);
+
+        // Clear the partial_write_limit to simulate recovery after crash
+        ctrls[&leader].borrow_mut().partial_write_limit = None;
+
+        // Tick to convergence -- the protocol should handle the inconsistency
+        tick_and_route_cluster(&mut nodes, 500);
+
+        // All nodes should be consistent
+        // (checking that decided_idx >= 10 at minimum -- torn writes shouldn't lose committed data)
+        for node in nodes.values() {
+            assert!(
+                node.get_decided_idx() >= 10,
+                "committed entries must survive torn write"
+            );
+        }
     });
 }
