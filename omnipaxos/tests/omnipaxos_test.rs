@@ -150,7 +150,7 @@ fn test_basic_replication() {
         for (&pid, node) in &cluster.nodes {
             let decided_idx = node.get_decided_idx();
             assert_eq!(
-                decided_idx, num_entries as usize,
+                decided_idx, num_entries as u64,
                 "node {} should have decided {} entries, got {}",
                 pid, num_entries, decided_idx
             );
@@ -213,7 +213,7 @@ fn test_follower_forwarding() {
         for (&pid, node) in &cluster.nodes {
             let decided_idx = node.get_decided_idx();
             assert_eq!(
-                decided_idx, num_entries as usize,
+                decided_idx, num_entries as u64,
                 "node {} should have decided {} entries, got {}",
                 pid, num_entries, decided_idx
             );
@@ -264,7 +264,7 @@ fn test_non_contiguous_pids() {
         for (&pid, node) in &cluster.nodes {
             let decided_idx = node.get_decided_idx();
             assert_eq!(
-                decided_idx, num_entries as usize,
+                decided_idx, num_entries as u64,
                 "node {} should have decided {} entries, got {}",
                 pid, num_entries, decided_idx
             );
@@ -287,7 +287,7 @@ fn test_trim() {
 
         // Verify all decided.
         for node in cluster.nodes.values() {
-            assert_eq!(node.get_decided_idx(), num_entries as usize);
+            assert_eq!(node.get_decided_idx(), num_entries as u64);
         }
 
         // Trim: must be called on the leader and only up to the min decided idx of all nodes.
@@ -335,7 +335,7 @@ fn test_snapshot() {
 
         // Verify all decided.
         for node in cluster.nodes.values() {
-            assert_eq!(node.get_decided_idx(), num_entries as usize);
+            assert_eq!(node.get_decided_idx(), num_entries as u64);
         }
 
         // Snapshot the first 5 entries on all nodes.
@@ -402,7 +402,7 @@ fn test_single_node_replication() {
         let node = cluster.nodes.get(&1).unwrap();
         assert_eq!(
             node.get_decided_idx(),
-            num_entries as usize,
+            num_entries as u64,
             "single node should decide all entries"
         );
 
@@ -482,7 +482,7 @@ fn test_single_node_recovery() {
                     Value::with_id(1),
                     Value::with_id(2),
                     Value::with_id(3),
-                ]),
+                ], false),
                 StorageOp::SetDecidedIndex(3),
             ])
             .await

@@ -301,7 +301,7 @@ mod docs_integration_test {
         };
         let my_pid = current_config.pid;
 
-        let idx: usize = 2; // some index we last read from
+        let idx: u64 = 2; // some index we last read from
         let decided_entries: Option<Vec<LogEntry<KeyValue>>> =
             omni_paxos.read_decided_suffix(idx).await.unwrap();
 

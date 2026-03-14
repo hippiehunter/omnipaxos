@@ -19,7 +19,7 @@ where
     /// The log suffix.
     pub suffix: Vec<T>,
     /// The index of the log where the entries from `suffix` should be applied at (also the compacted idx of `decided_snapshot` if it exists).
-    pub sync_idx: usize,
+    pub sync_idx: u64,
     /// The accepted StopSign.
     pub stopsign: Option<StopSign>,
 }
@@ -28,8 +28,8 @@ where
 /// Promise without the log update
 pub(crate) struct PromiseMetaData {
     pub n_accepted: Ballot,
-    pub accepted_idx: usize,
-    pub decided_idx: usize,
+    pub accepted_idx: u64,
+    pub decided_idx: u64,
     pub pid: NodeId,
 }
 
@@ -82,7 +82,7 @@ where
     pid_to_idx: HashMap<NodeId, usize>,
     promises_meta: Vec<PromiseState>,
     follower_seq_nums: Vec<SequenceNumber>,
-    accepted_indexes: Vec<usize>,
+    accepted_indexes: Vec<u64>,
     max_promise_meta: PromiseMetaData,
     max_promise_sync: Option<LogSync<T>>,
     latest_accept_meta: Vec<Option<(Ballot, usize)>>,
@@ -92,7 +92,7 @@ where
     /// accepted_idx hasn't advanced; reset on receiving Accepted.
     follower_backoff: Vec<u32>,
     /// Snapshot of accepted_indexes at last backoff tick, for detecting stalls.
-    prev_accepted_indexes: Vec<usize>,
+    prev_accepted_indexes: Vec<u64>,
     pub quorum: Quorum,
 }
 
@@ -215,7 +215,7 @@ where
         &self.max_promise_meta
     }
 
-    pub fn get_max_decided_idx(&self) -> usize {
+    pub fn get_max_decided_idx(&self) -> u64 {
         self.promises_meta
             .iter()
             .filter_map(|p| match p {
@@ -246,7 +246,7 @@ where
     /// promised ones). This is conservative: disconnected nodes retain their last-known
     /// accepted_idx (initialized to 0), so trim is blocked until all nodes catch up.
     /// This prevents trimming entries that a disconnected node still needs.
-    pub fn get_min_all_accepted_idx(&self) -> usize {
+    pub fn get_min_all_accepted_idx(&self) -> u64 {
         self.accepted_indexes.iter().copied().min().unwrap_or(0)
     }
 
@@ -277,7 +277,7 @@ where
         self.latest_accept_meta[pidx] = meta;
     }
 
-    pub fn set_accepted_idx(&mut self, pid: NodeId, idx: usize) {
+    pub fn set_accepted_idx(&mut self, pid: NodeId, idx: u64) {
         let pidx = self.idx(pid);
         self.accepted_indexes[pidx] = idx;
     }
@@ -286,7 +286,7 @@ where
         self.latest_accept_meta[self.idx(pid)]
     }
 
-    pub fn get_decided_idx(&self, pid: NodeId) -> Option<usize> {
+    pub fn get_decided_idx(&self, pid: NodeId) -> Option<u64> {
         let idx = self.idx(pid);
         match &self.promises_meta[idx] {
             PromiseState::Promised(metadata) => Some(metadata.decided_idx),
@@ -294,12 +294,12 @@ where
         }
     }
 
-    pub fn get_accepted_idx(&self, pid: NodeId) -> usize {
+    pub fn get_accepted_idx(&self, pid: NodeId) -> u64 {
         self.accepted_indexes[self.idx(pid)]
     }
 
     /// Returns per-follower data for metrics: `(node_id, accepted_idx, is_promised)`.
-    pub fn get_follower_accepted_indexes(&self) -> Vec<(NodeId, usize, bool)> {
+    pub fn get_follower_accepted_indexes(&self) -> Vec<(NodeId, u64, bool)> {
         self.peers
             .iter()
             .enumerate()
@@ -311,7 +311,7 @@ where
     }
 
     /// Returns true if a quorum of *promised* nodes have accepted up to `idx`.
-    pub fn is_chosen(&self, idx: usize) -> bool {
+    pub fn is_chosen(&self, idx: u64) -> bool {
         let mut count = 0;
         for (i, p) in self.promises_meta.iter().enumerate() {
             if matches!(p, PromiseState::Promised(_)) && self.accepted_indexes[i] >= idx {
@@ -437,7 +437,7 @@ impl<T> SnapshottedEntry<T>
 where
     T: Entry,
 {
-    pub(crate) fn with(trimmed_idx: usize, snapshot: T::Snapshot) -> Self {
+    pub(crate) fn with(trimmed_idx: u64, snapshot: T::Snapshot) -> Self {
         Self {
             trimmed_idx,
             snapshot,
@@ -464,7 +464,7 @@ pub(crate) mod defaults {
 }
 
 #[allow(missing_docs)]
-pub type TrimmedIndex = usize;
+pub type TrimmedIndex = u64;
 
 /// ID for an OmniPaxos node
 pub type NodeId = u64;
@@ -599,7 +599,7 @@ impl Quorum {
 
 /// The entries flushed due to an append operation
 pub(crate) struct AcceptedMetaData<T: Entry> {
-    pub accepted_idx: usize,
+    pub accepted_idx: u64,
     pub entries: Arc<Vec<T>>,
 }
 

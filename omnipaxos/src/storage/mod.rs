@@ -75,22 +75,26 @@ pub type StorageResult<T> = Result<T, AnyError>;
 /// The write operations of the storage implementation.
 #[derive(Debug)]
 pub enum StorageOp<T: Entry> {
-    /// Appends an entry to the end of the log.
-    AppendEntry(T),
-    /// Appends entries to the end of the log.
-    AppendEntries(Vec<T>),
+    /// Appends an entry to the end of the log. The `bool` indicates whether the
+    /// entry is already decided (`true`) or merely accepted (`false`).
+    AppendEntry(T, bool),
+    /// Appends entries to the end of the log. The `bool` indicates whether the
+    /// entries are already decided (`true`) or merely accepted (`false`).
+    AppendEntries(Vec<T>, bool),
     /// Appends entries to the log from the prefix specified by the given index.
-    AppendOnPrefix(usize, Vec<T>),
+    /// The `bool` indicates whether the entries are already decided (`true`) or
+    /// merely accepted (`false`).
+    AppendOnPrefix(u64, Vec<T>, bool),
     /// Sets the round that has been promised.
     SetPromise(Ballot),
     /// Sets the decided index in the log.
-    SetDecidedIndex(usize),
+    SetDecidedIndex(u64),
     /// Sets the latest accepted round.
     SetAcceptedRound(Ballot),
     /// Sets the compacted (i.e. trimmed or snapshotted) index.
-    SetCompactedIdx(usize),
+    SetCompactedIdx(u64),
     /// Removes elements up to the given idx from storage.
-    Trim(usize),
+    Trim(u64),
     /// Sets the StopSign used for reconfiguration.
     SetStopsign(Option<StopSign>),
     /// Sets the snapshot.
@@ -101,8 +105,8 @@ impl<T: Entry> StorageOp<T> {
     /// Returns a short description of this operation for error diagnostics.
     pub fn describe(&self) -> &'static str {
         match self {
-            StorageOp::AppendEntry(_) => "AppendEntry",
-            StorageOp::AppendEntries(_) => "AppendEntries",
+            StorageOp::AppendEntry(..) => "AppendEntry",
+            StorageOp::AppendEntries(..) => "AppendEntries",
             StorageOp::AppendOnPrefix(..) => "AppendOnPrefix",
             StorageOp::SetPromise(_) => "SetPromise",
             StorageOp::SetDecidedIndex(_) => "SetDecidedIndex",
@@ -128,13 +132,13 @@ pub struct PersistedState<T: Entry> {
     /// The latest accepted round.
     pub accepted_round: Option<Ballot>,
     /// The decided log index.
-    pub decided_idx: usize,
+    pub decided_idx: u64,
     /// The compacted (trimmed/snapshotted) index.
-    pub compacted_idx: usize,
+    pub compacted_idx: u64,
     /// The stopsign for reconfiguration.
     pub stopsign: Option<StopSign>,
     /// Log length (excluding compacted entries).
-    pub log_len: usize,
+    pub log_len: u64,
     /// The stored snapshot.
     pub snapshot: Option<T::Snapshot>,
 }
@@ -165,17 +169,17 @@ where
 
     /// Returns the entries in the log in the index interval of [from, to).
     /// If entries **do not exist for the complete interval**, an empty Vector should be returned.
-    async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>>;
+    async fn get_entries(&self, from: u64, to: u64) -> StorageResult<Vec<T>>;
 
     /// Returns the suffix of entries in the log from index `from` (inclusive).
     /// If entries **do not exist for the complete interval**, an empty Vector should be returned.
-    async fn get_suffix(&self, from: usize) -> StorageResult<Vec<T>>;
+    async fn get_suffix(&self, from: u64) -> StorageResult<Vec<T>>;
 
     /// Returns the stored snapshot.
     async fn get_snapshot(&self) -> StorageResult<Option<T::Snapshot>>;
 
     /// Returns the current length of the log (without the trimmed/snapshotted entries).
-    async fn get_log_len(&self) -> StorageResult<usize>;
+    async fn get_log_len(&self) -> StorageResult<u64>;
 
     /// Whether the storage backend is currently ready to create a snapshot.
     ///

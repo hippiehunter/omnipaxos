@@ -97,9 +97,9 @@ pub enum ErrorSubject {
     /// A range of log entries.
     LogEntries {
         /// Start index (inclusive).
-        from: usize,
+        from: u64,
         /// End index (exclusive).
-        to: usize,
+        to: u64,
     },
     /// Snapshot data.
     Snapshot,
@@ -147,7 +147,7 @@ impl StorageError {
     }
 
     /// Create a storage error for a read_entries failure.
-    pub fn read_entries(from: usize, to: usize, source: AnyError) -> Self {
+    pub fn read_entries(from: u64, to: u64, source: AnyError) -> Self {
         Self::new(StorageOperation::ReadEntries, ErrorSubject::LogEntries { from, to }, source)
     }
 

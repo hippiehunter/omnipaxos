@@ -9,9 +9,9 @@ use crate::{
 /// Note: current_seq_num is intentionally NOT included because it must
 /// stay advanced even on failure (the leader has already moved on).
 pub(crate) struct EngineStateSnapshot<T: Entry> {
-    pub decided_idx: usize,
-    pub accepted_idx: usize,
-    pub compacted_idx: usize,
+    pub decided_idx: u64,
+    pub accepted_idx: u64,
+    pub compacted_idx: u64,
     pub promise: Ballot,
     pub accepted_round: Ballot,
     pub stopsign: Option<StopSign>,
@@ -64,9 +64,9 @@ pub(crate) struct EngineState<T: Entry> {
     pub batched_entries: Vec<T>,
     pub promise: Ballot,
     pub accepted_round: Ballot,
-    pub decided_idx: usize,
-    pub accepted_idx: usize,
-    pub compacted_idx: usize,
+    pub decided_idx: u64,
+    pub accepted_idx: u64,
+    pub compacted_idx: u64,
     pub stopsign: Option<StopSign>,
 }
 
@@ -76,7 +76,7 @@ pub(crate) struct PendingReadIndex {
     /// Unique ID for this request.
     pub read_id: u64,
     /// The decided_idx at the time the read was requested.
-    pub read_idx: usize,
+    pub read_idx: u64,
     /// Number of confirmations received from followers.
     pub confirmations: usize,
     /// The quorum size needed.
@@ -127,7 +127,7 @@ impl<T: Entry> EngineState<T> {
     }
 
     /// Returns decided_idx without counting the stopsign.
-    pub fn get_decided_idx_without_stopsign(&self) -> usize {
+    pub fn get_decided_idx_without_stopsign(&self) -> u64 {
         if self.stopsign_is_decided() {
             self.decided_idx - 1
         } else {

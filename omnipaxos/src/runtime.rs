@@ -52,7 +52,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                     .map_err(|e| e.with_details(details))?;
                 }
                 Command::AppendEntries(entries) => {
-                    let ops = vec![StorageOp::AppendEntries(entries)];
+                    let ops = vec![StorageOp::AppendEntries(entries, false)];
                     let details = crate::storage::describe_batch(&ops);
                     Self::wrap_storage(
                         StorageOperation::WriteAtomic,
@@ -158,8 +158,8 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     async fn create_log_sync(
         &self,
         engine: &Engine<T>,
-        common_prefix_idx: usize,
-        other_logs_decided_idx: usize,
+        common_prefix_idx: u64,
+        other_logs_decided_idx: u64,
     ) -> Result<LogSync<T>, StorageError> {
         let decided_idx = engine.get_decided_idx();
         let (decided_snapshot, suffix, sync_idx) =
@@ -169,14 +169,14 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                     .await?;
                 let suffix = Self::wrap_storage(
                     StorageOperation::ReadSuffix,
-                    ErrorSubject::LogEntries { from: decided_idx, to: usize::MAX },
+                    ErrorSubject::LogEntries { from: decided_idx, to: u64::MAX },
                     self.storage.get_suffix(decided_idx).await,
                 )?;
                 (delta_snapshot, suffix, compacted_idx)
             } else {
                 let suffix = Self::wrap_storage(
                     StorageOperation::ReadSuffix,
-                    ErrorSubject::LogEntries { from: common_prefix_idx, to: usize::MAX },
+                    ErrorSubject::LogEntries { from: common_prefix_idx, to: u64::MAX },
                     self.storage.get_suffix(common_prefix_idx).await,
                 )?;
                 (None, suffix, common_prefix_idx)
@@ -193,8 +193,8 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     async fn create_diff_snapshot(
         &self,
         engine: &Engine<T>,
-        from_idx: usize,
-    ) -> Result<(Option<SnapshotType<T>>, usize), StorageError> {
+        from_idx: u64,
+    ) -> Result<(Option<SnapshotType<T>>, u64), StorageError> {
         let log_decided_idx = engine.s.get_decided_idx_without_stopsign();
         let compacted_idx = engine.get_compacted_idx();
         let snapshot = if from_idx <= compacted_idx {
@@ -227,7 +227,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     async fn create_snapshot(
         &self,
         engine: &Engine<T>,
-        compact_idx: usize,
+        compact_idx: u64,
     ) -> Result<T::Snapshot, StorageError> {
         let current_compacted_idx = engine.get_compacted_idx();
         let entries = Self::wrap_storage(
@@ -260,7 +260,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         r: R,
     ) -> Result<Option<Vec<LogEntry<T>>>, StorageError>
     where
-        R: RangeBounds<usize>,
+        R: RangeBounds<u64>,
     {
         use std::ops::Bound;
         let from_idx = match r.start_bound() {
@@ -301,14 +301,14 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                 Ok(Some(entries))
             }
             (IndexEntry::Compacted, IndexEntry::Entry) => {
-                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);
+                let mut entries = Vec::with_capacity((to_idx - compacted_idx + 1) as usize);
                 entries.push(self.create_compacted_entry(compacted_idx).await?);
                 let mut e = self.create_read_log_entries(engine, compacted_idx, to_idx).await?;
                 entries.append(&mut e);
                 Ok(Some(entries))
             }
             (IndexEntry::Compacted, IndexEntry::StopSign(ss)) => {
-                let mut entries = Vec::with_capacity(to_idx - compacted_idx + 1);
+                let mut entries = Vec::with_capacity((to_idx - compacted_idx + 1) as usize);
                 entries.push(self.create_compacted_entry(compacted_idx).await?);
                 let mut e = self.create_read_log_entries(engine, compacted_idx, to_idx - 1).await?;
                 entries.append(&mut e);
@@ -326,7 +326,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     pub(crate) async fn read_decided_suffix(
         &self,
         engine: &Engine<T>,
-        from_idx: usize,
+        from_idx: u64,
     ) -> Result<Option<Vec<LogEntry<T>>>, StorageError> {
         let decided_idx = engine.get_decided_idx();
         if from_idx < decided_idx {
@@ -339,9 +339,9 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     fn get_entry_type(
         &self,
         engine: &Engine<T>,
-        idx: usize,
-        compacted_idx: usize,
-        accepted_idx: usize,
+        idx: u64,
+        compacted_idx: u64,
+        accepted_idx: u64,
     ) -> Result<Option<IndexEntry>, StorageError> {
         if idx < compacted_idx {
             Ok(Some(IndexEntry::Compacted))
@@ -360,8 +360,8 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     async fn create_read_log_entries(
         &self,
         engine: &Engine<T>,
-        from: usize,
-        to: usize,
+        from: u64,
+        to: u64,
     ) -> Result<Vec<LogEntry<T>>, StorageError> {
         let decided_idx = engine.get_decided_idx();
         let entries = Self::wrap_storage(
@@ -372,7 +372,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         .into_iter()
         .enumerate()
         .map(|(idx, e)| {
-            let log_idx = idx + from;
+            let log_idx = idx as u64 + from;
             if log_idx < decided_idx {
                 LogEntry::Decided(e)
             } else {
@@ -385,7 +385,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
 
     async fn create_compacted_entry(
         &self,
-        compacted_idx: usize,
+        compacted_idx: u64,
     ) -> Result<LogEntry<T>, StorageError> {
         Self::wrap_storage(
             StorageOperation::ReadSnapshot,
@@ -406,7 +406,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     pub(crate) async fn try_snapshot(
         &mut self,
         engine: &mut Engine<T>,
-        snapshot_idx: Option<usize>,
+        snapshot_idx: Option<u64>,
         force: bool,
     ) -> Result<(), crate::CompactionErr> {
         if !force && !self.storage.can_snapshot().await {

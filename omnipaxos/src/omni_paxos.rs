@@ -79,7 +79,7 @@ impl OmniPaxosConfig {
 
         validate_persisted_state(&state)?;
 
-        let mut accepted_idx = state.log_len + state.compacted_idx;
+        let mut accepted_idx: u64 = state.log_len + state.compacted_idx;
         if state.stopsign.is_some() {
             accepted_idx += 1;
         }
@@ -139,6 +139,7 @@ impl OmniPaxosConfig {
             last_quorum_ack_tick: None,
             lease_tick_timeout: self.server_config.lease_tick_timeout,
             metrics_recorder: None,
+            cluster_config: self.cluster_config.clone(),
             configuration_id: self.cluster_config.configuration_id,
         })
     }
@@ -148,7 +149,7 @@ impl OmniPaxosConfig {
 /// Catches corrupted or inconsistent storage before constructing the node.
 fn validate_persisted_state<T: Entry>(state: &PersistedState<T>) -> Result<(), OmniPaxosError> {
     let max_accepted = state.log_len + state.compacted_idx
-        + state.stopsign.is_some() as usize;
+        + state.stopsign.is_some() as u64;
 
     if state.compacted_idx > state.decided_idx {
         return Err(OmniPaxosError::CorruptedState(format!(
@@ -347,6 +348,7 @@ where
     last_quorum_ack_tick: Option<u64>,
     lease_tick_timeout: Option<u64>,
     metrics_recorder: Option<Box<dyn crate::metrics::MetricsRecorder>>,
+    cluster_config: ClusterConfig,
     configuration_id: ConfigurationId,
 }
 
@@ -399,7 +401,7 @@ where
     ) -> (
         crate::engine::state::Role,
         crate::engine::state::Phase,
-        usize,
+        u64,
         NodeId,
         u64,
     ) {
@@ -416,7 +418,7 @@ where
         &mut self,
         old_role: crate::engine::state::Role,
         old_phase: crate::engine::state::Phase,
-        old_decided: usize,
+        old_decided: u64,
         old_leader: NodeId,
         old_dropped: u64,
     ) {
@@ -505,7 +507,7 @@ where
     /// Initiates the trim process.
     /// # Arguments
     /// * `trim_index` - Deletes all entries up to [`trim_index`], if the [`trim_index`] is `None` then the minimum index accepted by **ALL** servers will be used as the [`trim_index`].
-    pub async fn trim(&mut self, trim_index: Option<usize>) -> Result<(), CompactionErr> {
+    pub async fn trim(&mut self, trim_index: Option<u64>) -> Result<(), CompactionErr> {
         use crate::engine::state::Role;
         match self.engine.s.state {
             (Role::Leader, _) => {
@@ -554,7 +556,7 @@ where
     /// `local_only` - If `true`, only this server snapshots the log. If `false` all servers performs the snapshot.
     pub async fn snapshot(
         &mut self,
-        compact_idx: Option<usize>,
+        compact_idx: Option<u64>,
         local_only: bool,
     ) -> Result<(), CompactionErr> {
         self.runtime
@@ -578,13 +580,18 @@ where
     }
 
     /// Return the decided index. 0 means that no entry has been decided.
-    pub fn get_decided_idx(&self) -> usize {
+    pub fn get_decided_idx(&self) -> u64 {
         self.engine.get_decided_idx()
     }
 
     /// Return trim index from storage.
-    pub fn get_compacted_idx(&self) -> usize {
+    pub fn get_compacted_idx(&self) -> u64 {
         self.engine.get_compacted_idx()
+    }
+
+    /// Returns the cluster configuration this OmniPaxos instance was built with.
+    pub fn get_current_config(&self) -> &ClusterConfig {
+        &self.cluster_config
     }
 
     /// Returns the ID of the current leader and whether the node's `Phase` is `Phase::Accepted`.
@@ -615,7 +622,7 @@ where
     }
 
     /// Read entry at index `idx` in the log. Returns `None` if `idx` is out of bounds.
-    pub async fn read(&self, idx: usize) -> Result<Option<LogEntry<T>>, OmniPaxosError> {
+    pub async fn read(&self, idx: u64) -> Result<Option<LogEntry<T>>, OmniPaxosError> {
         match self
             .runtime
             .read(&self.engine, idx..idx + 1)
@@ -629,7 +636,7 @@ where
     /// Read entries in the range `r` in the log. Returns `None` if `r` is out of bounds.
     pub async fn read_entries<R>(&self, r: R) -> Result<Option<Vec<LogEntry<T>>>, OmniPaxosError>
     where
-        R: RangeBounds<usize>,
+        R: RangeBounds<u64>,
     {
         Ok(self.runtime.read(&self.engine, r).await?)
     }
@@ -637,7 +644,7 @@ where
     /// Read all decided entries starting at `from_idx` (inclusive) in the log. Returns `None` if `from_idx` is out of bounds.
     pub async fn read_decided_suffix(
         &self,
-        from_idx: usize,
+        from_idx: u64,
     ) -> Result<Option<Vec<LogEntry<T>>>, OmniPaxosError> {
         Ok(self
             .runtime
@@ -1092,18 +1099,18 @@ pub enum ReadGuard {
 #[derive(Debug, Clone)]
 #[must_use = "call read_idx() to check if reads are safe"]
 pub struct ReadBarrier {
-    pub(crate) read_idx: usize,
+    pub(crate) read_idx: u64,
 }
 
 impl ReadBarrier {
     /// The decided index at which reads are linearizable.
     /// Wait until `get_decided_idx() >= read_idx()` before reading.
-    pub fn read_idx(&self) -> usize {
+    pub fn read_idx(&self) -> u64 {
         self.read_idx
     }
 
     /// Returns true if the node's decided_idx has reached the barrier.
-    pub fn is_ready(&self, current_decided_idx: usize) -> bool {
+    pub fn is_ready(&self, current_decided_idx: u64) -> bool {
         current_decided_idx >= self.read_idx
     }
 }
@@ -1292,11 +1299,11 @@ impl<T: Entry> ProposeErr<T> {
 #[must_use = "compaction errors indicate the operation did not complete"]
 pub enum CompactionErr {
     /// Snapshot was called with an index that is not decided yet. Returns the currently decided index.
-    UndecidedIndex(usize),
+    UndecidedIndex(u64),
     /// Snapshot was called with an index which is already trimmed. Returns the currently compacted index.
-    TrimmedIndex(usize),
+    TrimmedIndex(u64),
     /// Trim was called with an index that is not decided by all servers yet. Returns the index decided by ALL servers currently.
-    NotAllDecided(usize),
+    NotAllDecided(u64),
     /// Trim was called at a follower node. Trim must be called by the leader, which is the returned NodeId.
     NotCurrentLeader(NodeId),
     /// A storage backend error occurred during the compaction operation.

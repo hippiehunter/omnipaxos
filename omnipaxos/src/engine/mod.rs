@@ -145,15 +145,15 @@ impl<T: Entry> Engine<T> {
         self.s.promise
     }
 
-    pub(crate) fn get_decided_idx(&self) -> usize {
+    pub(crate) fn get_decided_idx(&self) -> u64 {
         self.s.decided_idx
     }
 
-    pub(crate) fn get_compacted_idx(&self) -> usize {
+    pub(crate) fn get_compacted_idx(&self) -> u64 {
         self.s.compacted_idx
     }
 
-    pub(crate) fn get_accepted_idx(&self) -> usize {
+    pub(crate) fn get_accepted_idx(&self) -> u64 {
         self.s.accepted_idx
     }
 
@@ -361,7 +361,7 @@ impl<T: Entry> Engine<T> {
     }
 
     /// Validate and emit trim command.
-    pub(crate) fn try_trim(&mut self, idx: usize) {
+    pub(crate) fn try_trim(&mut self, idx: u64) {
         let decided_idx = self.s.decided_idx;
         let log_decided_idx = self.s.get_decided_idx_without_stopsign();
         let new_compacted_idx = if idx < decided_idx {
@@ -435,9 +435,9 @@ pub(crate) enum ProposeResult {
 pub(crate) struct InitialEngineState {
     pub promise: Option<Ballot>,
     pub accepted_round: Option<Ballot>,
-    pub decided_idx: usize,
-    pub accepted_idx: usize,
-    pub compacted_idx: usize,
+    pub decided_idx: u64,
+    pub accepted_idx: u64,
+    pub compacted_idx: u64,
     pub stopsign: Option<StopSign>,
     pub flexible_quorum: Option<crate::util::FlexibleQuorum>,
 }
@@ -451,9 +451,9 @@ pub(crate) enum EngineAction<T: Entry> {
     /// Need to build a LogSync from storage before completing.
     NeedLogSync {
         /// The index from which to build the sync.
-        from_idx: usize,
+        from_idx: u64,
         /// The decided index of the other node.
-        other_decided_idx: usize,
+        other_decided_idx: u64,
         /// What to do with the LogSync once built.
         continuation: LogSyncContinuation,
     },
@@ -461,7 +461,7 @@ pub(crate) enum EngineAction<T: Entry> {
     NeedMultipleLogSyncs(Vec<LogSyncRequest<T>>),
     /// Need to build/merge a snapshot before completing.
     NeedSnapshot {
-        compact_idx: usize,
+        compact_idx: u64,
         continuation: SnapshotContinuation<T>,
     },
 }
@@ -473,7 +473,7 @@ pub(crate) enum LogSyncContinuation {
         prep_n: Ballot,
         from: NodeId,
         na: Ballot,
-        accepted_idx: usize,
+        accepted_idx: u64,
     },
     /// Complete an AcceptSync send (leader → follower).
     CompleteAcceptSync { to: NodeId },
@@ -482,8 +482,8 @@ pub(crate) enum LogSyncContinuation {
 /// Request for a LogSync build during majority promises handling.
 pub(crate) struct LogSyncRequest<T: Entry> {
     pub to: NodeId,
-    pub from_idx: usize,
-    pub other_decided_idx: usize,
+    pub from_idx: u64,
+    pub other_decided_idx: u64,
     pub _phantom: std::marker::PhantomData<T>,
 }
 
@@ -494,12 +494,12 @@ pub(crate) enum SnapshotContinuation<T: Entry> {
     CompleteSnapshot {
         #[allow(dead_code)]
         local_only: bool,
-        snapshot_idx: Option<usize>,
+        snapshot_idx: Option<u64>,
     },
     /// Complete a sync_log delta merge: merge `delta` into the existing snapshot.
     CompleteSyncLogDelta {
         delta: T::Snapshot,
         #[allow(dead_code)]
-        compact_idx: usize,
+        compact_idx: u64,
     },
 }

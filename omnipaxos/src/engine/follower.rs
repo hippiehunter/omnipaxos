@@ -28,7 +28,7 @@ impl<T: Entry> Engine<T> {
             let num_new = self.s.batched_entries.len();
             let mut ops = Vec::with_capacity(2);
             if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone()));
+                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
             }
             ops.push(StorageOp::SetPromise(prep.n));
             self.commands.push(Command::WriteAtomic(ops));
@@ -36,7 +36,7 @@ impl<T: Entry> Engine<T> {
             if num_new > 0 {
                 self.s.batched_entries.clear();
             }
-            self.s.accepted_idx += num_new;
+            self.s.accepted_idx += num_new as u64;
             self.s.promise = prep.n;
 
             self.s.state = (Role::Follower, Phase::Prepare);
@@ -95,7 +95,7 @@ impl<T: Entry> Engine<T> {
         prep_n: Ballot,
         from: NodeId,
         na: Ballot,
-        accepted_idx: usize,
+        accepted_idx: u64,
         log_sync: crate::util::LogSync<T>,
     ) {
         let promise = Promise {
@@ -188,9 +188,9 @@ impl<T: Entry> Engine<T> {
             let entries = Arc::try_unwrap(acc_dec.entries).unwrap_or_else(|arc| (*arc).clone());
             // Batch the entries
             let append_res = self.s.append_entries_to_batch(entries);
-            let mut new_accepted_idx: Option<usize> = None;
+            let mut new_accepted_idx: Option<u64> = None;
             if let Some(flushed_entries) = append_res {
-                let num = flushed_entries.len();
+                let num = flushed_entries.len() as u64;
                 self.commands
                     .push(Command::AppendEntries(flushed_entries));
                 self.s.accepted_idx += num;
@@ -218,7 +218,7 @@ impl<T: Entry> Engine<T> {
             let num_new = self.s.batched_entries.len();
             let mut ops = Vec::with_capacity(2);
             if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone()));
+                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
             }
             ops.push(StorageOp::SetStopsign(Some(acc_ss.ss.clone())));
             self.commands.push(Command::WriteAtomic(ops));
@@ -226,7 +226,7 @@ impl<T: Entry> Engine<T> {
             if num_new > 0 {
                 self.s.batched_entries.clear();
             }
-            self.s.accepted_idx += num_new;
+            self.s.accepted_idx += num_new as u64;
             if self.s.stopsign.is_none() {
                 self.s.accepted_idx += 1;
             }
@@ -255,18 +255,18 @@ impl<T: Entry> Engine<T> {
 
     /// Update decided index, flushing batch if needed.
     /// Returns Some(new_accepted_idx) if entries were flushed.
-    fn update_decided_idx_and_flush(&mut self, new_decided_idx: usize) -> Option<usize> {
+    fn update_decided_idx_and_flush(&mut self, new_decided_idx: u64) -> Option<u64> {
         if new_decided_idx <= self.s.decided_idx {
             return None;
         }
         if new_decided_idx > self.s.accepted_idx {
             // Need to flush batch to maintain decided <= accepted
-            let num_new = self.s.batched_entries.len();
+            let num_new = self.s.batched_entries.len() as u64;
             let new_accepted_idx = self.s.accepted_idx + num_new;
             let clamped_decided_idx = new_decided_idx.min(new_accepted_idx);
             let mut ops = Vec::with_capacity(2);
             if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone()));
+                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
             }
             ops.push(StorageOp::SetDecidedIndex(clamped_decided_idx));
             self.commands.push(Command::WriteAtomic(ops));
@@ -286,7 +286,7 @@ impl<T: Entry> Engine<T> {
         }
     }
 
-    pub(crate) fn reply_accepted(&mut self, n: Ballot, accepted_idx: usize) {
+    pub(crate) fn reply_accepted(&mut self, n: Ballot, accepted_idx: u64) {
         let latest_accepted = self.get_latest_accepted_message(n);
         match latest_accepted {
             Some(acc) => acc.accepted_idx = accepted_idx,
@@ -442,7 +442,7 @@ impl<T: Entry> Engine<T> {
             return;
         }
         let entries = self.s.take_batched_entries();
-        let num = entries.len();
+        let num = entries.len() as u64;
         self.commands.push(Command::AppendEntries(entries));
         self.s.accepted_idx += num;
         let new_accepted_idx = self.s.accepted_idx;

@@ -48,16 +48,16 @@ impl Storage<Value> for SharedMemoryStorage {
     async fn load_state(&self) -> StorageResult<omnipaxos::storage::PersistedState<Value>> {
         self.inner.borrow().load_state().await
     }
-    async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<Value>> {
+    async fn get_entries(&self, from: u64, to: u64) -> StorageResult<Vec<Value>> {
         self.inner.borrow().get_entries(from, to).await
     }
-    async fn get_suffix(&self, from: usize) -> StorageResult<Vec<Value>> {
+    async fn get_suffix(&self, from: u64) -> StorageResult<Vec<Value>> {
         self.inner.borrow().get_suffix(from).await
     }
     async fn get_snapshot(&self) -> StorageResult<Option<ValueSnapshot>> {
         self.inner.borrow().get_snapshot().await
     }
-    async fn get_log_len(&self) -> StorageResult<usize> {
+    async fn get_log_len(&self) -> StorageResult<u64> {
         self.inner.borrow().get_log_len().await
     }
 }
@@ -297,7 +297,7 @@ impl SimCluster {
         None
     }
 
-    fn get_decided_indices(&self) -> BTreeMap<u64, usize> {
+    fn get_decided_indices(&self) -> BTreeMap<u64, u64> {
         self.nodes
             .iter()
             .map(|(&pid, node)| (pid, node.get_decided_idx()))
@@ -311,7 +311,7 @@ impl SimCluster {
         // After crash recovery with snapshots, some nodes may have compacted
         // entries that others still have as Decided. We can only compare
         // entries above the highest compacted index across all nodes.
-        let mut max_compacted = 0usize;
+        let mut max_compacted = 0u64;
         for node in self.nodes.values() {
             max_compacted = max_compacted.max(node.get_compacted_idx());
         }
@@ -366,7 +366,7 @@ impl SimCluster {
             self.logs_are_consistent().await,
             "decided logs are not consistent across nodes"
         );
-        let decided_indices: Vec<usize> = self
+        let decided_indices: Vec<u64> = self
             .nodes
             .values()
             .map(|node| node.get_decided_idx())
@@ -398,7 +398,7 @@ async fn elect_leader(cluster: &mut SimCluster) -> u64 {
 }
 
 #[allow(dead_code)]
-async fn wait_for_decided(cluster: &mut SimCluster, target: usize, max_rounds: usize) {
+async fn wait_for_decided(cluster: &mut SimCluster, target: u64, max_rounds: usize) {
     for _ in 0..max_rounds {
         cluster.tick_and_route(1).await;
         if cluster
@@ -476,7 +476,7 @@ async fn assert_logs_consistent(cluster: &SimCluster) {
 }
 
 /// Verify all live nodes have the same decided_idx.
-fn assert_all_decided(cluster: &SimCluster, expected: usize) {
+fn assert_all_decided(cluster: &SimCluster, expected: u64) {
     for (&pid, node) in &cluster.nodes {
         assert_eq!(
             node.get_decided_idx(),
@@ -781,7 +781,7 @@ fn test_symmetric_partition_no_progress() {
         }
         cluster.tick_and_route(100).await;
 
-        let pre_partition_decided: BTreeMap<u64, usize> = cluster.get_decided_indices();
+        let pre_partition_decided: BTreeMap<u64, u64> = cluster.get_decided_indices();
 
         // Partition [1,2] from [3,4] — neither has majority (need 3 of 4).
         let _filter_handle = cluster.partition(vec![1, 2], vec![3, 4]);

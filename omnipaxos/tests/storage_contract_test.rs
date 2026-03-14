@@ -107,17 +107,17 @@ impl Storage<Value> for FailableStorage {
         self.inner.load_state().await
     }
 
-    async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<Value>> {
+    async fn get_entries(&self, from: u64, to: u64) -> StorageResult<Vec<Value>> {
         check_fail!(self, FailOn::GetEntries);
         self.inner.get_entries(from, to).await
     }
 
-    async fn get_log_len(&self) -> StorageResult<usize> {
+    async fn get_log_len(&self) -> StorageResult<u64> {
         check_fail!(self, FailOn::GetLogLen);
         self.inner.get_log_len().await
     }
 
-    async fn get_suffix(&self, from: usize) -> StorageResult<Vec<Value>> {
+    async fn get_suffix(&self, from: u64) -> StorageResult<Vec<Value>> {
         check_fail!(self, FailOn::GetSuffix);
         self.inner.get_suffix(from).await
     }
@@ -372,7 +372,7 @@ fn test_append_and_get_entries() {
 
         let entries: Vec<Value> = (1..=5).map(Value::with_id).collect();
         storage
-            .write_atomically(vec![StorageOp::AppendEntries(entries.clone())])
+            .write_atomically(vec![StorageOp::AppendEntries(entries.clone(), false)])
             .await
             .unwrap();
 
@@ -393,7 +393,7 @@ fn test_append_and_get_entries() {
 
         // Append single entry
         storage
-            .write_atomically(vec![StorageOp::AppendEntry(Value::with_id(6))])
+            .write_atomically(vec![StorageOp::AppendEntry(Value::with_id(6), false)])
             .await
             .unwrap();
         assert_eq!(storage.get_log_len().await.unwrap(), 6);
@@ -408,14 +408,14 @@ fn test_append_on_prefix_truncates() {
         // Append 5 entries
         let entries: Vec<Value> = (1..=5).map(Value::with_id).collect();
         storage
-            .write_atomically(vec![StorageOp::AppendEntries(entries)])
+            .write_atomically(vec![StorageOp::AppendEntries(entries, false)])
             .await
             .unwrap();
 
         // Append on prefix at index 3 — keeps entries 0..3 and appends new ones
         let new_entries = vec![Value::with_id(100), Value::with_id(200)];
         storage
-            .write_atomically(vec![StorageOp::AppendOnPrefix(3, new_entries)])
+            .write_atomically(vec![StorageOp::AppendOnPrefix(3, new_entries, false)])
             .await
             .unwrap();
 
@@ -441,7 +441,7 @@ fn test_write_atomically_all_succeed() {
 
         let ballot = make_ballot(1, 1);
         let ops = vec![
-            StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)]),
+            StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)], false),
             StorageOp::SetPromise(ballot),
             StorageOp::SetDecidedIndex(2),
             StorageOp::SetAcceptedRound(ballot),
@@ -466,7 +466,7 @@ fn test_trim_removes_entries() {
         let entries: Vec<Value> = (1..=10).map(Value::with_id).collect();
         storage
             .write_atomically(vec![
-                StorageOp::AppendEntries(entries),
+                StorageOp::AppendEntries(entries, false),
                 StorageOp::SetDecidedIndex(10),
             ])
             .await
@@ -507,7 +507,7 @@ fn test_get_entries_boundary_behavior() {
         // Append 3 entries
         let entries: Vec<Value> = (1..=3).map(Value::with_id).collect();
         storage
-            .write_atomically(vec![StorageOp::AppendEntries(entries)])
+            .write_atomically(vec![StorageOp::AppendEntries(entries, false)])
             .await
             .unwrap();
 
@@ -734,7 +734,7 @@ fn test_write_atomically_fails_cleanly() {
             .write_atomically(vec![StorageOp::AppendEntries(vec![
                 Value::with_id(1),
                 Value::with_id(2),
-            ])])
+            ], false)])
             .await
             .unwrap();
         let ballot = make_ballot(1, 1);
@@ -748,7 +748,7 @@ fn test_write_atomically_fails_cleanly() {
 
         // Try write_atomically — should fail without modifying state
         let ops = vec![
-            StorageOp::AppendEntries(vec![Value::with_id(3)]),
+            StorageOp::AppendEntries(vec![Value::with_id(3)], false),
             StorageOp::SetDecidedIndex(3),
             StorageOp::SetPromise(make_ballot(2, 1)),
         ];
@@ -772,7 +772,7 @@ fn test_write_atomically_fails_cleanly() {
 
         // After the transient failure, write_atomically should work
         let ops = vec![
-            StorageOp::AppendEntries(vec![Value::with_id(3)]),
+            StorageOp::AppendEntries(vec![Value::with_id(3)], false),
             StorageOp::SetDecidedIndex(3),
         ];
         storage.write_atomically(ops).await.unwrap();
@@ -795,7 +795,7 @@ fn test_partial_write_breaks_promise_invariant() {
 
         let ballot = make_ballot(5, 1);
         let ops = vec![
-            StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)]),
+            StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)], false),
             StorageOp::SetPromise(ballot),
         ];
         storage.write_atomically(ops).await.unwrap();
@@ -827,7 +827,7 @@ fn test_partial_write_breaks_decided_invariant() {
         ctrl.borrow_mut().partial_write_limit = Some(1);
 
         let ops = vec![
-            StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)]),
+            StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)], false),
             StorageOp::SetDecidedIndex(2),
         ];
         storage.write_atomically(ops).await.unwrap();
@@ -930,7 +930,7 @@ fn test_get_entries_out_of_bounds_returns_empty() {
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
         let entries: Vec<Value> = (1..=3).map(Value::with_id).collect();
         storage
-            .write_atomically(vec![StorageOp::AppendEntries(entries)])
+            .write_atomically(vec![StorageOp::AppendEntries(entries, false)])
             .await
             .unwrap();
 
@@ -953,7 +953,7 @@ fn test_get_entries_after_trim_underflow() {
         let entries: Vec<Value> = (1..=10).map(Value::with_id).collect();
         storage
             .write_atomically(vec![
-                StorageOp::AppendEntries(entries),
+                StorageOp::AppendEntries(entries, false),
                 StorageOp::SetDecidedIndex(10),
                 StorageOp::Trim(5),
                 StorageOp::SetCompactedIdx(5),
@@ -1307,7 +1307,7 @@ fn test_leader_state_reverted_on_flush_failure() {
         );
 
         // All nodes should agree
-        let decided_indices: Vec<usize> = nodes.values().map(|n| n.get_decided_idx()).collect();
+        let decided_indices: Vec<u64> = nodes.values().map(|n| n.get_decided_idx()).collect();
         let max_decided = *decided_indices.iter().max().unwrap();
         let min_decided = *decided_indices.iter().min().unwrap();
         assert_eq!(
@@ -1790,7 +1790,7 @@ fn test_append_on_prefix_at_trim_boundary() {
         // Append 10 entries
         storage
             .write_atomically(vec![StorageOp::AppendEntries(
-                (0..10).map(|i| Value { id: i }).collect(),
+                (0..10).map(|i| Value { id: i }).collect(), false,
             )])
             .await
             .unwrap();
@@ -1804,7 +1804,7 @@ fn test_append_on_prefix_at_trim_boundary() {
         // append_on_prefix at exactly trimmed_idx (5) — should truncate to empty, then extend
         let new_entries = vec![Value { id: 100 }, Value { id: 101 }];
         storage
-            .write_atomically(vec![StorageOp::AppendOnPrefix(5, new_entries)])
+            .write_atomically(vec![StorageOp::AppendOnPrefix(5, new_entries, false)])
             .await
             .unwrap();
 
@@ -1825,7 +1825,7 @@ fn test_append_on_prefix_above_trim_boundary() {
         // Append 10 entries (ids 0-9)
         storage
             .write_atomically(vec![StorageOp::AppendEntries(
-                (0..10).map(|i| Value { id: i }).collect(),
+                (0..10).map(|i| Value { id: i }).collect(), false,
             )])
             .await
             .unwrap();
@@ -1839,7 +1839,7 @@ fn test_append_on_prefix_above_trim_boundary() {
         // append_on_prefix at 7 — should keep entries at indices 3..7 and replace 7+
         let new_entries = vec![Value { id: 200 }, Value { id: 201 }];
         storage
-            .write_atomically(vec![StorageOp::AppendOnPrefix(7, new_entries)])
+            .write_atomically(vec![StorageOp::AppendOnPrefix(7, new_entries, false)])
             .await
             .unwrap();
 
@@ -1861,7 +1861,7 @@ fn test_get_suffix_beyond_log_end() {
 
         storage
             .write_atomically(vec![StorageOp::AppendEntries(
-                (0..5).map(|i| Value { id: i }).collect(),
+                (0..5).map(|i| Value { id: i }).collect(), false,
             )])
             .await
             .unwrap();
@@ -1884,7 +1884,7 @@ fn test_get_suffix_after_trim() {
 
         storage
             .write_atomically(vec![StorageOp::AppendEntries(
-                (0..10).map(|i| Value { id: i }).collect(),
+                (0..10).map(|i| Value { id: i }).collect(), false,
             )])
             .await
             .unwrap();
@@ -1931,7 +1931,7 @@ fn test_write_atomically_partial_write_demonstrates_inconsistency() {
 
         // Append initial entry
         storage
-            .write_atomically(vec![StorageOp::AppendEntry(Value { id: 1 })])
+            .write_atomically(vec![StorageOp::AppendEntry(Value { id: 1 }, false)])
             .await
             .unwrap();
         let initial_len = storage.get_log_len().await.unwrap();
@@ -1941,7 +1941,7 @@ fn test_write_atomically_partial_write_demonstrates_inconsistency() {
         ctrl.borrow_mut().partial_write_limit = Some(1);
 
         let ops = vec![
-            StorageOp::AppendEntries(vec![Value { id: 2 }, Value { id: 3 }]),
+            StorageOp::AppendEntries(vec![Value { id: 2 }, Value { id: 3 }], false),
             StorageOp::SetDecidedIndex(3), // This op will be silently skipped
         ];
         let result = storage.write_atomically(ops).await;
@@ -1974,7 +1974,7 @@ fn test_write_atomically_preflight_error_leaves_state_unchanged() {
 
         // Append initial entry
         storage
-            .write_atomically(vec![StorageOp::AppendEntry(Value { id: 1 })])
+            .write_atomically(vec![StorageOp::AppendEntry(Value { id: 1 }, false)])
             .await
             .unwrap();
 
@@ -1982,7 +1982,7 @@ fn test_write_atomically_preflight_error_leaves_state_unchanged() {
         ctrl.borrow_mut().permanent_failures.insert(FailOn::WriteAtomically);
 
         let ops = vec![
-            StorageOp::AppendEntries(vec![Value { id: 2 }, Value { id: 3 }]),
+            StorageOp::AppendEntries(vec![Value { id: 2 }, Value { id: 3 }], false),
             StorageOp::SetDecidedIndex(3),
         ];
         let result = storage.write_atomically(ops).await;
@@ -2010,7 +2010,7 @@ fn test_write_atomically_mid_operation_rollback() {
 
         // Pre-populate with one entry
         storage
-            .write_atomically(vec![StorageOp::AppendEntry(Value::with_id(1))])
+            .write_atomically(vec![StorageOp::AppendEntry(Value::with_id(1), false)])
             .await
             .unwrap();
 
@@ -2019,7 +2019,7 @@ fn test_write_atomically_mid_operation_rollback() {
         ctrl.borrow_mut().fail_once.insert(FailOn::WriteAtomically);
 
         let ops = vec![
-            StorageOp::AppendEntries(vec![Value::with_id(2), Value::with_id(3)]),
+            StorageOp::AppendEntries(vec![Value::with_id(2), Value::with_id(3)], false),
             StorageOp::SetDecidedIndex(3),
         ];
         let result = storage.write_atomically(ops).await;
@@ -2136,7 +2136,7 @@ fn test_startup_validates_decided_gt_accepted() {
                 StorageOp::AppendEntries(vec![
                     Value::with_id(1), Value::with_id(2), Value::with_id(3),
                     Value::with_id(4), Value::with_id(5),
-                ]),
+                ], false),
                 StorageOp::SetDecidedIndex(10),
             ])).unwrap();
         }).await;
@@ -2199,7 +2199,7 @@ fn test_startup_valid_state_with_data() {
         let result = build_with_state(|s| {
             let ballot = Ballot { config_id: 1, n: 3, priority: 0, pid: 1 };
             smol::block_on(s.write_atomically(vec![
-                StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)]),
+                StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)], false),
                 StorageOp::SetPromise(ballot),
                 StorageOp::SetAcceptedRound(ballot),
                 StorageOp::SetDecidedIndex(2),
@@ -2254,16 +2254,16 @@ impl Storage<Value> for DeferrableStorage {
     async fn load_state(&self) -> StorageResult<PersistedState<Value>> {
         self.inner.load_state().await
     }
-    async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<Value>> {
+    async fn get_entries(&self, from: u64, to: u64) -> StorageResult<Vec<Value>> {
         self.inner.get_entries(from, to).await
     }
-    async fn get_suffix(&self, from: usize) -> StorageResult<Vec<Value>> {
+    async fn get_suffix(&self, from: u64) -> StorageResult<Vec<Value>> {
         self.inner.get_suffix(from).await
     }
     async fn get_snapshot(&self) -> StorageResult<Option<ValueSnapshot>> {
         self.inner.get_snapshot().await
     }
-    async fn get_log_len(&self) -> StorageResult<usize> {
+    async fn get_log_len(&self) -> StorageResult<u64> {
         self.inner.get_log_len().await
     }
     async fn can_snapshot(&self) -> bool {

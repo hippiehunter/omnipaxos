@@ -49,11 +49,11 @@ pub struct FollowerMetrics {
     /// The follower's node ID.
     pub node_id: NodeId,
     /// The follower's last known accepted index.
-    pub accepted_idx: usize,
+    pub accepted_idx: u64,
     /// Whether the follower has promised to this leader.
     pub is_promised: bool,
     /// How far behind the leader's accepted_idx this follower is.
-    pub replication_lag: usize,
+    pub replication_lag: u64,
     /// The tick at which the last heartbeat was received from this peer (if tracked).
     pub last_heartbeat_tick: Option<u64>,
     /// Whether this follower is currently backed off due to sustained unresponsiveness.
@@ -74,11 +74,11 @@ pub struct Metrics {
     /// The current promise ballot.
     pub promise: Ballot,
     /// The decided log index.
-    pub decided_idx: usize,
+    pub decided_idx: u64,
     /// The accepted log index.
-    pub accepted_idx: usize,
+    pub accepted_idx: u64,
     /// The compacted log index.
-    pub compacted_idx: usize,
+    pub compacted_idx: u64,
     /// Total number of messages dropped due to buffer overflow.
     pub dropped_messages: u64,
     /// Number of entries currently in the batch buffer.
@@ -120,11 +120,11 @@ pub trait MetricsRecorder: Send {
     /// Called when this node's role changes (e.g., follower → leader).
     fn on_role_change(&self, _pid: NodeId, _old: Role, _new: Role) {}
     /// Called when the decided index advances.
-    fn on_decided(&self, _pid: NodeId, _old_idx: usize, _new_idx: usize) {}
+    fn on_decided(&self, _pid: NodeId, _old_idx: u64, _new_idx: u64) {}
     /// Called when the leader changes.
     fn on_leader_change(&self, _pid: NodeId, _old_leader: NodeId, _new_leader: NodeId) {}
     /// Called when the leader receives a quorum ack.
-    fn on_quorum_ack(&self, _pid: NodeId, _decided_idx: usize) {}
+    fn on_quorum_ack(&self, _pid: NodeId, _decided_idx: u64) {}
     /// Called when a message is dropped due to buffer overflow.
     fn on_message_dropped(&self, _pid: NodeId, _total_dropped: u64) {}
     /// Called when the phase changes.

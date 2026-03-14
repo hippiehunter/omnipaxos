@@ -13,9 +13,9 @@ where
     log: VecDeque<T>,
     n_prom: Option<Ballot>,
     acc_round: Option<Ballot>,
-    ld: usize,
-    trimmed_idx: usize,
-    compacted_idx: usize,
+    ld: u64,
+    trimmed_idx: u64,
+    compacted_idx: u64,
     snapshot: Option<T::Snapshot>,
     stopsign: Option<StopSign>,
 }
@@ -39,10 +39,10 @@ impl<T: Entry> MemoryStorage<T> {
     // Internal helpers used by write_atomically
     fn apply_op(&mut self, op: StorageOp<T>) {
         match op {
-            StorageOp::AppendEntry(entry) => self.log.push_back(entry),
-            StorageOp::AppendEntries(entries) => self.log.extend(entries),
-            StorageOp::AppendOnPrefix(from_idx, entries) => {
-                self.log.truncate(from_idx.saturating_sub(self.trimmed_idx));
+            StorageOp::AppendEntry(entry, _decided) => self.log.push_back(entry),
+            StorageOp::AppendEntries(entries, _decided) => self.log.extend(entries),
+            StorageOp::AppendOnPrefix(from_idx, entries, _decided) => {
+                self.log.truncate(from_idx.saturating_sub(self.trimmed_idx) as usize);
                 self.log.extend(entries);
             }
             StorageOp::SetPromise(bal) => self.n_prom = Some(bal),
@@ -50,7 +50,7 @@ impl<T: Entry> MemoryStorage<T> {
             StorageOp::SetAcceptedRound(bal) => self.acc_round = Some(bal),
             StorageOp::SetCompactedIdx(idx) => self.compacted_idx = idx,
             StorageOp::Trim(trimmed_idx) => {
-                let to_trim = (trimmed_idx - self.trimmed_idx).min(self.log.len());
+                let to_trim = ((trimmed_idx - self.trimmed_idx) as usize).min(self.log.len());
                 self.log.drain(0..to_trim);
                 self.trimmed_idx = trimmed_idx;
             }
@@ -81,14 +81,14 @@ where
             decided_idx: self.ld,
             compacted_idx: self.compacted_idx,
             stopsign: self.stopsign.clone(),
-            log_len: self.log.len(),
+            log_len: self.log.len() as u64,
             snapshot: self.snapshot.clone(),
         })
     }
 
-    async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>> {
-        let from = from.saturating_sub(self.trimmed_idx);
-        let to = to.saturating_sub(self.trimmed_idx);
+    async fn get_entries(&self, from: u64, to: u64) -> StorageResult<Vec<T>> {
+        let from = from.saturating_sub(self.trimmed_idx) as usize;
+        let to = to.saturating_sub(self.trimmed_idx) as usize;
         if from >= self.log.len() {
             return Ok(vec![]);
         }
@@ -99,12 +99,12 @@ where
             .collect())
     }
 
-    async fn get_log_len(&self) -> StorageResult<usize> {
-        Ok(self.log.len())
+    async fn get_log_len(&self) -> StorageResult<u64> {
+        Ok(self.log.len() as u64)
     }
 
-    async fn get_suffix(&self, from: usize) -> StorageResult<Vec<T>> {
-        let start = from.saturating_sub(self.trimmed_idx);
+    async fn get_suffix(&self, from: u64) -> StorageResult<Vec<T>> {
+        let start = from.saturating_sub(self.trimmed_idx) as usize;
         if start >= self.log.len() {
             Ok(vec![])
         } else {

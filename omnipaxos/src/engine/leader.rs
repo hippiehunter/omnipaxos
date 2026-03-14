@@ -38,7 +38,7 @@ impl<T: Entry> Engine<T> {
             let num_new = self.s.batched_entries.len();
             let mut ops = Vec::with_capacity(2);
             if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone()));
+                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
             }
             ops.push(StorageOp::SetPromise(n));
             self.commands.push(Command::WriteAtomic(ops));
@@ -46,7 +46,7 @@ impl<T: Entry> Engine<T> {
             if num_new > 0 {
                 self.s.batched_entries.clear();
             }
-            self.s.accepted_idx += num_new;
+            self.s.accepted_idx += num_new as u64;
             self.s.promise = n;
 
             /* insert my promise */
@@ -159,7 +159,7 @@ impl<T: Entry> Engine<T> {
             // Emit append command
             self.commands
                 .push(Command::AppendEntries(flushed_entries));
-            let num = shared.len();
+            let num = shared.len() as u64;
             self.s.accepted_idx += num;
             let metadata = AcceptedMetaData {
                 accepted_idx: self.s.accepted_idx,
@@ -179,7 +179,7 @@ impl<T: Entry> Engine<T> {
             let shared = Arc::new(flushed_entries.clone());
             self.commands
                 .push(Command::AppendEntries(flushed_entries));
-            let num = shared.len();
+            let num = shared.len() as u64;
             self.s.accepted_idx += num;
             let metadata = AcceptedMetaData {
                 accepted_idx: self.s.accepted_idx,
@@ -199,7 +199,7 @@ impl<T: Entry> Engine<T> {
         // Build atomic transaction: flush entries + set stopsign
         let mut ops = Vec::with_capacity(2);
         if has_batched {
-            ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone()));
+            ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
         }
         ops.push(StorageOp::SetStopsign(Some(ss.clone())));
         self.commands.push(Command::WriteAtomic(ops));
@@ -207,7 +207,7 @@ impl<T: Entry> Engine<T> {
         // Update shadow state
         let accepted_entries_metadata = if has_batched {
             let entries = self.s.take_batched_entries();
-            self.s.accepted_idx += num_new;
+            self.s.accepted_idx += num_new as u64;
             Some(AcceptedMetaData {
                 accepted_idx: self.s.accepted_idx,
                 entries: Arc::new(entries),
@@ -234,7 +234,7 @@ impl<T: Entry> Engine<T> {
     /// Build AcceptSync message. This needs storage reads (create_log_sync),
     /// so returns EngineAction::NeedLogSync when it would need to read.
     /// For now, in the refactored version the Runtime handles the full send_accsync flow.
-    pub(crate) fn prepare_accsync_params(&self, to: NodeId) -> (usize, usize) {
+    pub(crate) fn prepare_accsync_params(&self, to: NodeId) -> (u64, u64) {
         let current_n = self.s.leader_state.n_leader;
         let PromiseMetaData {
             n_accepted: prev_round_max_promise_n,
@@ -338,7 +338,7 @@ impl<T: Entry> Engine<T> {
         }));
     }
 
-    pub(crate) fn send_decide(&mut self, to: NodeId, decided_idx: usize, resend: bool) {
+    pub(crate) fn send_decide(&mut self, to: NodeId, decided_idx: u64, resend: bool) {
         let seq_num = match resend {
             true => self.s.leader_state.get_seq_num(to),
             false => self.s.leader_state.next_seq_num(to),
@@ -372,7 +372,7 @@ impl<T: Entry> Engine<T> {
         if !self.accepted_reconfiguration() {
             if !self.s.buffered_proposals.is_empty() {
                 let entries = std::mem::take(&mut self.s.buffered_proposals);
-                let num = entries.len();
+                let num = entries.len() as u64;
                 self.commands.push(Command::AppendEntries(entries));
                 self.s.accepted_idx += num;
             }
@@ -420,15 +420,15 @@ impl<T: Entry> Engine<T> {
     pub(crate) fn sync_log_engine(
         &mut self,
         accepted_round: Ballot,
-        decided_idx: usize,
+        decided_idx: u64,
         log_sync: Option<crate::util::LogSync<T>>,
-    ) -> Option<(T::Snapshot, usize)> {
+    ) -> Option<(T::Snapshot, u64)> {
         use crate::storage::SnapshotType;
 
         let mut new_compacted_idx = self.s.compacted_idx;
         let mut new_stopsign = self.s.stopsign.clone();
         let mut new_accepted_idx = self.s.accepted_idx;
-        let mut needs_delta_merge: Option<(T::Snapshot, usize)> = None;
+        let mut needs_delta_merge: Option<(T::Snapshot, u64)> = None;
 
         let mut sync_txn: Vec<StorageOp<T>> = vec![
             StorageOp::SetAcceptedRound(accepted_round),
@@ -452,8 +452,8 @@ impl<T: Entry> Engine<T> {
                 }
                 None => (),
             }
-            new_accepted_idx = sync.sync_idx + sync.suffix.len();
-            sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix));
+            new_accepted_idx = sync.sync_idx + sync.suffix.len() as u64;
+            sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix, false));
             match sync.stopsign {
                 Some(ss) => {
                     new_stopsign = Some(ss.clone());
@@ -817,7 +817,7 @@ impl<T: Entry> Engine<T> {
         if self.s.batched_entries.is_empty() {
             return;
         }
-        let projected_accepted_idx = self.s.accepted_idx + self.s.batched_entries.len();
+        let projected_accepted_idx = self.s.accepted_idx + self.s.batched_entries.len() as u64;
         let old_accepted_idx = self.s.leader_state.get_accepted_idx(self.s.pid);
         self.s
             .leader_state
@@ -841,14 +841,14 @@ impl<T: Entry> Engine<T> {
             return;
         }
 
-        let num_new = entries.len();
+        let num_new = entries.len() as u64;
         let entries_for_msg = entries.clone();
         let new_accepted_idx = self.s.accepted_idx + num_new;
         let clamped_decided_idx = decided_idx.min(new_accepted_idx);
 
         // Emit atomic flush + decide
         self.commands.push(Command::WriteAtomic(vec![
-            StorageOp::AppendEntries(entries),
+            StorageOp::AppendEntries(entries, false),
             StorageOp::SetDecidedIndex(clamped_decided_idx),
         ]));
 
