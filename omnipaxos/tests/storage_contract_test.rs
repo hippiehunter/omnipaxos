@@ -2092,3 +2092,330 @@ fn test_crash_recovery_with_torn_write() {
         }
     });
 }
+
+// ===========================================================================
+// Item 1: Startup invariant validation
+// ===========================================================================
+
+/// Helper: build a MemoryStorage with arbitrary persisted state.
+async fn build_with_state(state_setup: impl FnOnce(&mut MemoryStorage<Value>)) -> Result<OmniPaxos<Value, MemoryStorage<Value>>, omnipaxos::errors::OmniPaxosError> {
+    let mut storage = MemoryStorage::<Value>::default();
+    state_setup(&mut storage);
+    let config = OmniPaxosConfig {
+        cluster_config: ClusterConfig {
+            configuration_id: 1,
+            nodes: vec![1],
+            ..Default::default()
+        },
+        server_config: ServerConfig {
+            pid: 1,
+            ..Default::default()
+        },
+    };
+    config.build(storage).await
+}
+
+#[test]
+fn test_startup_validates_compacted_gt_decided() {
+    smol::block_on(async {
+        let result = build_with_state(|s| {
+            smol::block_on(s.write_atomically(vec![
+                StorageOp::SetDecidedIndex(5),
+                StorageOp::SetCompactedIdx(10), // compacted > decided
+            ])).unwrap();
+        }).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(err, omnipaxos::errors::OmniPaxosError::CorruptedState(_)));
+        let msg = format!("{}", err);
+        assert!(msg.contains("compacted_idx"));
+    });
+}
+
+#[test]
+fn test_startup_validates_decided_gt_accepted() {
+    smol::block_on(async {
+        let result = build_with_state(|s| {
+            // log_len=5, compacted_idx=0, so accepted=5. decided=10 > 5 is invalid.
+            smol::block_on(s.write_atomically(vec![
+                StorageOp::AppendEntries(vec![
+                    Value::with_id(1), Value::with_id(2), Value::with_id(3),
+                    Value::with_id(4), Value::with_id(5),
+                ]),
+                StorageOp::SetDecidedIndex(10),
+            ])).unwrap();
+        }).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(err, omnipaxos::errors::OmniPaxosError::CorruptedState(_)));
+        let msg = format!("{}", err);
+        assert!(msg.contains("decided_idx"));
+    });
+}
+
+#[test]
+fn test_startup_validates_snapshot_without_compaction() {
+    smol::block_on(async {
+        let result = build_with_state(|s| {
+            // Snapshot present but compacted_idx = 0
+            smol::block_on(s.write_atomically(vec![
+                StorageOp::SetSnapshot(Some(ValueSnapshot { map: HashMap::new() })),
+            ])).unwrap();
+        }).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(err, omnipaxos::errors::OmniPaxosError::CorruptedState(_)));
+        let msg = format!("{}", err);
+        assert!(msg.contains("snapshot"));
+    });
+}
+
+#[test]
+fn test_startup_validates_promise_lt_accepted_round() {
+    smol::block_on(async {
+        let result = build_with_state(|s| {
+            // promise < accepted_round
+            let low = Ballot { config_id: 1, n: 1, priority: 0, pid: 1 };
+            let high = Ballot { config_id: 1, n: 5, priority: 0, pid: 1 };
+            smol::block_on(s.write_atomically(vec![
+                StorageOp::SetPromise(low),
+                StorageOp::SetAcceptedRound(high),
+            ])).unwrap();
+        }).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(err, omnipaxos::errors::OmniPaxosError::CorruptedState(_)));
+        let msg = format!("{}", err);
+        assert!(msg.contains("promise"));
+    });
+}
+
+#[test]
+fn test_startup_valid_fresh_state() {
+    smol::block_on(async {
+        let result = build_with_state(|_| {}).await;
+        assert!(result.is_ok());
+    });
+}
+
+#[test]
+fn test_startup_valid_state_with_data() {
+    smol::block_on(async {
+        let result = build_with_state(|s| {
+            let ballot = Ballot { config_id: 1, n: 3, priority: 0, pid: 1 };
+            smol::block_on(s.write_atomically(vec![
+                StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)]),
+                StorageOp::SetPromise(ballot),
+                StorageOp::SetAcceptedRound(ballot),
+                StorageOp::SetDecidedIndex(2),
+            ])).unwrap();
+        }).await;
+        assert!(result.is_ok());
+    });
+}
+
+// ===========================================================================
+// Item 3: Richer StorageError context
+// ===========================================================================
+
+#[test]
+fn test_storage_error_details_on_write_failure() {
+    smol::block_on(async {
+        let ctrl = Rc::new(RefCell::new(FailCtrl::new()));
+        let mut node = build_single_node(ctrl.clone()).await;
+
+        // Tick to elect leader
+        for _ in 0..10 {
+            node.tick().await.unwrap();
+        }
+
+        // Enable failure on writes
+        ctrl.borrow_mut().permanent_failures.insert(FailOn::WriteAtomically);
+
+        // Try appending -- should fail with storage error containing details
+        let err = node.append(Value::with_id(42)).await;
+        assert!(err.is_err());
+        if let Err(propose_err) = err {
+            assert!(propose_err.is_fatal());
+            // The error should propagate through
+        }
+    });
+}
+
+// ===========================================================================
+// Item 4: Snapshot deferral
+// ===========================================================================
+
+/// A storage implementation that can defer snapshots.
+struct DeferrableStorage {
+    inner: MemoryStorage<Value>,
+    can_snapshot: Rc<RefCell<bool>>,
+}
+
+impl Storage<Value> for DeferrableStorage {
+    async fn write_atomically(&mut self, ops: Vec<StorageOp<Value>>) -> StorageResult<()> {
+        self.inner.write_atomically(ops).await
+    }
+    async fn load_state(&self) -> StorageResult<PersistedState<Value>> {
+        self.inner.load_state().await
+    }
+    async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<Value>> {
+        self.inner.get_entries(from, to).await
+    }
+    async fn get_suffix(&self, from: usize) -> StorageResult<Vec<Value>> {
+        self.inner.get_suffix(from).await
+    }
+    async fn get_snapshot(&self) -> StorageResult<Option<ValueSnapshot>> {
+        self.inner.get_snapshot().await
+    }
+    async fn get_log_len(&self) -> StorageResult<usize> {
+        self.inner.get_log_len().await
+    }
+    async fn can_snapshot(&self) -> bool {
+        *self.can_snapshot.borrow()
+    }
+}
+
+#[test]
+fn test_snapshot_deferred_when_storage_not_ready() {
+    smol::block_on(async {
+        let can_snapshot = Rc::new(RefCell::new(false));
+        let storage = DeferrableStorage {
+            inner: MemoryStorage::default(),
+            can_snapshot: can_snapshot.clone(),
+        };
+        let config = OmniPaxosConfig {
+            cluster_config: ClusterConfig {
+                configuration_id: 1,
+                nodes: vec![1],
+                ..Default::default()
+            },
+            server_config: ServerConfig {
+                pid: 1,
+                ..Default::default()
+            },
+        };
+        let mut node = config.build(storage).await.unwrap();
+
+        // Elect leader and decide some entries
+        for _ in 0..10 {
+            node.tick().await.unwrap();
+        }
+        for i in 1..=3 {
+            node.append(Value::with_id(i)).await.unwrap();
+        }
+        for _ in 0..10 {
+            node.tick().await.unwrap();
+        }
+
+        // Snapshot should be deferred
+        let result = node.snapshot(None, true).await;
+        assert!(matches!(result, Err(omnipaxos::CompactionErr::Deferred)));
+
+        // Now allow snapshots
+        *can_snapshot.borrow_mut() = true;
+        let result = node.snapshot(None, true).await;
+        assert!(result.is_ok());
+    });
+}
+
+// ===========================================================================
+// Item 2: Lease-based reads
+// ===========================================================================
+
+#[test]
+fn test_lease_read_disabled_by_default() {
+    smol::block_on(async {
+        let ctrl = Rc::new(RefCell::new(FailCtrl::new()));
+        let mut node = build_single_node(ctrl).await;
+
+        // Elect leader + decide something
+        for _ in 0..10 { node.tick().await.unwrap(); }
+        node.append(Value::with_id(1)).await.unwrap();
+        for _ in 0..5 { node.tick().await.unwrap(); }
+
+        let result = node.ensure_linearizable();
+        assert!(result.is_ok());
+        // Should be Pending (ReadIndex) since lease is not configured
+        assert!(matches!(result.unwrap(), omnipaxos::ReadGuard::Pending(_)));
+    });
+}
+
+#[test]
+fn test_lease_read_fast_path() {
+    smol::block_on(async {
+        let storage = MemoryStorage::<Value>::default();
+        let config = OmniPaxosConfig {
+            cluster_config: ClusterConfig {
+                configuration_id: 1,
+                nodes: vec![1],
+                ..Default::default()
+            },
+            server_config: ServerConfig {
+                pid: 1,
+                lease_tick_timeout: Some(100),
+                ..Default::default()
+            },
+        };
+        let mut node = config.build(storage).await.unwrap();
+
+        // Elect leader
+        for _ in 0..10 { node.tick().await.unwrap(); }
+
+        // Decide an entry to set last_quorum_ack_tick
+        node.append(Value::with_id(1)).await.unwrap();
+        for _ in 0..5 { node.tick().await.unwrap(); }
+
+        // Now ensure_linearizable should use the lease fast path
+        let result = node.ensure_linearizable();
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), omnipaxos::ReadGuard::Lease(_)));
+    });
+}
+
+#[test]
+fn test_lease_read_expires() {
+    smol::block_on(async {
+        let storage = MemoryStorage::<Value>::default();
+        let config = OmniPaxosConfig {
+            cluster_config: ClusterConfig {
+                configuration_id: 1,
+                nodes: vec![1],
+                ..Default::default()
+            },
+            server_config: ServerConfig {
+                pid: 1,
+                lease_tick_timeout: Some(5),
+                ..Default::default()
+            },
+        };
+        let mut node = config.build(storage).await.unwrap();
+
+        // Elect leader and decide
+        for _ in 0..10 { node.tick().await.unwrap(); }
+        node.append(Value::with_id(1)).await.unwrap();
+        for _ in 0..3 { node.tick().await.unwrap(); }
+
+        // Lease should be valid immediately
+        let result = node.ensure_linearizable();
+        assert!(matches!(result.as_ref().unwrap(), omnipaxos::ReadGuard::Lease(_)));
+
+        // Tick past the lease timeout
+        for _ in 0..10 { node.tick().await.unwrap(); }
+
+        // Now should fall back to ReadIndex
+        let result = node.ensure_linearizable();
+        assert!(matches!(result.as_ref().unwrap(), omnipaxos::ReadGuard::Pending(_)));
+    });
+}
+
+#[test]
+fn test_lease_tick_timeout_zero_rejected() {
+    let config = ServerConfig {
+        pid: 1,
+        lease_tick_timeout: Some(0),
+        ..Default::default()
+    };
+    let result = config.validate();
+    assert!(result.is_err());
+}

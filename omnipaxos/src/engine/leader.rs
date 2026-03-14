@@ -638,6 +638,7 @@ impl<T: Entry> Engine<T> {
                     pending.confirmations += 1;
                     if pending.confirmations >= pending.quorum_size {
                         pending.quorum_reached = true;
+                        self.s.read_quorum_reached = true;
                     }
                 }
             }

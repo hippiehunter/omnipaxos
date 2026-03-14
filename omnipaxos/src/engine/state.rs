@@ -55,6 +55,9 @@ pub(crate) struct EngineState<T: Entry> {
     // --- Linearizable reads ---
     pub pending_read_indexes: Vec<PendingReadIndex>,
     pub next_read_id: u64,
+    /// Set to `true` when a read-index request reaches quorum.
+    /// Checked and reset by `OmniPaxos` to update `last_quorum_ack_tick`.
+    pub read_quorum_reached: bool,
 
     // --- Cached storage state (from StateCache) ---
     pub batch_size: usize,

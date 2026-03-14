@@ -5,7 +5,7 @@ use crate::{
     errors::{valid_config, ConfigError, OmniPaxosError, StorageError},
     messages::Message,
     runtime::Runtime,
-    storage::{Entry, StopSign, Storage},
+    storage::{Entry, PersistedState, StopSign, Storage},
     util::{
         defaults::{BUFFER_SIZE, ELECTION_TIMEOUT, FLUSH_BATCH_TIMEOUT, RESEND_MESSAGE_TIMEOUT},
         ConfigurationId, FlexibleQuorum, LogEntry, LogicalClock, NodeId,
@@ -77,6 +77,8 @@ impl OmniPaxosConfig {
             .await
             .map_err(StorageError::load_state)?;
 
+        validate_persisted_state(&state)?;
+
         let mut accepted_idx = state.log_len + state.compacted_idx;
         if state.stopsign.is_some() {
             accepted_idx += 1;
@@ -135,9 +137,49 @@ impl OmniPaxosConfig {
             metrics_version: 0,
             running_state: crate::metrics::RunningState::Healthy,
             last_quorum_ack_tick: None,
+            lease_tick_timeout: self.server_config.lease_tick_timeout,
             metrics_recorder: None,
         })
     }
+}
+
+/// Validate invariants of persisted state loaded from storage at startup.
+/// Catches corrupted or inconsistent storage before constructing the node.
+fn validate_persisted_state<T: Entry>(state: &PersistedState<T>) -> Result<(), OmniPaxosError> {
+    let max_accepted = state.log_len + state.compacted_idx
+        + state.stopsign.is_some() as usize;
+
+    if state.compacted_idx > state.decided_idx {
+        return Err(OmniPaxosError::CorruptedState(format!(
+            "compacted_idx ({}) > decided_idx ({})",
+            state.compacted_idx, state.decided_idx
+        )));
+    }
+
+    if state.decided_idx > max_accepted {
+        return Err(OmniPaxosError::CorruptedState(format!(
+            "decided_idx ({}) > accepted_idx ({})",
+            state.decided_idx, max_accepted
+        )));
+    }
+
+    if state.snapshot.is_some() && state.compacted_idx == 0 {
+        return Err(OmniPaxosError::CorruptedState(
+            "snapshot present but compacted_idx is 0".to_string(),
+        ));
+    }
+
+    if let (Some(ref promise), Some(ref accepted_round)) = (&state.promise, &state.accepted_round)
+    {
+        if promise < accepted_round {
+            return Err(OmniPaxosError::CorruptedState(format!(
+                "promise ({:?}) < accepted_round ({:?})",
+                promise, accepted_round
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Configuration for an `OmniPaxos` cluster.
@@ -237,6 +279,15 @@ pub struct ServerConfig {
     pub flush_batch_tick_timeout: u64,
     /// Custom priority for this node to be elected as the leader.
     pub leader_priority: u32,
+    /// Optional lease-based read timeout in ticks. When set, the leader can serve
+    /// linearizable reads without a network round-trip if fewer than this many
+    /// ticks have elapsed since the last quorum acknowledgment.
+    ///
+    /// **Safety:** Lease reads rely on bounded clock drift. The lease timeout
+    /// should be significantly less than `election_tick_timeout` to maintain
+    /// safety. If clock drift exceeds the margin, linearizability may be violated.
+    /// Defaults to `None` (disabled — always uses ReadIndex protocol).
+    pub lease_tick_timeout: Option<u64>,
 }
 
 impl ServerConfig {
@@ -253,6 +304,9 @@ impl ServerConfig {
             self.resend_message_tick_timeout != 0,
             "Resend message tick timeout must be greater than 0"
         );
+        if let Some(lease) = self.lease_tick_timeout {
+            valid_config!(lease > 0, "Lease tick timeout must be greater than 0");
+        }
         Ok(())
     }
 }
@@ -267,6 +321,7 @@ impl Default for ServerConfig {
             batch_size: 1,
             flush_batch_tick_timeout: FLUSH_BATCH_TIMEOUT,
             leader_priority: 0,
+            lease_tick_timeout: None,
         }
     }
 }
@@ -289,6 +344,7 @@ where
     metrics_version: u64,
     running_state: crate::metrics::RunningState,
     last_quorum_ack_tick: Option<u64>,
+    lease_tick_timeout: Option<u64>,
     metrics_recorder: Option<Box<dyn crate::metrics::MetricsRecorder>>,
 }
 
@@ -417,6 +473,14 @@ where
             }
         }
 
+        // Update last_quorum_ack_tick when a ReadIndex request reaches quorum
+        if self.engine.s.read_quorum_reached {
+            self.engine.s.read_quorum_reached = false;
+            if *new_role == R::Leader {
+                self.last_quorum_ack_tick = Some(self.tick_count);
+            }
+        }
+
         if new_leader != old_leader {
             changed = true;
             if let Some(ref recorder) = self.metrics_recorder {
@@ -492,7 +556,7 @@ where
         local_only: bool,
     ) -> Result<(), CompactionErr> {
         self.runtime
-            .try_snapshot(&mut self.engine, compact_idx)
+            .try_snapshot(&mut self.engine, compact_idx, false)
             .await?;
         if !local_only {
             let pid = self.engine.s.pid;
@@ -865,10 +929,30 @@ where
     }
 
     /// Start a linearizable read by confirming leader authority.
-    /// Returns a `read_id` that can be polled with [`poll_read_barrier`].
-    /// For single-node clusters, the barrier is immediately available.
-    pub fn ensure_linearizable(&mut self) -> Result<u64, ReadError> {
-        self.engine.start_read_index()
+    ///
+    /// If a lease timeout is configured and the leader recently received a quorum
+    /// acknowledgment, returns [`ReadGuard::Lease`] with an immediate barrier
+    /// (no network round-trip). Otherwise falls back to the ReadIndex protocol
+    /// and returns [`ReadGuard::Pending`] with a `read_id` to poll.
+    ///
+    /// For single-node clusters, the ReadIndex barrier is also immediately available.
+    pub fn ensure_linearizable(&mut self) -> Result<ReadGuard, ReadError> {
+        use crate::engine::state::{Role, Phase as EngPhase};
+        // Lease fast path: skip network round-trip if within lease window
+        if let Some(lease_timeout) = self.lease_tick_timeout {
+            if self.engine.s.state == (Role::Leader, EngPhase::Accept) {
+                if let Some(last_ack) = self.last_quorum_ack_tick {
+                    let elapsed = self.tick_count.saturating_sub(last_ack);
+                    if elapsed < lease_timeout {
+                        return Ok(ReadGuard::Lease(ReadBarrier {
+                            read_idx: self.engine.get_decided_idx(),
+                        }));
+                    }
+                }
+            }
+        }
+        // Slow path: ReadIndex protocol
+        self.engine.start_read_index().map(ReadGuard::Pending)
     }
 
     /// Poll for a read barrier. Returns `Ok(ReadBarrier)` when a quorum has confirmed
@@ -950,6 +1034,17 @@ impl Default for RuntimeConfig {
             enable_proposals: true,
         }
     }
+}
+
+/// Result of [`ensure_linearizable()`](OmniPaxos::ensure_linearizable).
+#[derive(Debug)]
+pub enum ReadGuard {
+    /// Leader lease is valid; the read barrier is immediately available.
+    /// No network round-trip was needed.
+    Lease(ReadBarrier),
+    /// ReadIndex protocol has been initiated. Poll with
+    /// [`poll_read_barrier()`](OmniPaxos::poll_read_barrier) using this ID.
+    Pending(u64),
 }
 
 /// A read barrier indicating that reads at or below `read_idx` are linearizable.
@@ -1145,6 +1240,8 @@ pub enum CompactionErr {
     NotCurrentLeader(NodeId),
     /// A storage backend error occurred during the compaction operation.
     Storage(StorageError),
+    /// Snapshot deferred: storage backend indicated it is not ready. Retry later.
+    Deferred,
 }
 
 impl CompactionErr {

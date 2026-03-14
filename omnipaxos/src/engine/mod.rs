@@ -85,6 +85,7 @@ impl<T: Entry> Engine<T> {
                 transfer_state: None,
                 pending_read_indexes: Vec::new(),
                 next_read_id: 1,
+                read_quorum_reached: false,
                 batch_size,
                 batched_entries: Vec::with_capacity(batch_size),
                 promise: initial_state.promise.unwrap_or_default(),

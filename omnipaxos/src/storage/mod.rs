@@ -97,6 +97,29 @@ pub enum StorageOp<T: Entry> {
     SetSnapshot(Option<T::Snapshot>),
 }
 
+impl<T: Entry> StorageOp<T> {
+    /// Returns a short description of this operation for error diagnostics.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            StorageOp::AppendEntry(_) => "AppendEntry",
+            StorageOp::AppendEntries(_) => "AppendEntries",
+            StorageOp::AppendOnPrefix(..) => "AppendOnPrefix",
+            StorageOp::SetPromise(_) => "SetPromise",
+            StorageOp::SetDecidedIndex(_) => "SetDecidedIndex",
+            StorageOp::SetAcceptedRound(_) => "SetAcceptedRound",
+            StorageOp::SetCompactedIdx(_) => "SetCompactedIdx",
+            StorageOp::Trim(_) => "Trim",
+            StorageOp::SetStopsign(_) => "SetStopsign",
+            StorageOp::SetSnapshot(_) => "SetSnapshot",
+        }
+    }
+}
+
+/// Describe all operations in a batch for error diagnostics.
+pub(crate) fn describe_batch<T: Entry>(ops: &[StorageOp<T>]) -> String {
+    ops.iter().map(|op| op.describe()).collect::<Vec<_>>().join(", ")
+}
+
 /// All persisted scalar state, loaded once during recovery via [`Storage::load_state`].
 #[derive(Debug)]
 pub struct PersistedState<T: Entry> {
@@ -153,6 +176,17 @@ where
 
     /// Returns the current length of the log (without the trimmed/snapshotted entries).
     async fn get_log_len(&self) -> StorageResult<usize>;
+
+    /// Whether the storage backend is currently ready to create a snapshot.
+    ///
+    /// Called before routine compaction. If this returns `false`, the snapshot
+    /// is deferred (returning [`CompactionErr::Deferred`](crate::CompactionErr::Deferred)).
+    /// Urgent snapshots (e.g., for follower catch-up) bypass this check.
+    ///
+    /// The default implementation always returns `true`.
+    async fn can_snapshot(&self) -> bool {
+        true
+    }
 }
 
 /// A place holder type for when not using snapshots. You should not use this type, it is only internally when deriving the Entry implementation.

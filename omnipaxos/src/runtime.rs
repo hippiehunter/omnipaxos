@@ -43,20 +43,23 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         for cmd in commands {
             match cmd {
                 Command::WriteAtomic(ops) => {
+                    let details = crate::storage::describe_batch(&ops);
                     Self::wrap_storage(
                         StorageOperation::WriteAtomic,
                         ErrorSubject::Batch,
                         self.storage.write_atomically(ops).await,
-                    )?;
+                    )
+                    .map_err(|e| e.with_details(details))?;
                 }
                 Command::AppendEntries(entries) => {
+                    let ops = vec![StorageOp::AppendEntries(entries)];
+                    let details = crate::storage::describe_batch(&ops);
                     Self::wrap_storage(
                         StorageOperation::WriteAtomic,
                         ErrorSubject::Batch,
-                        self.storage
-                            .write_atomically(vec![StorageOp::AppendEntries(entries)])
-                            .await,
-                    )?;
+                        self.storage.write_atomically(ops).await,
+                    )
+                    .map_err(|e| e.with_details(details))?;
                 }
             }
         }
@@ -121,8 +124,8 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                 match continuation {
                     SnapshotContinuation::CompleteSnapshot { snapshot_idx, .. } => {
                         // Reuse existing try_snapshot flow, ignore errors
-                        // (follower may not be caught up)
-                        let _ = self.try_snapshot(engine, snapshot_idx).await;
+                        // (follower may not be caught up). Force=true: urgent (catch-up).
+                        let _ = self.try_snapshot(engine, snapshot_idx, true).await;
                     }
                     SnapshotContinuation::CompleteSyncLogDelta { delta, compact_idx: _ } => {
                         let existing = Self::wrap_storage(
@@ -396,11 +399,19 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     }
 
     /// Try snapshot (compaction with snapshot creation - needs storage reads).
+    ///
+    /// When `force` is `false`, the storage backend's [`can_snapshot()`](Storage::can_snapshot)
+    /// is consulted first; if it returns `false`, the snapshot is deferred.
+    /// When `force` is `true` (e.g., follower catch-up), the check is skipped.
     pub(crate) async fn try_snapshot(
         &mut self,
         engine: &mut Engine<T>,
         snapshot_idx: Option<usize>,
+        force: bool,
     ) -> Result<(), crate::CompactionErr> {
+        if !force && !self.storage.can_snapshot().await {
+            return Err(crate::CompactionErr::Deferred);
+        }
         let decided_idx = engine.get_decided_idx();
         let log_decided_idx = engine.s.get_decided_idx_without_stopsign();
         let new_compacted_idx = match snapshot_idx {
@@ -418,17 +429,18 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                 .create_snapshot(engine, new_compacted_idx)
                 .await
                 .map_err(crate::CompactionErr::Storage)?;
+            let ops = vec![
+                StorageOp::Trim(new_compacted_idx),
+                StorageOp::SetCompactedIdx(new_compacted_idx),
+                StorageOp::SetSnapshot(Some(snapshot)),
+            ];
+            let details = crate::storage::describe_batch(&ops);
             Self::wrap_storage(
                 StorageOperation::WriteAtomic,
                 ErrorSubject::Snapshot,
-                self.storage
-                    .write_atomically(vec![
-                        StorageOp::Trim(new_compacted_idx),
-                        StorageOp::SetCompactedIdx(new_compacted_idx),
-                        StorageOp::SetSnapshot(Some(snapshot)),
-                    ])
-                    .await,
+                self.storage.write_atomically(ops).await,
             )
+            .map_err(|e| e.with_details(details))
             .map_err(crate::CompactionErr::Storage)?;
             engine.s.compacted_idx = new_compacted_idx;
         }

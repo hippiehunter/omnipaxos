@@ -130,12 +130,20 @@ pub struct StorageError {
     pub subject: ErrorSubject,
     /// The underlying error from the storage backend.
     pub source: AnyError,
+    /// Optional human-readable context (e.g., batch contents).
+    pub details: Option<String>,
 }
 
 impl StorageError {
     /// Create a new `StorageError` with context.
     pub fn new(operation: StorageOperation, subject: ErrorSubject, source: AnyError) -> Self {
-        StorageError { operation, subject, source }
+        StorageError { operation, subject, source, details: None }
+    }
+
+    /// Attach human-readable details to this error (e.g., batch operation summary).
+    pub fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
     }
 
     /// Create a storage error for a read_entries failure.
@@ -161,7 +169,11 @@ impl StorageError {
 
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "storage error during {} on {}: {}", self.operation, self.subject, self.source)
+        write!(f, "storage error during {} on {}", self.operation, self.subject)?;
+        if let Some(ref details) = self.details {
+            write!(f, " ({})", details)?;
+        }
+        write!(f, ": {}", self.source)
     }
 }
 
@@ -178,12 +190,14 @@ pub enum OmniPaxosError {
     Fatal(StorageError),
     /// Invalid configuration
     InvalidConfig(ConfigError),
+    /// Corrupted or inconsistent persisted state detected at startup.
+    CorruptedState(String),
 }
 
 impl OmniPaxosError {
-    /// Returns `true` if this is a fatal storage error.
+    /// Returns `true` if this is a fatal error (storage failure or corrupted state).
     pub fn is_fatal(&self) -> bool {
-        matches!(self, OmniPaxosError::Fatal(_))
+        matches!(self, OmniPaxosError::Fatal(_) | OmniPaxosError::CorruptedState(_))
     }
 
     /// Consume self and return the `StorageError` if fatal, or `None`.
@@ -200,6 +214,7 @@ impl fmt::Display for OmniPaxosError {
         match self {
             OmniPaxosError::Fatal(e) => write!(f, "{}", e),
             OmniPaxosError::InvalidConfig(e) => write!(f, "{}", e),
+            OmniPaxosError::CorruptedState(msg) => write!(f, "corrupted persisted state: {}", msg),
         }
     }
 }
@@ -209,6 +224,7 @@ impl error::Error for OmniPaxosError {
         match self {
             OmniPaxosError::Fatal(e) => Some(e),
             OmniPaxosError::InvalidConfig(e) => Some(e),
+            OmniPaxosError::CorruptedState(_) => None,
         }
     }
 }
