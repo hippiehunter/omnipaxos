@@ -4,38 +4,147 @@ use std::{error, fmt};
 #[cfg(feature = "toml_config")]
 use toml;
 
-/// Error from the storage backend
+/// A type-erased error that preserves the full error chain.
+///
+/// Wraps `Box<dyn Error + Send + Sync + 'static>` with convenience methods
+/// for downcasting. Unlike a raw boxed error, `AnyError` implements `Error`
+/// itself, so it can be used as a `source()` in error chains.
 #[derive(Debug)]
-pub struct StorageError(pub Box<dyn std::error::Error + Send + Sync>);
+pub struct AnyError(Box<dyn error::Error + Send + Sync + 'static>);
+
+impl AnyError {
+    /// Wrap any error.
+    pub fn new<E: error::Error + Send + Sync + 'static>(e: E) -> Self {
+        AnyError(Box::new(e))
+    }
+
+    /// Wrap an already-boxed error.
+    pub fn from_boxed(b: Box<dyn error::Error + Send + Sync + 'static>) -> Self {
+        AnyError(b)
+    }
+
+    /// Attempt to downcast the inner error to a concrete type.
+    pub fn downcast<T: error::Error + 'static>(self) -> Result<T, Self> {
+        match self.0.downcast::<T>() {
+            Ok(t) => Ok(*t),
+            Err(b) => Err(AnyError(b)),
+        }
+    }
+
+    /// Attempt to get a reference to the inner error as a concrete type.
+    pub fn downcast_ref<T: error::Error + 'static>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
+impl fmt::Display for AnyError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl error::Error for AnyError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+// Note: We can't do a blanket From<E: Error> impl because it would conflict
+// with From<T> for T from core. Instead, AnyError::new() or AnyError::from_boxed()
+// must be called explicitly, or specific From impls can be added for common types.
+
+/// Identifies which storage operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOperation {
+    /// Loading persisted state on startup.
+    LoadState,
+    /// An atomic write batch.
+    WriteAtomic,
+    /// Reading entries from the log.
+    ReadEntries,
+    /// Reading a log suffix.
+    ReadSuffix,
+    /// Reading a snapshot.
+    ReadSnapshot,
+    /// Reading the log length.
+    ReadLogLen,
+    /// Creating a snapshot from entries.
+    CreateSnapshot,
+}
+
+impl fmt::Display for StorageOperation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            StorageOperation::LoadState => write!(f, "load_state"),
+            StorageOperation::WriteAtomic => write!(f, "write_atomically"),
+            StorageOperation::ReadEntries => write!(f, "get_entries"),
+            StorageOperation::ReadSuffix => write!(f, "get_suffix"),
+            StorageOperation::ReadSnapshot => write!(f, "get_snapshot"),
+            StorageOperation::ReadLogLen => write!(f, "get_log_len"),
+            StorageOperation::CreateSnapshot => write!(f, "create_snapshot"),
+        }
+    }
+}
+
+/// Error from the storage backend, enriched with the operation that failed.
+///
+/// Always fatal by convention — callers should stop processing and surface
+/// the error to the application.
+#[derive(Debug)]
+pub struct StorageError {
+    /// Which storage operation failed.
+    pub operation: StorageOperation,
+    /// The underlying error from the storage backend.
+    pub source: AnyError,
+}
+
+impl StorageError {
+    /// Create a new `StorageError` with context.
+    pub fn new(operation: StorageOperation, source: AnyError) -> Self {
+        StorageError { operation, source }
+    }
+}
 
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "storage error: {}", self.0)
+        write!(f, "storage error during {}: {}", self.operation, self.source)
     }
 }
 
 impl error::Error for StorageError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        Some(self.0.as_ref())
+        Some(&self.source)
     }
 }
 
 /// Top-level OmniPaxos error
 #[derive(Debug)]
 pub enum OmniPaxosError {
-    /// Error from the storage backend
-    Storage(StorageError),
-    /// Compaction error
-    Compaction(super::CompactionErr),
+    /// Fatal storage error — the node should stop processing.
+    Fatal(StorageError),
     /// Invalid configuration
     InvalidConfig(ConfigError),
+}
+
+impl OmniPaxosError {
+    /// Returns `true` if this is a fatal storage error.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, OmniPaxosError::Fatal(_))
+    }
+
+    /// Consume self and return the `StorageError` if fatal, or `None`.
+    pub fn into_fatal(self) -> Option<StorageError> {
+        match self {
+            OmniPaxosError::Fatal(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for OmniPaxosError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            OmniPaxosError::Storage(e) => write!(f, "{}", e),
-            OmniPaxosError::Compaction(e) => write!(f, "{}", e),
+            OmniPaxosError::Fatal(e) => write!(f, "{}", e),
             OmniPaxosError::InvalidConfig(e) => write!(f, "{}", e),
         }
     }
@@ -44,8 +153,7 @@ impl fmt::Display for OmniPaxosError {
 impl error::Error for OmniPaxosError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            OmniPaxosError::Storage(e) => Some(e),
-            OmniPaxosError::Compaction(e) => Some(e),
+            OmniPaxosError::Fatal(e) => Some(e),
             OmniPaxosError::InvalidConfig(e) => Some(e),
         }
     }
@@ -53,25 +161,13 @@ impl error::Error for OmniPaxosError {
 
 impl From<StorageError> for OmniPaxosError {
     fn from(e: StorageError) -> Self {
-        OmniPaxosError::Storage(e)
+        OmniPaxosError::Fatal(e)
     }
 }
 
 impl From<ConfigError> for OmniPaxosError {
     fn from(e: ConfigError) -> Self {
         OmniPaxosError::InvalidConfig(e)
-    }
-}
-
-impl From<Box<dyn std::error::Error>> for StorageError {
-    fn from(e: Box<dyn std::error::Error>) -> Self {
-        StorageError(e.to_string().into())
-    }
-}
-
-impl From<super::CompactionErr> for StorageError {
-    fn from(e: super::CompactionErr) -> Self {
-        StorageError(Box::new(e))
     }
 }
 

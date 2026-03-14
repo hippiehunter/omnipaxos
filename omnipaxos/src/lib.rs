@@ -16,14 +16,20 @@
 pub mod ballot_leader_election;
 /// OmniPaxos error definitions
 pub mod errors;
+pub use errors::{AnyError, StorageOperation};
 /// The different messages OmniPaxos servers can communicate to each other with.
 pub mod messages;
 /// The user-facing OmniPaxos struct.
 mod omni_paxos;
 pub use omni_paxos::*;
 
-/// The core replication algorithm of OmniPaxos.
-pub(crate) mod sequence_paxos;
+/// The pure, synchronous Paxos engine.
+pub(crate) mod engine;
+/// Metrics and observability.
+pub mod metrics;
+pub use metrics::{FollowerMetrics, MetricsRecorder, RunningState};
+/// The runtime that executes engine commands against storage.
+pub(crate) mod runtime;
 /// Traits and structs related to the backend storage of an OmniPaxos server.
 pub mod storage;
 

@@ -44,69 +44,20 @@ impl Storage<Value> for SharedMemoryStorage {
     async fn write_atomically(&mut self, ops: Vec<StorageOp<Value>>) -> StorageResult<()> {
         self.inner.borrow_mut().write_atomically(ops).await
     }
-    async fn append_entry(&mut self, entry: Value) -> StorageResult<()> {
-        self.inner.borrow_mut().append_entry(entry).await
-    }
-    async fn append_entries(&mut self, entries: Vec<Value>) -> StorageResult<()> {
-        self.inner.borrow_mut().append_entries(entries).await
-    }
-    async fn append_on_prefix(
-        &mut self,
-        from_idx: usize,
-        entries: Vec<Value>,
-    ) -> StorageResult<()> {
-        self.inner
-            .borrow_mut()
-            .append_on_prefix(from_idx, entries)
-            .await
-    }
-    async fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()> {
-        self.inner.borrow_mut().set_promise(n_prom).await
-    }
-    async fn set_decided_idx(&mut self, ld: usize) -> StorageResult<()> {
-        self.inner.borrow_mut().set_decided_idx(ld).await
-    }
-    async fn set_accepted_round(&mut self, na: Ballot) -> StorageResult<()> {
-        self.inner.borrow_mut().set_accepted_round(na).await
-    }
-    async fn set_stopsign(&mut self, s: Option<StopSign>) -> StorageResult<()> {
-        self.inner.borrow_mut().set_stopsign(s).await
-    }
-    async fn trim(&mut self, idx: usize) -> StorageResult<()> {
-        self.inner.borrow_mut().trim(idx).await
-    }
-    async fn set_compacted_idx(&mut self, idx: usize) -> StorageResult<()> {
-        self.inner.borrow_mut().set_compacted_idx(idx).await
-    }
-    async fn set_snapshot(&mut self, snapshot: Option<ValueSnapshot>) -> StorageResult<()> {
-        self.inner.borrow_mut().set_snapshot(snapshot).await
-    }
-    async fn get_decided_idx(&self) -> StorageResult<usize> {
-        self.inner.borrow().get_decided_idx().await
-    }
-    async fn get_accepted_round(&self) -> StorageResult<Option<Ballot>> {
-        self.inner.borrow().get_accepted_round().await
+    async fn load_state(&self) -> StorageResult<omnipaxos::storage::PersistedState<Value>> {
+        self.inner.borrow().load_state().await
     }
     async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<Value>> {
         self.inner.borrow().get_entries(from, to).await
     }
-    async fn get_log_len(&self) -> StorageResult<usize> {
-        self.inner.borrow().get_log_len().await
-    }
     async fn get_suffix(&self, from: usize) -> StorageResult<Vec<Value>> {
         self.inner.borrow().get_suffix(from).await
     }
-    async fn get_promise(&self) -> StorageResult<Option<Ballot>> {
-        self.inner.borrow().get_promise().await
-    }
-    async fn get_stopsign(&self) -> StorageResult<Option<StopSign>> {
-        self.inner.borrow().get_stopsign().await
-    }
-    async fn get_compacted_idx(&self) -> StorageResult<usize> {
-        self.inner.borrow().get_compacted_idx().await
-    }
     async fn get_snapshot(&self) -> StorageResult<Option<ValueSnapshot>> {
         self.inner.borrow().get_snapshot().await
+    }
+    async fn get_log_len(&self) -> StorageResult<usize> {
+        self.inner.borrow().get_log_len().await
     }
 }
 
@@ -405,7 +356,7 @@ impl SimCluster {
 
     async fn try_propose(&mut self, node_id: u64, entry: Value) -> Result<(), ProposeErr<Value>> {
         let node = self.nodes.get_mut(&node_id).expect("node not found");
-        node.append(entry).await
+        node.append(entry).await.map(|_| ())
     }
 
     #[allow(dead_code)]
@@ -1712,7 +1663,8 @@ fn test_single_node_flush_decide_atomicity() {
 
             let storage = cluster.storage_handles[&1].borrow();
             let log_len = storage.get_log_len().await.unwrap();
-            let decided_idx = storage.get_decided_idx().await.unwrap();
+            let state = storage.load_state().await.unwrap();
+            let decided_idx = state.decided_idx;
 
             // If entries were written but decided_idx hasn't caught up,
             // the flush is non-atomic
@@ -1724,7 +1676,7 @@ fn test_single_node_flush_decide_atomicity() {
         // Verify final state is correct
         let storage = cluster.storage_handles[&1].borrow();
         assert_eq!(storage.get_log_len().await.unwrap(), 5);
-        assert_eq!(storage.get_decided_idx().await.unwrap(), 5);
+        assert_eq!(storage.load_state().await.unwrap().decided_idx, 5);
 
         // With the atomic fix, entries and decided_idx are written together
         assert!(
@@ -3024,18 +2976,22 @@ fn test_buffer_overflow_recovered_via_resend() {
 
 #[test]
 fn test_compaction_err_storage_error_variant() {
-    // Verify the new StorageError variant works in the CompactionErr enum
-    use omnipaxos::errors::StorageError;
+    // Verify the Storage variant works in the CompactionErr enum
+    use omnipaxos::errors::{AnyError, StorageError, StorageOperation};
     use omnipaxos::CompactionErr;
 
-    let storage_err = StorageError("test error".to_string().into());
-    let compaction_err = CompactionErr::StorageError(storage_err);
+    let any_err = AnyError::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "test error",
+    ));
+    let storage_err = StorageError::new(StorageOperation::WriteAtomic, any_err);
+    let compaction_err = CompactionErr::Storage(storage_err);
 
     // Should display properly
     let display = format!("{}", compaction_err);
     assert!(
         display.contains("storage error"),
-        "CompactionErr::StorageError should display properly: {}",
+        "CompactionErr::Storage should display properly: {}",
         display
     );
 
@@ -3043,7 +2999,7 @@ fn test_compaction_err_storage_error_variant() {
     let debug = format!("{:?}", compaction_err);
     assert!(
         !debug.is_empty(),
-        "CompactionErr::StorageError should be debuggable"
+        "CompactionErr::Storage should be debuggable"
     );
 }
 

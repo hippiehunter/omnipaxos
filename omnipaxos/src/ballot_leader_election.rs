@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 /// Ballot Leader Election algorithm for electing new leaders
 use crate::{
-    sequence_paxos::{Phase, Role},
+    engine::state::{Phase, Role},
     util::{defaults::*, ConfigurationId, FlexibleQuorum, Quorum},
 };
 
@@ -393,6 +393,12 @@ impl BallotLeaderElection {
     pub(crate) fn set_leader(&mut self, ballot: Ballot) {
         self.leader = ballot;
     }
+
+    /// Returns the current heartbeat round number.
+    pub(crate) fn get_hb_round(&self) -> u32 {
+        self.hb_round
+    }
+
 }
 
 /// Configuration for `BallotLeaderElection`.

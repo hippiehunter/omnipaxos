@@ -2,7 +2,7 @@ use omnipaxos::{
     ballot_leader_election::Ballot,
     messages::Message,
     storage::{
-        memory_storage::MemoryStorage, StopSign, Storage, StorageError, StorageOp,
+        memory_storage::MemoryStorage, AnyError, PersistedState, StopSign, Storage, StorageOp,
         StorageResult,
     },
     ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
@@ -21,25 +21,11 @@ use test_utils::{Value, ValueSnapshot};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum FailOn {
     WriteAtomically,
-    AppendEntry,
-    AppendEntries,
-    AppendOnPrefix,
-    SetPromise,
-    SetDecidedIdx,
-    GetDecidedIdx,
-    SetAcceptedRound,
-    GetAcceptedRound,
     GetEntries,
     GetLogLen,
     GetSuffix,
-    GetPromise,
-    SetStopsign,
-    GetStopsign,
-    Trim,
-    SetCompactedIdx,
-    GetCompactedIdx,
-    SetSnapshot,
     GetSnapshot,
+    LoadState,
 }
 
 struct FailCtrl {
@@ -70,11 +56,11 @@ impl FailCtrl {
     }
 }
 
-fn make_storage_error(msg: &str) -> StorageError {
-    StorageError(Box::new(std::io::Error::new(
+fn make_storage_error(msg: &str) -> AnyError {
+    AnyError::new(std::io::Error::new(
         std::io::ErrorKind::Other,
-        msg,
-    )))
+        msg.to_owned(),
+    ))
 }
 
 struct FailableStorage {
@@ -107,126 +93,18 @@ impl Storage<Value> for FailableStorage {
 
         // Check partial write limit (simulates non-atomic implementation)
         if let Some(limit) = self.ctrl.borrow().partial_write_limit {
-            let backup = self.inner.clone();
-            for (i, op) in ops.into_iter().enumerate() {
-                if i >= limit {
-                    // Partial write: stop after `limit` ops but return Ok
-                    return Ok(());
-                }
-                let result = match op {
-                    StorageOp::AppendEntry(entry) => self.inner.append_entry(entry).await,
-                    StorageOp::AppendEntries(entries) => self.inner.append_entries(entries).await,
-                    StorageOp::AppendOnPrefix(from_idx, entries) => {
-                        self.inner.append_on_prefix(from_idx, entries).await
-                    }
-                    StorageOp::SetPromise(bal) => self.inner.set_promise(bal).await,
-                    StorageOp::SetDecidedIndex(idx) => self.inner.set_decided_idx(idx).await,
-                    StorageOp::SetAcceptedRound(bal) => self.inner.set_accepted_round(bal).await,
-                    StorageOp::SetCompactedIdx(idx) => self.inner.set_compacted_idx(idx).await,
-                    StorageOp::Trim(idx) => self.inner.trim(idx).await,
-                    StorageOp::SetStopsign(ss) => self.inner.set_stopsign(ss).await,
-                    StorageOp::SetSnapshot(snap) => self.inner.set_snapshot(snap).await,
-                };
-                if let Err(e) = result {
-                    self.inner = backup;
-                    return Err(e);
-                }
-            }
-            return Ok(());
+            let ops_to_apply: Vec<StorageOp<Value>> = ops.into_iter().take(limit).collect();
+            return self.inner.write_atomically(ops_to_apply).await;
         }
 
         check_fail!(self, FailOn::WriteAtomically);
 
-        // Execute ops individually with per-op failure checking and rollback.
-        // We inline the failure check (instead of using check_fail! which does
-        // early return) so that failures go through the rollback path.
-        let backup = self.inner.clone();
-        for op in ops {
-            let fail_op = match &op {
-                StorageOp::AppendEntry(_) => Some(FailOn::AppendEntry),
-                StorageOp::AppendEntries(_) => Some(FailOn::AppendEntries),
-                StorageOp::AppendOnPrefix(_, _) => Some(FailOn::AppendOnPrefix),
-                StorageOp::SetPromise(_) => Some(FailOn::SetPromise),
-                StorageOp::SetDecidedIndex(_) => Some(FailOn::SetDecidedIdx),
-                StorageOp::SetAcceptedRound(_) => Some(FailOn::SetAcceptedRound),
-                StorageOp::SetCompactedIdx(_) => Some(FailOn::SetCompactedIdx),
-                StorageOp::Trim(_) => Some(FailOn::Trim),
-                StorageOp::SetStopsign(_) => Some(FailOn::SetStopsign),
-                StorageOp::SetSnapshot(_) => Some(FailOn::SetSnapshot),
-            };
-            if let Some(ref fop) = fail_op {
-                if self.ctrl.borrow_mut().should_fail(fop) {
-                    self.inner = backup;
-                    return Err(make_storage_error(&format!(
-                        "injected failure: {:?}",
-                        fop
-                    )));
-                }
-            }
-            let result = match op {
-                StorageOp::AppendEntry(entry) => self.inner.append_entry(entry).await,
-                StorageOp::AppendEntries(entries) => self.inner.append_entries(entries).await,
-                StorageOp::AppendOnPrefix(idx, entries) => {
-                    self.inner.append_on_prefix(idx, entries).await
-                }
-                StorageOp::SetPromise(bal) => self.inner.set_promise(bal).await,
-                StorageOp::SetDecidedIndex(idx) => self.inner.set_decided_idx(idx).await,
-                StorageOp::SetAcceptedRound(bal) => self.inner.set_accepted_round(bal).await,
-                StorageOp::SetCompactedIdx(idx) => self.inner.set_compacted_idx(idx).await,
-                StorageOp::Trim(idx) => self.inner.trim(idx).await,
-                StorageOp::SetStopsign(ss) => self.inner.set_stopsign(ss).await,
-                StorageOp::SetSnapshot(snap) => self.inner.set_snapshot(snap).await,
-            };
-            if let Err(e) = result {
-                self.inner = backup;
-                return Err(e);
-            }
-        }
-        Ok(())
+        self.inner.write_atomically(ops).await
     }
 
-    async fn append_entry(&mut self, entry: Value) -> StorageResult<()> {
-        check_fail!(self, FailOn::AppendEntry);
-        self.inner.append_entry(entry).await
-    }
-
-    async fn append_entries(&mut self, entries: Vec<Value>) -> StorageResult<()> {
-        check_fail!(self, FailOn::AppendEntries);
-        self.inner.append_entries(entries).await
-    }
-
-    async fn append_on_prefix(
-        &mut self,
-        from_idx: usize,
-        entries: Vec<Value>,
-    ) -> StorageResult<()> {
-        check_fail!(self, FailOn::AppendOnPrefix);
-        self.inner.append_on_prefix(from_idx, entries).await
-    }
-
-    async fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()> {
-        check_fail!(self, FailOn::SetPromise);
-        self.inner.set_promise(n_prom).await
-    }
-
-    async fn set_decided_idx(&mut self, ld: usize) -> StorageResult<()> {
-        check_fail!(self, FailOn::SetDecidedIdx);
-        self.inner.set_decided_idx(ld).await
-    }
-
-    async fn get_decided_idx(&self) -> StorageResult<usize> {
-        check_fail!(self, FailOn::GetDecidedIdx);
-        self.inner.get_decided_idx().await
-    }
-
-    async fn set_accepted_round(&mut self, na: Ballot) -> StorageResult<()> {
-        check_fail!(self, FailOn::SetAcceptedRound);
-        self.inner.set_accepted_round(na).await
-    }
-
-    async fn get_accepted_round(&self) -> StorageResult<Option<Ballot>> {
-        check_fail!(self, FailOn::GetAcceptedRound);
-        self.inner.get_accepted_round().await
+    async fn load_state(&self) -> StorageResult<PersistedState<Value>> {
+        check_fail!(self, FailOn::LoadState);
+        self.inner.load_state().await
     }
 
     async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<Value>> {
@@ -242,41 +120,6 @@ impl Storage<Value> for FailableStorage {
     async fn get_suffix(&self, from: usize) -> StorageResult<Vec<Value>> {
         check_fail!(self, FailOn::GetSuffix);
         self.inner.get_suffix(from).await
-    }
-
-    async fn get_promise(&self) -> StorageResult<Option<Ballot>> {
-        check_fail!(self, FailOn::GetPromise);
-        self.inner.get_promise().await
-    }
-
-    async fn set_stopsign(&mut self, s: Option<StopSign>) -> StorageResult<()> {
-        check_fail!(self, FailOn::SetStopsign);
-        self.inner.set_stopsign(s).await
-    }
-
-    async fn get_stopsign(&self) -> StorageResult<Option<StopSign>> {
-        check_fail!(self, FailOn::GetStopsign);
-        self.inner.get_stopsign().await
-    }
-
-    async fn trim(&mut self, idx: usize) -> StorageResult<()> {
-        check_fail!(self, FailOn::Trim);
-        self.inner.trim(idx).await
-    }
-
-    async fn set_compacted_idx(&mut self, idx: usize) -> StorageResult<()> {
-        check_fail!(self, FailOn::SetCompactedIdx);
-        self.inner.set_compacted_idx(idx).await
-    }
-
-    async fn get_compacted_idx(&self) -> StorageResult<usize> {
-        check_fail!(self, FailOn::GetCompactedIdx);
-        self.inner.get_compacted_idx().await
-    }
-
-    async fn set_snapshot(&mut self, snapshot: Option<ValueSnapshot>) -> StorageResult<()> {
-        check_fail!(self, FailOn::SetSnapshot);
-        self.inner.set_snapshot(snapshot).await
     }
 
     async fn get_snapshot(&self) -> StorageResult<Option<ValueSnapshot>> {
@@ -463,16 +306,22 @@ fn test_promise_roundtrip() {
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
 
         // Initially None
-        assert_eq!(storage.get_promise().await.unwrap(), None);
+        assert_eq!(storage.load_state().await.unwrap().promise, None);
 
         let ballot = make_ballot(5, 2);
-        storage.set_promise(ballot).await.unwrap();
-        assert_eq!(storage.get_promise().await.unwrap(), Some(ballot));
+        storage
+            .write_atomically(vec![StorageOp::SetPromise(ballot)])
+            .await
+            .unwrap();
+        assert_eq!(storage.load_state().await.unwrap().promise, Some(ballot));
 
         // Overwrite with higher ballot
         let ballot2 = make_ballot(10, 3);
-        storage.set_promise(ballot2).await.unwrap();
-        assert_eq!(storage.get_promise().await.unwrap(), Some(ballot2));
+        storage
+            .write_atomically(vec![StorageOp::SetPromise(ballot2)])
+            .await
+            .unwrap();
+        assert_eq!(storage.load_state().await.unwrap().promise, Some(ballot2));
     });
 }
 
@@ -481,13 +330,19 @@ fn test_decided_idx_roundtrip() {
     smol::block_on(async {
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
 
-        assert_eq!(storage.get_decided_idx().await.unwrap(), 0);
+        assert_eq!(storage.load_state().await.unwrap().decided_idx, 0);
 
-        storage.set_decided_idx(5).await.unwrap();
-        assert_eq!(storage.get_decided_idx().await.unwrap(), 5);
+        storage
+            .write_atomically(vec![StorageOp::SetDecidedIndex(5)])
+            .await
+            .unwrap();
+        assert_eq!(storage.load_state().await.unwrap().decided_idx, 5);
 
-        storage.set_decided_idx(10).await.unwrap();
-        assert_eq!(storage.get_decided_idx().await.unwrap(), 10);
+        storage
+            .write_atomically(vec![StorageOp::SetDecidedIndex(10)])
+            .await
+            .unwrap();
+        assert_eq!(storage.load_state().await.unwrap().decided_idx, 10);
     });
 }
 
@@ -496,11 +351,17 @@ fn test_accepted_round_roundtrip() {
     smol::block_on(async {
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
 
-        assert_eq!(storage.get_accepted_round().await.unwrap(), None);
+        assert_eq!(storage.load_state().await.unwrap().accepted_round, None);
 
         let ballot = make_ballot(3, 1);
-        storage.set_accepted_round(ballot).await.unwrap();
-        assert_eq!(storage.get_accepted_round().await.unwrap(), Some(ballot));
+        storage
+            .write_atomically(vec![StorageOp::SetAcceptedRound(ballot)])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.load_state().await.unwrap().accepted_round,
+            Some(ballot)
+        );
     });
 }
 
@@ -510,7 +371,10 @@ fn test_append_and_get_entries() {
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
 
         let entries: Vec<Value> = (1..=5).map(Value::with_id).collect();
-        storage.append_entries(entries.clone()).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendEntries(entries.clone())])
+            .await
+            .unwrap();
 
         // get_entries for the full range
         let retrieved = storage.get_entries(0, 5).await.unwrap();
@@ -528,7 +392,10 @@ fn test_append_and_get_entries() {
         assert_eq!(storage.get_log_len().await.unwrap(), 5);
 
         // Append single entry
-        storage.append_entry(Value::with_id(6)).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendEntry(Value::with_id(6))])
+            .await
+            .unwrap();
         assert_eq!(storage.get_log_len().await.unwrap(), 6);
     });
 }
@@ -540,11 +407,17 @@ fn test_append_on_prefix_truncates() {
 
         // Append 5 entries
         let entries: Vec<Value> = (1..=5).map(Value::with_id).collect();
-        storage.append_entries(entries).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendEntries(entries)])
+            .await
+            .unwrap();
 
         // Append on prefix at index 3 — keeps entries 0..3 and appends new ones
         let new_entries = vec![Value::with_id(100), Value::with_id(200)];
-        storage.append_on_prefix(3, new_entries).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendOnPrefix(3, new_entries)])
+            .await
+            .unwrap();
 
         let all = storage.get_entries(0, 5).await.unwrap();
         assert_eq!(
@@ -577,9 +450,10 @@ fn test_write_atomically_all_succeed() {
 
         // Verify all changes are visible
         assert_eq!(storage.get_entries(0, 2).await.unwrap().len(), 2);
-        assert_eq!(storage.get_promise().await.unwrap(), Some(ballot));
-        assert_eq!(storage.get_decided_idx().await.unwrap(), 2);
-        assert_eq!(storage.get_accepted_round().await.unwrap(), Some(ballot));
+        let state = storage.load_state().await.unwrap();
+        assert_eq!(state.promise, Some(ballot));
+        assert_eq!(state.decided_idx, 2);
+        assert_eq!(state.accepted_round, Some(ballot));
     });
 }
 
@@ -590,12 +464,22 @@ fn test_trim_removes_entries() {
 
         // Append 10 entries and mark all as decided
         let entries: Vec<Value> = (1..=10).map(Value::with_id).collect();
-        storage.append_entries(entries).await.unwrap();
-        storage.set_decided_idx(10).await.unwrap();
+        storage
+            .write_atomically(vec![
+                StorageOp::AppendEntries(entries),
+                StorageOp::SetDecidedIndex(10),
+            ])
+            .await
+            .unwrap();
 
         // Trim first 5 entries
-        storage.trim(5).await.unwrap();
-        storage.set_compacted_idx(5).await.unwrap();
+        storage
+            .write_atomically(vec![
+                StorageOp::Trim(5),
+                StorageOp::SetCompactedIdx(5),
+            ])
+            .await
+            .unwrap();
 
         // Entries after trim should still exist (use post-trim indices)
         let remaining = storage.get_entries(5, 10).await.unwrap();
@@ -607,7 +491,8 @@ fn test_trim_removes_entries() {
         assert_eq!(suffix.len(), 5);
 
         // Compacted idx
-        assert_eq!(storage.get_compacted_idx().await.unwrap(), 5);
+        let state = storage.load_state().await.unwrap();
+        assert_eq!(state.compacted_idx, 5);
 
         // Log length reflects only remaining entries
         assert_eq!(storage.get_log_len().await.unwrap(), 5);
@@ -621,7 +506,10 @@ fn test_get_entries_boundary_behavior() {
 
         // Append 3 entries
         let entries: Vec<Value> = (1..=3).map(Value::with_id).collect();
-        storage.append_entries(entries).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendEntries(entries)])
+            .await
+            .unwrap();
 
         // Boundary: from == log.len() should return empty (no entries at that index)
         let at_boundary = storage.get_entries(3, 10).await.unwrap();
@@ -764,7 +652,7 @@ fn test_storage_error_on_append_propagates() {
     smol::block_on(async {
         // append() now propagates storage errors via ProposeErr::StorageErr.
         // With batch_size=1, the entry is flushed immediately during append
-        // via append_entries(), so a failure is surfaced to the caller.
+        // via write_atomically(), so a failure is surfaced to the caller.
         let ctrl = Rc::new(RefCell::new(FailCtrl::new()));
         let mut node = build_single_node(ctrl.clone()).await;
 
@@ -773,10 +661,10 @@ fn test_storage_error_on_append_propagates() {
             node.tick().await.unwrap();
         }
 
-        // Inject failure on AppendEntries (used by batch_size=1 immediate flush)
+        // Inject failure on WriteAtomically (used by the immediate flush path)
         ctrl.borrow_mut()
             .permanent_failures
-            .insert(FailOn::AppendEntries);
+            .insert(FailOn::WriteAtomically);
 
         // append() should return Err when storage fails
         let result = node.append(Value::with_id(1)).await;
@@ -843,11 +731,17 @@ fn test_write_atomically_fails_cleanly() {
 
         // Append some initial entries
         storage
-            .append_entries(vec![Value::with_id(1), Value::with_id(2)])
+            .write_atomically(vec![StorageOp::AppendEntries(vec![
+                Value::with_id(1),
+                Value::with_id(2),
+            ])])
             .await
             .unwrap();
         let ballot = make_ballot(1, 1);
-        storage.set_promise(ballot).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::SetPromise(ballot)])
+            .await
+            .unwrap();
 
         // Inject WriteAtomically failure — the check happens before any ops execute
         ctrl.borrow_mut().fail_once.insert(FailOn::WriteAtomically);
@@ -864,13 +758,14 @@ fn test_write_atomically_fails_cleanly() {
         // Verify state is unchanged (no ops were executed)
         let entries = storage.get_entries(0, 3).await.unwrap();
         assert_eq!(entries.len(), 2, "entries should not have been appended");
+        let state = storage.load_state().await.unwrap();
         assert_eq!(
-            storage.get_promise().await.unwrap(),
+            state.promise,
             Some(ballot),
             "promise should not have changed"
         );
         assert_eq!(
-            storage.get_decided_idx().await.unwrap(),
+            state.decided_idx,
             0,
             "decided_idx should not have changed"
         );
@@ -882,7 +777,7 @@ fn test_write_atomically_fails_cleanly() {
         ];
         storage.write_atomically(ops).await.unwrap();
         assert_eq!(storage.get_entries(0, 3).await.unwrap().len(), 3);
-        assert_eq!(storage.get_decided_idx().await.unwrap(), 3);
+        assert_eq!(storage.load_state().await.unwrap().decided_idx, 3);
     });
 }
 
@@ -913,9 +808,9 @@ fn test_partial_write_breaks_promise_invariant() {
             "entries should be written (partial write)"
         );
 
-        let promise = storage.get_promise().await.unwrap();
+        let state = storage.load_state().await.unwrap();
         assert_eq!(
-            promise, None,
+            state.promise, None,
             "promise should NOT be set (partial write broke atomicity)"
         );
 
@@ -941,9 +836,9 @@ fn test_partial_write_breaks_decided_invariant() {
         let entries = storage.get_entries(0, 2).await.unwrap();
         assert_eq!(entries.len(), 2, "entries should be written");
 
-        let decided = storage.get_decided_idx().await.unwrap();
+        let state = storage.load_state().await.unwrap();
         assert_eq!(
-            decided, 0,
+            state.decided_idx, 0,
             "decided_idx should NOT be updated (partial write broke atomicity)"
         );
     });
@@ -1003,10 +898,10 @@ fn test_append_should_propagate_storage_errors() {
             node.tick().await.unwrap();
         }
 
-        // Inject permanent failure on AppendEntries
+        // Inject permanent failure on WriteAtomically (all writes go through this)
         ctrl.borrow_mut()
             .permanent_failures
-            .insert(FailOn::AppendEntries);
+            .insert(FailOn::WriteAtomically);
 
         // append() SHOULD return Err when storage fails.
         // Instead, it returns Ok(()) and the entry is silently lost.
@@ -1034,7 +929,10 @@ fn test_get_entries_out_of_bounds_returns_empty() {
     smol::block_on(async {
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
         let entries: Vec<Value> = (1..=3).map(Value::with_id).collect();
-        storage.append_entries(entries).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendEntries(entries)])
+            .await
+            .unwrap();
 
         // Per trait contract: "If entries do not exist for the complete
         // interval, an empty Vector should be returned."
@@ -1053,10 +951,15 @@ fn test_get_entries_after_trim_underflow() {
     smol::block_on(async {
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
         let entries: Vec<Value> = (1..=10).map(Value::with_id).collect();
-        storage.append_entries(entries).await.unwrap();
-        storage.set_decided_idx(10).await.unwrap();
-        storage.trim(5).await.unwrap();
-        storage.set_compacted_idx(5).await.unwrap();
+        storage
+            .write_atomically(vec![
+                StorageOp::AppendEntries(entries),
+                StorageOp::SetDecidedIndex(10),
+                StorageOp::Trim(5),
+                StorageOp::SetCompactedIdx(5),
+            ])
+            .await
+            .unwrap();
 
         // Asking for entries in the trimmed range should return empty, not panic/underflow
         let result = storage.get_entries(0, 5).await.unwrap();
@@ -1488,7 +1391,7 @@ fn test_stopsign_roundtrip() {
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
 
         // Initially None
-        assert_eq!(storage.get_stopsign().await.unwrap(), None);
+        assert_eq!(storage.load_state().await.unwrap().stopsign, None);
 
         let ss = StopSign::with(
             ClusterConfig {
@@ -1498,8 +1401,11 @@ fn test_stopsign_roundtrip() {
             },
             None,
         );
-        storage.set_stopsign(Some(ss.clone())).await.unwrap();
-        let retrieved = storage.get_stopsign().await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::SetStopsign(Some(ss.clone()))])
+            .await
+            .unwrap();
+        let retrieved = storage.load_state().await.unwrap().stopsign;
         assert_eq!(
             retrieved,
             Some(ss.clone()),
@@ -1507,8 +1413,11 @@ fn test_stopsign_roundtrip() {
         );
 
         // Clear it
-        storage.set_stopsign(None).await.unwrap();
-        assert_eq!(storage.get_stopsign().await.unwrap(), None);
+        storage
+            .write_atomically(vec![StorageOp::SetStopsign(None)])
+            .await
+            .unwrap();
+        assert_eq!(storage.load_state().await.unwrap().stopsign, None);
     });
 }
 
@@ -1524,12 +1433,18 @@ fn test_snapshot_roundtrip() {
         map.insert(1, 1);
         map.insert(2, 2);
         let snap = ValueSnapshot { map };
-        storage.set_snapshot(Some(snap.clone())).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::SetSnapshot(Some(snap.clone()))])
+            .await
+            .unwrap();
         let retrieved = storage.get_snapshot().await.unwrap();
         assert_eq!(retrieved, Some(snap));
 
         // Clear it
-        storage.set_snapshot(None).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::SetSnapshot(None)])
+            .await
+            .unwrap();
         assert_eq!(storage.get_snapshot().await.unwrap(), None);
     });
 }
@@ -1572,10 +1487,11 @@ fn test_cache_consistent_after_decided_idx_failure() {
         let decided_before = node.get_decided_idx();
         assert!(decided_before > 0, "should have decided at least one entry");
 
-        // Now inject SetDecidedIdx failure
+        // Now inject WriteAtomically failure — all writes (including decided_idx updates)
+        // go through write_atomically
         ctrl.borrow_mut()
             .permanent_failures
-            .insert(FailOn::SetDecidedIdx);
+            .insert(FailOn::WriteAtomically);
 
         // Propose another entry — the decided_idx update should fail
         let _ = node.append(Value { id: 2 }).await;
@@ -1620,7 +1536,7 @@ fn test_cache_consistent_after_promise_failure() {
 
         let promise_before = node.get_promise();
 
-        // Inject promise failure — this will prevent the node from accepting a new leader
+        // Inject WriteAtomically failure — this will prevent the node from accepting a new leader
         ctrl.borrow_mut()
             .permanent_failures
             .insert(FailOn::WriteAtomically);
@@ -1647,10 +1563,10 @@ fn test_cache_consistent_after_promise_failure() {
 fn test_load_cache_returns_error_not_panic() {
     smol::block_on(async {
         let ctrl = Rc::new(RefCell::new(FailCtrl::new()));
-        // Make get_promise fail — this is the first call in load_cache
+        // Make load_state fail — this is called during load_cache
         ctrl.borrow_mut()
             .permanent_failures
-            .insert(FailOn::GetPromise);
+            .insert(FailOn::LoadState);
 
         let storage = FailableStorage {
             inner: MemoryStorage::default(),
@@ -1872,16 +1788,25 @@ fn test_append_on_prefix_at_trim_boundary() {
         let mut storage = MemoryStorage::<Value>::default();
 
         // Append 10 entries
-        for i in 0..10 {
-            storage.append_entry(Value { id: i }).await.unwrap();
-        }
+        storage
+            .write_atomically(vec![StorageOp::AppendEntries(
+                (0..10).map(|i| Value { id: i }).collect(),
+            )])
+            .await
+            .unwrap();
 
         // Trim first 5
-        storage.trim(5).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::Trim(5)])
+            .await
+            .unwrap();
 
         // append_on_prefix at exactly trimmed_idx (5) — should truncate to empty, then extend
         let new_entries = vec![Value { id: 100 }, Value { id: 101 }];
-        storage.append_on_prefix(5, new_entries).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendOnPrefix(5, new_entries)])
+            .await
+            .unwrap();
 
         let suffix = storage.get_suffix(5).await.unwrap();
         assert_eq!(suffix.len(), 2);
@@ -1898,16 +1823,25 @@ fn test_append_on_prefix_above_trim_boundary() {
         let mut storage = MemoryStorage::<Value>::default();
 
         // Append 10 entries (ids 0-9)
-        for i in 0..10 {
-            storage.append_entry(Value { id: i }).await.unwrap();
-        }
+        storage
+            .write_atomically(vec![StorageOp::AppendEntries(
+                (0..10).map(|i| Value { id: i }).collect(),
+            )])
+            .await
+            .unwrap();
 
         // Trim first 3
-        storage.trim(3).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::Trim(3)])
+            .await
+            .unwrap();
 
         // append_on_prefix at 7 — should keep entries at indices 3..7 and replace 7+
         let new_entries = vec![Value { id: 200 }, Value { id: 201 }];
-        storage.append_on_prefix(7, new_entries).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendOnPrefix(7, new_entries)])
+            .await
+            .unwrap();
 
         let suffix = storage.get_suffix(3).await.unwrap();
         // Entries at indices 3,4,5,6 are original (ids 3,4,5,6), then 200,201
@@ -1925,9 +1859,12 @@ fn test_get_suffix_beyond_log_end() {
     smol::block_on(async {
         let mut storage = MemoryStorage::<Value>::default();
 
-        for i in 0..5 {
-            storage.append_entry(Value { id: i }).await.unwrap();
-        }
+        storage
+            .write_atomically(vec![StorageOp::AppendEntries(
+                (0..5).map(|i| Value { id: i }).collect(),
+            )])
+            .await
+            .unwrap();
 
         // get_suffix beyond log: should return empty
         let suffix = storage.get_suffix(100).await.unwrap();
@@ -1945,12 +1882,18 @@ fn test_get_suffix_after_trim() {
     smol::block_on(async {
         let mut storage = MemoryStorage::<Value>::default();
 
-        for i in 0..10 {
-            storage.append_entry(Value { id: i }).await.unwrap();
-        }
+        storage
+            .write_atomically(vec![StorageOp::AppendEntries(
+                (0..10).map(|i| Value { id: i }).collect(),
+            )])
+            .await
+            .unwrap();
 
         // Trim first 7
-        storage.trim(7).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::Trim(7)])
+            .await
+            .unwrap();
 
         // get_suffix(5) — asks for entries below trimmed_idx (7).
         // Due to saturating_sub, this returns entries from trimmed_idx onward.
@@ -1987,7 +1930,10 @@ fn test_write_atomically_partial_write_demonstrates_inconsistency() {
         };
 
         // Append initial entry
-        storage.append_entry(Value { id: 1 }).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendEntry(Value { id: 1 })])
+            .await
+            .unwrap();
         let initial_len = storage.get_log_len().await.unwrap();
         assert_eq!(initial_len, 1);
 
@@ -2007,9 +1953,9 @@ fn test_write_atomically_partial_write_demonstrates_inconsistency() {
         assert_eq!(len_after, 3, "entries should be appended (first op)");
 
         // But decided_idx was NOT set (second op skipped) — INCONSISTENCY
-        let decided = storage.get_decided_idx().await.unwrap();
+        let state = storage.load_state().await.unwrap();
         assert_eq!(
-            decided, 0,
+            state.decided_idx, 0,
             "decided_idx should still be 0 because second op was skipped"
         );
     });
@@ -2027,8 +1973,10 @@ fn test_write_atomically_preflight_error_leaves_state_unchanged() {
         };
 
         // Append initial entry
-        storage.append_entry(Value { id: 1 }).await.unwrap();
-        storage.set_decided_idx(0).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendEntry(Value { id: 1 })])
+            .await
+            .unwrap();
 
         // Make write_atomically fail (goes through MemoryStorage which has its own rollback)
         ctrl.borrow_mut().permanent_failures.insert(FailOn::WriteAtomically);
@@ -2044,8 +1992,8 @@ fn test_write_atomically_preflight_error_leaves_state_unchanged() {
         let len = storage.get_log_len().await.unwrap();
         assert_eq!(len, 1, "log should still have 1 entry after failed write");
 
-        let decided = storage.get_decided_idx().await.unwrap();
-        assert_eq!(decided, 0, "decided_idx should still be 0 after failed write");
+        let state = storage.load_state().await.unwrap();
+        assert_eq!(state.decided_idx, 0, "decided_idx should still be 0 after failed write");
     });
 }
 
@@ -2061,25 +2009,28 @@ fn test_write_atomically_mid_operation_rollback() {
         };
 
         // Pre-populate with one entry
-        storage.append_entry(Value::with_id(1)).await.unwrap();
-        storage.set_decided_idx(0).await.unwrap();
+        storage
+            .write_atomically(vec![StorageOp::AppendEntry(Value::with_id(1))])
+            .await
+            .unwrap();
 
-        // Inject failure on SetDecidedIdx -- AppendEntries will succeed but SetDecidedIndex will fail
-        ctrl.borrow_mut().fail_once.insert(FailOn::SetDecidedIdx);
+        // Inject failure on WriteAtomically — the entire atomic batch will fail
+        // (since all writes now go through write_atomically, we fail the whole batch)
+        ctrl.borrow_mut().fail_once.insert(FailOn::WriteAtomically);
 
         let ops = vec![
             StorageOp::AppendEntries(vec![Value::with_id(2), Value::with_id(3)]),
             StorageOp::SetDecidedIndex(3),
         ];
         let result = storage.write_atomically(ops).await;
-        assert!(result.is_err(), "write_atomically should fail when SetDecidedIdx fails");
+        assert!(result.is_err(), "write_atomically should fail when WriteAtomically fails");
 
         // Both operations should be rolled back
         let len = storage.get_log_len().await.unwrap();
         assert_eq!(len, 1, "log should still have 1 entry after rollback (AppendEntries was reverted)");
 
-        let decided = storage.get_decided_idx().await.unwrap();
-        assert_eq!(decided, 0, "decided_idx should still be 0 after rollback");
+        let state = storage.load_state().await.unwrap();
+        assert_eq!(state.decided_idx, 0, "decided_idx should still be 0 after rollback");
     });
 }
 

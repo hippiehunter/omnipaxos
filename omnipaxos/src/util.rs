@@ -120,12 +120,19 @@ where
     }
 
     fn idx(&self, pid: NodeId) -> usize {
-        *self.pid_to_idx.get(&pid).unwrap_or_else(|| {
-            panic!(
-                "BUG: Unknown PID {} in LeaderState (leader: {:?}, known PIDs: {:?})",
-                pid, self.n_leader, self.peers
-            )
-        })
+        match self.pid_to_idx.get(&pid) {
+            Some(&i) => i,
+            None => {
+                debug_assert!(
+                    false,
+                    "BUG: Unknown PID {} in LeaderState (leader: {:?}, known PIDs: {:?})",
+                    pid, self.n_leader, self.peers
+                );
+                #[cfg(feature = "tracing")]
+                tracing::error!(pid, "unknown PID in LeaderState");
+                0
+            }
+        }
     }
 
     pub fn increment_seq_num_session(&mut self, pid: NodeId) {
@@ -217,7 +224,16 @@ where
         let idx = self.idx(pid);
         match &self.promises_meta[idx] {
             PromiseState::Promised(metadata) => metadata,
-            _ => panic!("No Metadata found for promised follower {}", pid),
+            _ => {
+                debug_assert!(
+                    false,
+                    "BUG: No Metadata found for promised follower {}",
+                    pid
+                );
+                #[cfg(feature = "tracing")]
+                tracing::error!(pid, "no promise metadata for follower");
+                &self.max_promise_meta
+            }
         }
     }
 
@@ -275,6 +291,18 @@ where
 
     pub fn get_accepted_idx(&self, pid: NodeId) -> usize {
         self.accepted_indexes[self.idx(pid)]
+    }
+
+    /// Returns per-follower data for metrics: `(node_id, accepted_idx, is_promised)`.
+    pub fn get_follower_accepted_indexes(&self) -> Vec<(NodeId, usize, bool)> {
+        self.peers
+            .iter()
+            .enumerate()
+            .map(|(i, &pid)| {
+                let is_promised = matches!(&self.promises_meta[i], PromiseState::Promised(_));
+                (pid, self.accepted_indexes[i], is_promised)
+            })
+            .collect()
     }
 
     /// Returns true if a quorum of *promised* nodes have accepted up to `idx`.
@@ -481,11 +509,32 @@ impl Quorum {
         }
     }
 
+    /// Returns the minimum number of nodes needed for a prepare quorum.
+    pub(crate) fn prepare_quorum_size(&self) -> usize {
+        match self {
+            Quorum::Majority(majority) => *majority,
+            Quorum::Flexible(flex_quorum) => flex_quorum.read_quorum_size,
+        }
+    }
+
     pub(crate) fn is_accept_quorum(&self, num_nodes: usize) -> bool {
         match self {
             Quorum::Majority(majority) => num_nodes >= *majority,
             Quorum::Flexible(flex_quorum) => num_nodes >= flex_quorum.write_quorum_size,
         }
+    }
+
+    /// Returns the minimum number of nodes needed for a write (accept) quorum.
+    pub(crate) fn write_quorum_size(&self) -> usize {
+        match self {
+            Quorum::Majority(majority) => *majority,
+            Quorum::Flexible(flex_quorum) => flex_quorum.write_quorum_size,
+        }
+    }
+
+    /// Returns the minimum number of nodes needed for a read (prepare) quorum.
+    pub(crate) fn read_quorum_size(&self) -> usize {
+        self.prepare_quorum_size()
     }
 }
 

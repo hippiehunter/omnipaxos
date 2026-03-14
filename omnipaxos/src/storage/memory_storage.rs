@@ -1,6 +1,6 @@
 use crate::{
     ballot_leader_election::Ballot,
-    storage::{Entry, StopSign, Storage, StorageOp, StorageResult},
+    storage::{Entry, PersistedState, StopSign, Storage, StorageOp, StorageResult},
 };
 use std::collections::VecDeque;
 
@@ -35,73 +35,55 @@ impl<T: Entry> Default for MemoryStorage<T> {
     }
 }
 
+impl<T: Entry> MemoryStorage<T> {
+    // Internal helpers used by write_atomically
+    fn apply_op(&mut self, op: StorageOp<T>) {
+        match op {
+            StorageOp::AppendEntry(entry) => self.log.push_back(entry),
+            StorageOp::AppendEntries(entries) => self.log.extend(entries),
+            StorageOp::AppendOnPrefix(from_idx, entries) => {
+                self.log.truncate(from_idx.saturating_sub(self.trimmed_idx));
+                self.log.extend(entries);
+            }
+            StorageOp::SetPromise(bal) => self.n_prom = Some(bal),
+            StorageOp::SetDecidedIndex(idx) => self.ld = idx,
+            StorageOp::SetAcceptedRound(bal) => self.acc_round = Some(bal),
+            StorageOp::SetCompactedIdx(idx) => self.compacted_idx = idx,
+            StorageOp::Trim(trimmed_idx) => {
+                let to_trim = (trimmed_idx - self.trimmed_idx).min(self.log.len());
+                self.log.drain(0..to_trim);
+                self.trimmed_idx = trimmed_idx;
+            }
+            StorageOp::SetStopsign(ss) => self.stopsign = ss,
+            StorageOp::SetSnapshot(snap) => self.snapshot = snap,
+        }
+    }
+}
+
 impl<T> Storage<T> for MemoryStorage<T>
 where
     T: Entry,
 {
     async fn write_atomically(&mut self, ops: Vec<StorageOp<T>>) -> StorageResult<()> {
-        // Save state for rollback on error
         let backup = self.clone();
         for op in ops {
-            let result = match op {
-                StorageOp::AppendEntry(entry) => self.append_entry(entry).await,
-                StorageOp::AppendEntries(entries) => self.append_entries(entries).await,
-                StorageOp::AppendOnPrefix(from_idx, entries) => {
-                    self.append_on_prefix(from_idx, entries).await
-                }
-                StorageOp::SetPromise(bal) => self.set_promise(bal).await,
-                StorageOp::SetDecidedIndex(idx) => self.set_decided_idx(idx).await,
-                StorageOp::SetAcceptedRound(bal) => self.set_accepted_round(bal).await,
-                StorageOp::SetCompactedIdx(idx) => self.set_compacted_idx(idx).await,
-                StorageOp::Trim(idx) => self.trim(idx).await,
-                StorageOp::SetStopsign(ss) => self.set_stopsign(ss).await,
-                StorageOp::SetSnapshot(snap) => self.set_snapshot(snap).await,
-            };
-            if let Err(e) = result {
-                *self = backup;
-                return Err(e);
-            }
+            self.apply_op(op);
         }
+        // MemoryStorage ops are infallible, but keep backup pattern for API contract
+        let _ = backup;
         Ok(())
     }
 
-    async fn append_entry(&mut self, entry: T) -> StorageResult<()> {
-        self.log.push_back(entry);
-        Ok(())
-    }
-
-    async fn append_entries(&mut self, entries: Vec<T>) -> StorageResult<()> {
-        self.log.extend(entries);
-        Ok(())
-    }
-
-    async fn append_on_prefix(&mut self, from_idx: usize, entries: Vec<T>) -> StorageResult<()> {
-        self.log.truncate(from_idx.saturating_sub(self.trimmed_idx));
-        self.log.extend(entries);
-        Ok(())
-    }
-
-    async fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()> {
-        self.n_prom = Some(n_prom);
-        Ok(())
-    }
-
-    async fn set_decided_idx(&mut self, ld: usize) -> StorageResult<()> {
-        self.ld = ld;
-        Ok(())
-    }
-
-    async fn get_decided_idx(&self) -> StorageResult<usize> {
-        Ok(self.ld)
-    }
-
-    async fn set_accepted_round(&mut self, na: Ballot) -> StorageResult<()> {
-        self.acc_round = Some(na);
-        Ok(())
-    }
-
-    async fn get_accepted_round(&self) -> StorageResult<Option<Ballot>> {
-        Ok(self.acc_round)
+    async fn load_state(&self) -> StorageResult<PersistedState<T>> {
+        Ok(PersistedState {
+            promise: self.n_prom,
+            accepted_round: self.acc_round,
+            decided_idx: self.ld,
+            compacted_idx: self.compacted_idx,
+            stopsign: self.stopsign.clone(),
+            log_len: self.log.len(),
+            snapshot: self.snapshot.clone(),
+        })
     }
 
     async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>> {
@@ -128,40 +110,6 @@ where
         } else {
             Ok(self.log.range(start..).cloned().collect())
         }
-    }
-
-    async fn get_promise(&self) -> StorageResult<Option<Ballot>> {
-        Ok(self.n_prom)
-    }
-
-    async fn set_stopsign(&mut self, s: Option<StopSign>) -> StorageResult<()> {
-        self.stopsign = s;
-        Ok(())
-    }
-
-    async fn get_stopsign(&self) -> StorageResult<Option<StopSign>> {
-        Ok(self.stopsign.clone())
-    }
-
-    async fn trim(&mut self, trimmed_idx: usize) -> StorageResult<()> {
-        let to_trim = (trimmed_idx - self.trimmed_idx).min(self.log.len());
-        self.log.drain(0..to_trim);
-        self.trimmed_idx = trimmed_idx;
-        Ok(())
-    }
-
-    async fn set_compacted_idx(&mut self, compact_idx: usize) -> StorageResult<()> {
-        self.compacted_idx = compact_idx;
-        Ok(())
-    }
-
-    async fn get_compacted_idx(&self) -> StorageResult<usize> {
-        Ok(self.compacted_idx)
-    }
-
-    async fn set_snapshot(&mut self, snapshot: Option<T::Snapshot>) -> StorageResult<()> {
-        self.snapshot = snapshot;
-        Ok(())
     }
 
     async fn get_snapshot(&self) -> StorageResult<Option<T::Snapshot>> {

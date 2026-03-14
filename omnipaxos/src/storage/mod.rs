@@ -1,10 +1,8 @@
-pub(crate) mod internal_storage;
 /// An in-memory storage implementation for OmniPaxos.
 pub mod memory_storage;
-mod state_cache;
 
 use super::ballot_leader_election::Ballot;
-pub use crate::errors::StorageError;
+pub use crate::errors::{AnyError, StorageError, StorageOperation};
 use crate::ClusterConfig;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -66,14 +64,15 @@ where
 
     /// Whether `T` is snapshottable. If not, simply return `false` and leave the other functions `unimplemented!()`.
     fn use_snapshots() -> bool;
-
-    //fn size_hint() -> usize;  // TODO: To let the system know trade-off of using entries vs snapshot?
 }
 
 /// The Result type returned by the storage API.
-pub type StorageResult<T> = Result<T, StorageError>;
+///
+/// Storage trait methods return `AnyError` — the Runtime wraps these into
+/// `StorageError` (with operation context) as they propagate up.
+pub type StorageResult<T> = Result<T, AnyError>;
 
-/// The write operations of the storge implementation.
+/// The write operations of the storage implementation.
 #[derive(Debug)]
 pub enum StorageOp<T: Entry> {
     /// Appends an entry to the end of the log.
@@ -98,7 +97,30 @@ pub enum StorageOp<T: Entry> {
     SetSnapshot(Option<T::Snapshot>),
 }
 
-/// Trait for implementing the storage backend of Sequence Paxos.
+/// All persisted scalar state, loaded once during recovery via [`Storage::load_state`].
+#[derive(Debug)]
+pub struct PersistedState<T: Entry> {
+    /// The promised ballot.
+    pub promise: Option<Ballot>,
+    /// The latest accepted round.
+    pub accepted_round: Option<Ballot>,
+    /// The decided log index.
+    pub decided_idx: usize,
+    /// The compacted (trimmed/snapshotted) index.
+    pub compacted_idx: usize,
+    /// The stopsign for reconfiguration.
+    pub stopsign: Option<StopSign>,
+    /// Log length (excluding compacted entries).
+    pub log_len: usize,
+    /// The stored snapshot.
+    pub snapshot: Option<T::Snapshot>,
+}
+
+/// Trait for implementing the storage backend of OmniPaxos.
+///
+/// All mutations go through [`write_atomically`](Storage::write_atomically).
+/// State is loaded once at startup via [`load_state`](Storage::load_state).
+/// The remaining methods are read-only and used during normal operation.
 ///
 /// All methods are async to support storage backends with async I/O primitives.
 /// No `Send` bound is placed on the returned futures, so implementations may use
@@ -115,65 +137,22 @@ where
     /// call.
     async fn write_atomically(&mut self, ops: Vec<StorageOp<T>>) -> StorageResult<()>;
 
-    /// Appends an entry to the end of the log.
-    async fn append_entry(&mut self, entry: T) -> StorageResult<()>;
-
-    /// Appends the entries of `entries` to the end of the log.
-    async fn append_entries(&mut self, entries: Vec<T>) -> StorageResult<()>;
-
-    /// Appends the entries of `entries` to the prefix from index `from_index` (inclusive) in the log.
-    async fn append_on_prefix(&mut self, from_idx: usize, entries: Vec<T>) -> StorageResult<()>;
-
-    /// Sets the round that has been promised.
-    async fn set_promise(&mut self, n_prom: Ballot) -> StorageResult<()>;
-
-    /// Sets the decided index in the log.
-    async fn set_decided_idx(&mut self, ld: usize) -> StorageResult<()>;
-
-    /// Returns the decided index in the log.
-    async fn get_decided_idx(&self) -> StorageResult<usize>;
-
-    /// Sets the latest accepted round.
-    async fn set_accepted_round(&mut self, na: Ballot) -> StorageResult<()>;
-
-    /// Returns the latest round in which entries have been accepted, returns `None` if no
-    /// entries have been accepted.
-    async fn get_accepted_round(&self) -> StorageResult<Option<Ballot>>;
+    /// Load all persisted scalar state on startup. Called once during recovery.
+    async fn load_state(&self) -> StorageResult<PersistedState<T>>;
 
     /// Returns the entries in the log in the index interval of [from, to).
     /// If entries **do not exist for the complete interval**, an empty Vector should be returned.
     async fn get_entries(&self, from: usize, to: usize) -> StorageResult<Vec<T>>;
 
-    /// Returns the current length of the log (without the trimmed/snapshotted entries).
-    async fn get_log_len(&self) -> StorageResult<usize>;
-
     /// Returns the suffix of entries in the log from index `from` (inclusive).
     /// If entries **do not exist for the complete interval**, an empty Vector should be returned.
     async fn get_suffix(&self, from: usize) -> StorageResult<Vec<T>>;
 
-    /// Returns the round that has been promised.
-    async fn get_promise(&self) -> StorageResult<Option<Ballot>>;
-
-    /// Sets the StopSign used for reconfiguration.
-    async fn set_stopsign(&mut self, s: Option<StopSign>) -> StorageResult<()>;
-
-    /// Returns the stored StopSign, returns `None` if no StopSign has been stored.
-    async fn get_stopsign(&self) -> StorageResult<Option<StopSign>>;
-
-    /// Removes elements up to the given [`idx`] from storage.
-    async fn trim(&mut self, idx: usize) -> StorageResult<()>;
-
-    /// Sets the compacted (i.e. trimmed or snapshotted) index.
-    async fn set_compacted_idx(&mut self, idx: usize) -> StorageResult<()>;
-
-    /// Returns the garbage collector index from storage.
-    async fn get_compacted_idx(&self) -> StorageResult<usize>;
-
-    /// Sets the snapshot.
-    async fn set_snapshot(&mut self, snapshot: Option<T::Snapshot>) -> StorageResult<()>;
-
     /// Returns the stored snapshot.
     async fn get_snapshot(&self) -> StorageResult<Option<T::Snapshot>>;
+
+    /// Returns the current length of the log (without the trimmed/snapshotted entries).
+    async fn get_log_len(&self) -> StorageResult<usize>;
 }
 
 /// A place holder type for when not using snapshots. You should not use this type, it is only internally when deriving the Entry implementation.

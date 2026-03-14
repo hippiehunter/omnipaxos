@@ -1,14 +1,22 @@
 use crate::{
     ballot_leader_election::{Ballot, BallotLeaderElection},
-    errors::{valid_config, ConfigError, OmniPaxosError, StorageError},
+    engine::{Engine, EngineAction, InitialEngineState, Phase},
+    engine::state::EngineStateSnapshot,
+    errors::{valid_config, ConfigError, OmniPaxosError, StorageError, StorageOperation},
     messages::Message,
-    sequence_paxos::{Phase, SequencePaxos},
+    runtime::Runtime,
     storage::{Entry, StopSign, Storage},
     util::{
         defaults::{BUFFER_SIZE, ELECTION_TIMEOUT, FLUSH_BATCH_TIMEOUT, RESEND_MESSAGE_TIMEOUT},
         ConfigurationId, FlexibleQuorum, LogEntry, LogicalClock, NodeId,
     },
 };
+
+/// Snapshot of engine state for rollback on storage failure.
+struct EngineSnapshot<T: Entry> {
+    state: EngineStateSnapshot<T>,
+    outgoing_len: usize,
+}
 #[cfg(any(feature = "toml_config", feature = "serde"))]
 use serde::Deserialize;
 #[cfg(feature = "serde")]
@@ -63,16 +71,71 @@ impl OmniPaxosConfig {
         B: Storage<T>,
     {
         self.validate()?;
-        // Use stored ballot as initial BLE leader
-        let recovered_leader = storage.get_promise().await?;
+        // Load all persisted state in one call
+        let state = storage
+            .load_state()
+            .await
+            .map_err(|e| StorageError::new(StorageOperation::LoadState, e))?;
+
+        let mut accepted_idx = state.log_len + state.compacted_idx;
+        if state.stopsign.is_some() {
+            accepted_idx += 1;
+        }
+
+        let pid = self.server_config.pid;
+        let peers: Vec<NodeId> = self
+            .cluster_config
+            .nodes
+            .iter()
+            .copied()
+            .filter(|x| *x != pid)
+            .collect();
+
+        let initial_state = InitialEngineState {
+            promise: state.promise,
+            accepted_round: state.accepted_round,
+            decided_idx: state.decided_idx,
+            accepted_idx,
+            compacted_idx: state.compacted_idx,
+            stopsign: state.stopsign,
+            flexible_quorum: self.cluster_config.flexible_quorum,
+        };
+
+        let engine = Engine::new(
+            pid,
+            peers,
+            self.server_config.buffer_size,
+            self.server_config.batch_size,
+            initial_state,
+        );
+
+        // If we recovered a promise, set it in storage (matching old behavior)
+        let mut runtime = Runtime::new(storage);
+        if let Some(b) = state.promise {
+            if b != Ballot::default() {
+                runtime
+                    .storage
+                    .write_atomically(vec![crate::storage::StorageOp::SetPromise(b)])
+                    .await
+                    .map_err(|e| OmniPaxosError::Fatal(StorageError::new(StorageOperation::WriteAtomic, e)))?;
+            }
+        }
+
         Ok(OmniPaxos {
-            ble: BallotLeaderElection::with(self.clone().into(), recovered_leader),
+            engine,
+            runtime,
+            ble: BallotLeaderElection::with(self.clone().into(), state.promise),
             election_clock: LogicalClock::with(self.server_config.election_tick_timeout),
             resend_message_clock: LogicalClock::with(
                 self.server_config.resend_message_tick_timeout,
             ),
             flush_batch_clock: LogicalClock::with(self.server_config.flush_batch_tick_timeout),
-            seq_paxos: SequencePaxos::with(self.into(), storage).await?,
+            runtime_config: RuntimeConfig::default(),
+            tick_count: 0,
+            metrics_version: 0,
+            running_state: crate::metrics::RunningState::Healthy,
+            last_quorum_ack_tick: None,
+            metrics_recorder: None,
         })
     }
 }
@@ -226,11 +289,18 @@ where
     T: Entry,
     B: Storage<T>,
 {
-    seq_paxos: SequencePaxos<T, B>,
+    engine: Engine<T>,
+    runtime: Runtime<T, B>,
     ble: BallotLeaderElection,
     election_clock: LogicalClock,
     resend_message_clock: LogicalClock,
     flush_batch_clock: LogicalClock,
+    runtime_config: RuntimeConfig,
+    tick_count: u64,
+    metrics_version: u64,
+    running_state: crate::metrics::RunningState,
+    last_quorum_ack_tick: Option<u64>,
+    metrics_recorder: Option<Box<dyn crate::metrics::MetricsRecorder>>,
 }
 
 impl<T, B> OmniPaxos<T, B>
@@ -238,11 +308,186 @@ where
     T: Entry,
     B: Storage<T>,
 {
+    /// Snapshot engine state (scalars + outgoing length) before an operation.
+    fn snapshot_engine(&self) -> EngineSnapshot<T> {
+        EngineSnapshot {
+            state: self.engine.s.snapshot(),
+            outgoing_len: self.engine.outgoing.len(),
+        }
+    }
+
+    /// Restore engine state on failure.
+    fn restore_engine(&mut self, snap: EngineSnapshot<T>) {
+        self.engine.s.restore(snap.state);
+        self.engine.outgoing.truncate(snap.outgoing_len);
+        self.engine.commands.clear();
+    }
+
+    /// Helper: run engine, execute commands, handle action.
+    /// Snapshots engine state before execution and restores on failure.
+    async fn execute_engine_commands(&mut self) -> Result<(), StorageError> {
+        let cmds = self.engine.take_commands();
+        if cmds.is_empty() {
+            return Ok(());
+        }
+        // Note: snapshot was already taken by the caller before engine mutation
+        self.runtime.execute_commands(cmds).await
+    }
+
+    /// Helper: run action from engine that may need storage reads.
+    async fn handle_engine_action(&mut self, action: EngineAction<T>) -> Result<(), StorageError> {
+        // Execute any commands generated before the action
+        let cmds = self.engine.take_commands();
+        self.runtime.execute_commands(cmds).await?;
+        // Then handle the action (which may generate more commands)
+        self.runtime.handle_action(action, &mut self.engine).await
+    }
+
+    /// Snapshot 5 scalar values before a public entry point.
+    fn snapshot_metrics(
+        &self,
+    ) -> (
+        crate::engine::state::Role,
+        crate::engine::state::Phase,
+        usize,
+        NodeId,
+        u64,
+    ) {
+        let (role, phase) = self.engine.s.state.clone();
+        let decided_idx = self.engine.get_decided_idx();
+        let leader = self.engine.get_promise().pid;
+        let dropped = self.engine.get_dropped_message_count();
+        (role, phase, decided_idx, leader, dropped)
+    }
+
+    /// Compare old vs new state after a public entry point, increment
+    /// metrics_version and call the recorder if installed.
+    fn detect_and_report_changes(
+        &mut self,
+        old_role: crate::engine::state::Role,
+        old_phase: crate::engine::state::Phase,
+        old_decided: usize,
+        old_leader: NodeId,
+        old_dropped: u64,
+    ) {
+        use crate::engine::state::{Role as R, Phase as P};
+        use crate::metrics::{Role, Phase};
+
+        let (new_role, new_phase) = &self.engine.s.state;
+        let new_decided = self.engine.get_decided_idx();
+        let new_leader = self.engine.get_promise().pid;
+        let new_dropped = self.engine.get_dropped_message_count();
+
+        let mut changed = false;
+
+        if *new_role != old_role {
+            changed = true;
+            if let Some(ref recorder) = self.metrics_recorder {
+                let old_r = match old_role {
+                    R::Leader => Role::Leader,
+                    R::Follower => Role::Follower,
+                };
+                let new_r = match *new_role {
+                    R::Leader => Role::Leader,
+                    R::Follower => Role::Follower,
+                };
+                recorder.on_role_change(self.engine.s.pid, old_r, new_r);
+            }
+        }
+
+        if *new_phase != old_phase {
+            changed = true;
+            if let Some(ref recorder) = self.metrics_recorder {
+                let old_p = match old_phase {
+                    P::Prepare => Phase::Prepare,
+                    P::Accept => Phase::Accept,
+                    P::Recover => Phase::Recover,
+                    P::None => Phase::None,
+                };
+                let new_p = match *new_phase {
+                    P::Prepare => Phase::Prepare,
+                    P::Accept => Phase::Accept,
+                    P::Recover => Phase::Recover,
+                    P::None => Phase::None,
+                };
+                recorder.on_phase_change(self.engine.s.pid, old_p, new_p);
+            }
+        }
+
+        if new_decided != old_decided {
+            changed = true;
+            // Update last_quorum_ack_tick when leader decides
+            if *new_role == R::Leader {
+                self.last_quorum_ack_tick = Some(self.tick_count);
+            }
+            if let Some(ref recorder) = self.metrics_recorder {
+                recorder.on_decided(self.engine.s.pid, old_decided, new_decided);
+            }
+        }
+
+        if new_leader != old_leader {
+            changed = true;
+            if let Some(ref recorder) = self.metrics_recorder {
+                recorder.on_leader_change(self.engine.s.pid, old_leader, new_leader);
+            }
+        }
+
+        if new_dropped != old_dropped {
+            changed = true;
+            if let Some(ref recorder) = self.metrics_recorder {
+                recorder.on_message_dropped(self.engine.s.pid, new_dropped);
+            }
+        }
+
+        if changed {
+            self.metrics_version += 1;
+        }
+    }
+
     /// Initiates the trim process.
     /// # Arguments
     /// * `trim_index` - Deletes all entries up to [`trim_index`], if the [`trim_index`] is `None` then the minimum index accepted by **ALL** servers will be used as the [`trim_index`].
     pub async fn trim(&mut self, trim_index: Option<usize>) -> Result<(), CompactionErr> {
-        self.seq_paxos.trim(trim_index).await
+        use crate::engine::state::Role;
+        match self.engine.s.state {
+            (Role::Leader, _) => {
+                let min_all_accepted_idx =
+                    self.engine.s.leader_state.get_min_all_accepted_idx();
+                let trimmed_idx = match trim_index {
+                    Some(idx) if idx <= min_all_accepted_idx => idx,
+                    None => min_all_accepted_idx,
+                    _ => {
+                        return Err(CompactionErr::NotAllDecided(min_all_accepted_idx));
+                    }
+                };
+                let snap = self.snapshot_engine();
+                self.engine.try_trim(trimmed_idx);
+                let result = self.execute_engine_commands().await;
+                if result.is_err() {
+                    self.restore_engine(snap);
+                }
+                if result.is_ok() {
+                    // Send compaction to peers
+                    let pid = self.engine.s.pid;
+                    let peers = self.engine.s.peers.clone();
+                    for peer in peers {
+                        use crate::messages::sequence_paxos::*;
+                        let msg = PaxosMsg::Compaction(Compaction::Trim(trimmed_idx));
+                        self.engine.try_push_message(Message::SequencePaxos(
+                            PaxosMessage {
+                                from: pid,
+                                to: peer,
+                                msg,
+                            },
+                        ));
+                    }
+                }
+                result.map_err(CompactionErr::Storage)
+            }
+            _ => Err(CompactionErr::NotCurrentLeader(
+                self.engine.get_promise().pid,
+            )),
+        }
     }
 
     /// Trim the log and create a snapshot. ** Note: only up to the `decided_idx` can be snapshotted **
@@ -254,17 +499,34 @@ where
         compact_idx: Option<usize>,
         local_only: bool,
     ) -> Result<(), CompactionErr> {
-        self.seq_paxos.snapshot(compact_idx, local_only).await
+        self.runtime
+            .try_snapshot(&mut self.engine, compact_idx)
+            .await?;
+        if !local_only {
+            let pid = self.engine.s.pid;
+            let peers = self.engine.s.peers.clone();
+            for peer in peers {
+                use crate::messages::sequence_paxos::*;
+                let msg = PaxosMsg::Compaction(Compaction::Snapshot(compact_idx));
+                self.engine
+                    .try_push_message(Message::SequencePaxos(PaxosMessage {
+                        from: pid,
+                        to: peer,
+                        msg,
+                    }));
+            }
+        }
+        Ok(())
     }
 
     /// Return the decided index. 0 means that no entry has been decided.
     pub fn get_decided_idx(&self) -> usize {
-        self.seq_paxos.get_decided_idx()
+        self.engine.get_decided_idx()
     }
 
     /// Return trim index from storage.
     pub fn get_compacted_idx(&self) -> usize {
-        self.seq_paxos.get_compacted_idx()
+        self.engine.get_compacted_idx()
     }
 
     /// Returns the ID of the current leader and whether the node's `Phase` is `Phase::Accepted`.
@@ -274,29 +536,33 @@ where
     /// necessarily imply that the leader is not in the accepted phase; it only reflects the current
     /// phase of this node.
     pub fn get_current_leader(&self) -> Option<(NodeId, bool)> {
-        let promised_pid = self.seq_paxos.get_promise().pid;
+        let promised_pid = self.engine.get_promise().pid;
         if promised_pid == 0 {
             None
         } else {
-            let is_accepted = self.seq_paxos.get_state().1 == Phase::Accept;
+            let is_accepted = self.engine.get_state().1 == Phase::Accept;
             Some((promised_pid, is_accepted))
         }
     }
 
     /// Returns the promised ballot of this node.
     pub fn get_promise(&self) -> Ballot {
-        self.seq_paxos.get_promise()
+        self.engine.get_promise()
     }
 
     /// Moves outgoing messages from this server into the buffer. The messages should then be sent via the network implementation.
     pub fn take_outgoing_messages(&mut self, buffer: &mut Vec<Message<T>>) {
-        self.seq_paxos.take_outgoing_msgs(buffer);
+        self.engine.take_outgoing_msgs(buffer);
         buffer.extend(self.ble.outgoing_mut().drain(..).map(|b| Message::BLE(b)));
     }
 
     /// Read entry at index `idx` in the log. Returns `None` if `idx` is out of bounds.
     pub async fn read(&self, idx: usize) -> Result<Option<LogEntry<T>>, OmniPaxosError> {
-        match self.seq_paxos.internal_storage.read(idx..idx + 1).await? {
+        match self
+            .runtime
+            .read(&self.engine, idx..idx + 1)
+            .await?
+        {
             Some(mut v) => Ok(v.pop()),
             None => Ok(None),
         }
@@ -307,7 +573,7 @@ where
     where
         R: RangeBounds<usize>,
     {
-        Ok(self.seq_paxos.internal_storage.read(r).await?)
+        Ok(self.runtime.read(&self.engine, r).await?)
     }
 
     /// Read all decided entries starting at `from_idx` (inclusive) in the log. Returns `None` if `from_idx` is out of bounds.
@@ -316,29 +582,75 @@ where
         from_idx: usize,
     ) -> Result<Option<Vec<LogEntry<T>>>, OmniPaxosError> {
         Ok(self
-            .seq_paxos
-            .internal_storage
-            .read_decided_suffix(from_idx)
+            .runtime
+            .read_decided_suffix(&self.engine, from_idx)
             .await?)
     }
 
-    /// Handle an incoming message
+    /// Handle an incoming message.
+    /// Note: on storage failure, state may be partially updated (matching
+    /// the old behavior where each storage call was independent).
     pub async fn handle_incoming(&mut self, m: Message<T>) -> Result<(), OmniPaxosError> {
+        let (old_role, old_phase, old_decided, old_leader, old_dropped) =
+            self.snapshot_metrics();
         match m {
-            Message::SequencePaxos(p) => self.seq_paxos.handle(p).await?,
+            Message::SequencePaxos(p) => {
+                let action = self.engine.handle(p);
+                if let Err(e) = self.handle_engine_action(action).await {
+                    self.running_state = crate::metrics::RunningState::StorageError;
+                    self.metrics_version += 1;
+                    return Err(e.into());
+                }
+            }
             Message::BLE(b) => self.ble.handle(b),
         }
+        self.detect_and_report_changes(old_role, old_phase, old_decided, old_leader, old_dropped);
         Ok(())
     }
 
     /// Returns whether this Sequence Paxos has been reconfigured
     pub fn is_reconfigured(&self) -> Option<StopSign> {
-        self.seq_paxos.is_reconfigured()
+        self.engine.is_reconfigured()
     }
 
     /// Append an entry to the replicated log.
-    pub async fn append(&mut self, entry: T) -> Result<(), ProposeErr<T>> {
-        self.seq_paxos.append(entry).await
+    ///
+    /// Returns `Ok(AppendResult)` describing how the entry was handled, or an error
+    /// if the entry could not be proposed.
+    pub async fn append(&mut self, entry: T) -> Result<AppendResult, ProposeErr<T>> {
+        if !self.runtime_config.enable_proposals {
+            return Err(ProposeErr::ProposalsDisabled(entry));
+        }
+        if self.engine.s.transfer_state.is_some() {
+            return Err(ProposeErr::TransferInProgress(entry));
+        }
+        if self.engine.accepted_reconfiguration() {
+            return Err(ProposeErr::PendingReconfigEntry(entry));
+        }
+        let (old_role, old_phase, old_decided, old_leader, old_dropped) =
+            self.snapshot_metrics();
+        let snap = self.snapshot_engine();
+        match self.engine.propose_entry(entry) {
+            Ok(result) => {
+                if let Err(e) = self.execute_engine_commands().await {
+                    self.restore_engine(snap);
+                    self.running_state = crate::metrics::RunningState::StorageError;
+                    self.metrics_version += 1;
+                    return Err(ProposeErr::Storage(e));
+                }
+                self.detect_and_report_changes(
+                    old_role, old_phase, old_decided, old_leader, old_dropped,
+                );
+                Ok(match result {
+                    crate::engine::ProposeResult::Accepted => AppendResult::Accepted,
+                    crate::engine::ProposeResult::Forwarded { leader } => {
+                        AppendResult::Forwarded { leader }
+                    }
+                    crate::engine::ProposeResult::Buffered => AppendResult::Buffered,
+                })
+            }
+            Err(entry) => Err(ProposeErr::NoLeader(entry)),
+        }
     }
 
     /// Propose a cluster reconfiguration. Returns an error if the current configuration has already been stopped
@@ -357,30 +669,70 @@ where
                 metadata,
             ));
         }
-        self.seq_paxos
-            .reconfigure(new_configuration, metadata)
-            .await
+        if self.engine.accepted_reconfiguration() {
+            return Err(ProposeErr::PendingReconfigConfig(
+                new_configuration,
+                metadata,
+            ));
+        }
+        use crate::engine::state::Role;
+        let ss = StopSign::with(new_configuration, metadata);
+        match self.engine.s.state {
+            (Role::Leader, Phase::Prepare) => self.engine.s.buffered_stopsign = Some(ss),
+            (Role::Leader, Phase::Accept) => {
+                let snap = self.snapshot_engine();
+                self.engine.accept_stopsign_leader(ss);
+                if let Err(e) = self.execute_engine_commands().await {
+                    self.restore_engine(snap);
+                    return Err(ProposeErr::Storage(e));
+                }
+            }
+            _ => self.engine.forward_stopsign(ss),
+        }
+        Ok(())
     }
 
     /// Handles re-establishing a connection to a previously disconnected peer.
     /// This should only be called if the underlying network implementation indicates that a connection has been re-established.
     pub fn reconnected(&mut self, pid: NodeId) {
-        self.seq_paxos.reconnected(pid)
+        self.engine.reconnected(pid)
     }
 
     /// Increments the internal logical clock. This drives the processes for leader changes, resending dropped messages, and flushing batched log entries.
     /// Each of these is triggered every `election_tick_timeout`, `resend_message_tick_timeout`, and `flush_batch_tick_timeout` number of calls to this function
     /// (See how to configure these timeouts in `ServerConfig`).
     pub async fn tick(&mut self) -> Result<(), OmniPaxosError> {
+        self.tick_count += 1;
+        let (old_role, old_phase, old_decided, old_leader, old_dropped) =
+            self.snapshot_metrics();
         if self.election_clock.tick_and_check_timeout() {
             self.election_timeout().await?;
         }
         if self.resend_message_clock.tick_and_check_timeout() {
-            self.seq_paxos.resend_message_timeout();
+            self.engine.resend_message_timeout();
         }
+        // Tick leader transfer timeout
+        self.engine.tick_transfer();
         if self.flush_batch_clock.tick_and_check_timeout() {
-            self.seq_paxos.flush_batch_timeout().await?;
+            let snap = self.snapshot_engine();
+            let old_leader_accepted_idx = self
+                .engine
+                .s
+                .leader_state
+                .get_accepted_idx(self.engine.s.pid);
+            self.engine.flush_batch_timeout();
+            if let Err(e) = self.execute_engine_commands().await {
+                self.restore_engine(snap);
+                self.engine
+                    .s
+                    .leader_state
+                    .set_accepted_idx(self.engine.s.pid, old_leader_accepted_idx);
+                self.running_state = crate::metrics::RunningState::StorageError;
+                self.metrics_version += 1;
+                return Err(e.into());
+            }
         }
+        self.detect_and_report_changes(old_role, old_phase, old_decided, old_leader, old_dropped);
         Ok(())
     }
 
@@ -389,18 +741,155 @@ where
     /// leadership with higher Ballots.
     pub async fn try_become_leader(&mut self) -> Result<(), OmniPaxosError> {
         let mut my_ballot = self.ble.get_current_ballot();
-        let promise = self.seq_paxos.get_promise();
+        let promise = self.engine.get_promise();
         my_ballot.n = promise.n + 1;
         // Sync BLE state so it's aware of the new ballot
         self.ble.set_current_ballot(my_ballot);
         self.ble.set_leader(my_ballot);
-        self.seq_paxos.handle_leader(my_ballot).await?;
+        let snap = self.snapshot_engine();
+        let action = self.engine.handle_leader(my_ballot);
+        if let Err(e) = self.handle_engine_action(action).await {
+            self.restore_engine(snap);
+            return Err(e.into());
+        }
         Ok(())
     }
 
     /// Returns the total number of outgoing messages that were dropped due to buffer overflow.
     pub fn get_dropped_message_count(&self) -> u64 {
-        self.seq_paxos.get_dropped_message_count()
+        self.engine.get_dropped_message_count()
+    }
+
+    /// Returns a snapshot of the current metrics for this node.
+    pub fn metrics(&self) -> crate::metrics::Metrics {
+        use crate::engine::state::{Phase as P, Role as R};
+        use crate::metrics::{
+            FollowerMetrics, Metrics, Phase, Role, RunningState,
+        };
+        let (role, phase) = &self.engine.s.state;
+        let role = match role {
+            R::Leader => Role::Leader,
+            R::Follower => Role::Follower,
+        };
+        let phase = match phase {
+            P::Prepare => Phase::Prepare,
+            P::Accept => Phase::Accept,
+            P::Recover => Phase::Recover,
+            P::None => Phase::None,
+        };
+
+        let leader_accepted_idx = self.engine.get_accepted_idx();
+        let follower_metrics = if role == Role::Leader {
+            let data = self.engine.s.leader_state.get_follower_accepted_indexes();
+            data.into_iter()
+                .filter(|(pid, _, _)| *pid != self.engine.s.pid)
+                .map(|(pid, acc_idx, is_promised)| {
+                    (
+                        pid,
+                        FollowerMetrics {
+                            node_id: pid,
+                            accepted_idx: acc_idx,
+                            is_promised,
+                            replication_lag: leader_accepted_idx.saturating_sub(acc_idx),
+                            last_heartbeat_tick: None,
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        let running_state = if self.engine.is_reconfigured().is_some() {
+            RunningState::Reconfigured
+        } else {
+            self.running_state
+        };
+
+        let ticks_since_quorum_ack = if role == Role::Leader {
+            self.last_quorum_ack_tick
+                .map(|t| self.tick_count.saturating_sub(t))
+        } else {
+            None
+        };
+
+        Metrics {
+            pid: self.engine.s.pid,
+            role,
+            phase,
+            current_leader: self.engine.get_promise().pid,
+            promise: self.engine.get_promise(),
+            decided_idx: self.engine.get_decided_idx(),
+            accepted_idx: leader_accepted_idx,
+            compacted_idx: self.engine.get_compacted_idx(),
+            dropped_messages: self.engine.get_dropped_message_count(),
+            batched_entries: self.engine.s.batched_entries.len(),
+            configuration_id: self.engine.get_promise().config_id,
+            is_reconfigured: self.engine.is_reconfigured().is_some(),
+            running_state,
+            metrics_version: self.metrics_version,
+            tick_count: self.tick_count,
+            last_quorum_ack_tick: self.last_quorum_ack_tick,
+            ticks_since_quorum_ack,
+            follower_metrics,
+            num_peers: self.engine.s.peers.len(),
+            write_quorum_size: self.engine.s.leader_state.quorum.write_quorum_size(),
+            read_quorum_size: self.engine.s.leader_state.quorum.read_quorum_size(),
+            heartbeat_round: self.ble.get_hb_round(),
+        }
+    }
+
+    /// Set a custom metrics recorder for push-based observability.
+    pub fn set_metrics_recorder(
+        &mut self,
+        recorder: Box<dyn crate::metrics::MetricsRecorder>,
+    ) {
+        self.metrics_recorder = Some(recorder);
+    }
+
+    /// Returns the current metrics version. This is a cheap way to detect
+    /// if any observable state has changed since the last poll.
+    pub fn metrics_version(&self) -> u64 {
+        self.metrics_version
+    }
+
+    /// Start a linearizable read by confirming leader authority.
+    /// Returns a `read_id` that can be polled with [`poll_read_barrier`].
+    /// For single-node clusters, the barrier is immediately available.
+    pub fn ensure_linearizable(&mut self) -> Result<u64, ReadError> {
+        self.engine.start_read_index()
+    }
+
+    /// Poll for a read barrier. Returns `Ok(ReadBarrier)` when a quorum has confirmed
+    /// leader authority, `Err(ReadError::QuorumPending)` if still waiting, or
+    /// `Err(ReadError::QuorumLost)` if the read-index was lost.
+    ///
+    /// Once you have a `ReadBarrier`, wait until `get_decided_idx() >= barrier.read_idx()`
+    /// then reads from the log are linearizable.
+    pub fn poll_read_barrier(&mut self, read_id: u64) -> Result<ReadBarrier, ReadError> {
+        self.engine.poll_read_barrier(read_id)
+    }
+
+    /// Initiate a graceful leader transfer to the specified target node.
+    /// The leader will stop accepting new proposals and, once the target is caught up,
+    /// send a `TransferLeader` message causing the target to start an election.
+    pub fn transfer_leader(&mut self, target: NodeId) -> Result<(), TransferError> {
+        self.engine.transfer_leader(target)
+    }
+
+    /// Set the runtime configuration (election and proposal toggles).
+    pub fn set_runtime_config(&mut self, config: RuntimeConfig) {
+        self.runtime_config = config;
+    }
+
+    /// Toggle whether this node participates in leader elections.
+    pub fn set_election_enabled(&mut self, enabled: bool) {
+        self.runtime_config.enable_election = enabled;
+    }
+
+    /// Toggle whether this node accepts proposals.
+    pub fn set_proposals_enabled(&mut self, enabled: bool) {
+        self.runtime_config.enable_proposals = enabled;
     }
 
     /*** BLE calls ***/
@@ -416,12 +905,136 @@ where
     async fn election_timeout(&mut self) -> Result<(), OmniPaxosError> {
         if let Some(new_leader) = self
             .ble
-            .hb_timeout(self.seq_paxos.get_state(), self.seq_paxos.get_promise())
+            .hb_timeout(self.engine.get_state(), self.engine.get_promise())
         {
-            self.seq_paxos.handle_leader(new_leader).await?;
+            // Skip becoming leader if elections are disabled for this node
+            if !self.runtime_config.enable_election && new_leader.pid == self.engine.s.pid {
+                return Ok(());
+            }
+            let snap = self.snapshot_engine();
+            let action = self.engine.handle_leader(new_leader);
+            if let Err(e) = self.handle_engine_action(action).await {
+                self.restore_engine(snap);
+                return Err(e.into());
+            }
         }
         Ok(())
     }
+}
+
+/// Runtime-switchable configuration flags.
+/// These can be changed without restarting the node.
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    /// When false, node will not attempt to become leader. Still responds to heartbeats.
+    pub enable_election: bool,
+    /// When false, node rejects all proposals. In-flight entries still get decided.
+    pub enable_proposals: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enable_election: true,
+            enable_proposals: true,
+        }
+    }
+}
+
+/// A read barrier indicating that reads at or below `read_idx` are linearizable.
+#[derive(Debug, Clone)]
+#[must_use = "call read_idx() to check if reads are safe"]
+pub struct ReadBarrier {
+    pub(crate) read_idx: usize,
+}
+
+impl ReadBarrier {
+    /// The decided index at which reads are linearizable.
+    /// Wait until `get_decided_idx() >= read_idx()` before reading.
+    pub fn read_idx(&self) -> usize {
+        self.read_idx
+    }
+
+    /// Returns true if the node's decided_idx has reached the barrier.
+    pub fn is_ready(&self, current_decided_idx: usize) -> bool {
+        current_decided_idx >= self.read_idx
+    }
+}
+
+/// Error type for linearizable read operations.
+#[derive(Debug)]
+pub enum ReadError {
+    /// This node is not the leader.
+    NotLeader {
+        /// The current leader, if known.
+        leader: Option<NodeId>,
+    },
+    /// Read-index quorum was lost (leader may have lost leadership).
+    QuorumLost,
+    /// Quorum not yet reached; poll again.
+    QuorumPending,
+}
+
+impl Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::NotLeader { leader } => write!(f, "not leader (leader: {:?})", leader),
+            ReadError::QuorumLost => write!(f, "read-index quorum lost"),
+            ReadError::QuorumPending => write!(f, "read-index quorum pending"),
+        }
+    }
+}
+
+impl Error for ReadError {}
+
+/// Error type for leader transfer operations.
+#[derive(Debug)]
+pub enum TransferError {
+    /// Not the current leader.
+    NotLeader {
+        /// The current leader, if known.
+        leader: Option<NodeId>,
+    },
+    /// Target is not a known peer.
+    UnknownTarget(NodeId),
+    /// A transfer is already in progress.
+    TransferInProgress {
+        /// The target of the current transfer.
+        target: NodeId,
+    },
+    /// Node has been reconfigured.
+    Reconfigured,
+}
+
+impl Display for TransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransferError::NotLeader { leader } => {
+                write!(f, "not leader (leader: {:?})", leader)
+            }
+            TransferError::UnknownTarget(pid) => write!(f, "unknown target: {}", pid),
+            TransferError::TransferInProgress { target } => {
+                write!(f, "transfer in progress to {}", target)
+            }
+            TransferError::Reconfigured => write!(f, "node is reconfigured"),
+        }
+    }
+}
+
+impl Error for TransferError {}
+
+/// Describes how an appended entry was handled.
+#[derive(Debug)]
+pub enum AppendResult {
+    /// Leader accepted the entry directly.
+    Accepted,
+    /// Entry forwarded to the known leader.
+    Forwarded {
+        /// The leader the entry was forwarded to.
+        leader: NodeId,
+    },
+    /// Entry buffered (leader in Prepare phase).
+    Buffered,
 }
 
 /// An error indicating a failed proposal due to the current cluster configuration being already stopped
@@ -440,7 +1053,13 @@ where
     /// error and the failed, proposed cluster config and metadata.
     ConfigError(ConfigError, ClusterConfig, Option<Vec<u8>>),
     /// Storage backend error during proposal. The entry may not have been persisted.
-    StorageErr(StorageError),
+    Storage(StorageError),
+    /// No leader is known. Entry returned to caller.
+    NoLeader(T),
+    /// Proposals are disabled via RuntimeConfig. Entry returned to caller.
+    ProposalsDisabled(T),
+    /// A leader transfer is in progress. Entry returned to caller.
+    TransferInProgress(T),
 }
 
 impl<T: Entry> Display for ProposeErr<T> {
@@ -458,8 +1077,17 @@ impl<T: Entry> Display for ProposeErr<T> {
             ProposeErr::ConfigError(e, _, _) => {
                 write!(f, "reconfiguration rejected: {}", e)
             }
-            ProposeErr::StorageErr(e) => {
+            ProposeErr::Storage(e) => {
                 write!(f, "storage error during proposal: {}", e)
+            }
+            ProposeErr::NoLeader(_) => {
+                write!(f, "proposal rejected: no leader known")
+            }
+            ProposeErr::ProposalsDisabled(_) => {
+                write!(f, "proposal rejected: proposals are disabled")
+            }
+            ProposeErr::TransferInProgress(_) => {
+                write!(f, "proposal rejected: leader transfer in progress")
             }
         }
     }
@@ -469,7 +1097,7 @@ impl<T: Entry> std::error::Error for ProposeErr<T> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ProposeErr::ConfigError(e, _, _) => Some(e),
-            ProposeErr::StorageErr(e) => Some(e),
+            ProposeErr::Storage(e) => Some(e),
             _ => None,
         }
     }
@@ -487,27 +1115,14 @@ pub enum CompactionErr {
     /// Trim was called at a follower node. Trim must be called by the leader, which is the returned NodeId.
     NotCurrentLeader(NodeId),
     /// A storage backend error occurred during the compaction operation.
-    StorageError(StorageError),
+    Storage(StorageError),
 }
 
 impl Error for CompactionErr {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            CompactionErr::StorageError(e) => Some(e),
+            CompactionErr::Storage(e) => Some(e),
             _ => None,
-        }
-    }
-}
-impl Clone for CompactionErr {
-    fn clone(&self) -> Self {
-        match self {
-            CompactionErr::UndecidedIndex(idx) => CompactionErr::UndecidedIndex(*idx),
-            CompactionErr::TrimmedIndex(idx) => CompactionErr::TrimmedIndex(*idx),
-            CompactionErr::NotAllDecided(idx) => CompactionErr::NotAllDecided(*idx),
-            CompactionErr::NotCurrentLeader(pid) => CompactionErr::NotCurrentLeader(*pid),
-            CompactionErr::StorageError(e) => {
-                CompactionErr::StorageError(StorageError(e.to_string().into()))
-            }
         }
     }
 }
@@ -515,7 +1130,7 @@ impl Clone for CompactionErr {
 impl Display for CompactionErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompactionErr::StorageError(e) => write!(f, "storage error during compaction: {}", e),
+            CompactionErr::Storage(e) => write!(f, "storage error during compaction: {}", e),
             other => Debug::fmt(other, f),
         }
     }
