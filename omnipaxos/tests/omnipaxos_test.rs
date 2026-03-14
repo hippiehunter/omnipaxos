@@ -1,6 +1,6 @@
 use omnipaxos::{
     messages::Message,
-    storage::{memory_storage::MemoryStorage, Storage},
+    storage::{memory_storage::MemoryStorage, Storage as _},
     util::LogEntry,
     ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
 };
@@ -465,6 +465,8 @@ fn test_single_node_recovery() {
         // (as if the node had been a leader before crashing).
         use omnipaxos::ballot_leader_election::Ballot;
 
+        use omnipaxos::storage::StorageOp;
+
         let mut storage: MemoryStorage<Value> = MemoryStorage::default();
         let ballot = Ballot {
             config_id: 1,
@@ -472,18 +474,19 @@ fn test_single_node_recovery() {
             priority: 0,
             pid: 1,
         };
-        storage.set_promise(ballot).await.unwrap();
-        storage.set_accepted_round(ballot).await.unwrap();
-        // Write some entries that were accepted before "crash".
         storage
-            .append_entries(vec![
-                Value::with_id(1),
-                Value::with_id(2),
-                Value::with_id(3),
+            .write_atomically(vec![
+                StorageOp::SetPromise(ballot),
+                StorageOp::SetAcceptedRound(ballot),
+                StorageOp::AppendEntries(vec![
+                    Value::with_id(1),
+                    Value::with_id(2),
+                    Value::with_id(3),
+                ]),
+                StorageOp::SetDecidedIndex(3),
             ])
             .await
             .unwrap();
-        storage.set_decided_idx(3).await.unwrap();
 
         let cluster_config = ClusterConfig {
             configuration_id: 1,

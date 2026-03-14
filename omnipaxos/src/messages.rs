@@ -170,6 +170,44 @@ pub mod sequence_paxos {
         Compaction(Compaction),
         AcceptStopSign(AcceptStopSign),
         ForwardStopSign(StopSign),
+        /// Leader transfer: current leader asks target to take over.
+        TransferLeader(TransferLeader),
+        /// Leader asks followers to confirm its authority for linearizable reads.
+        ReadIndexReq(ReadIndexReq),
+        /// Follower confirms (or denies) leader authority for linearizable reads.
+        ReadIndexResp(ReadIndexResp),
+    }
+
+    /// Leader sends this to confirm its authority for linearizable reads.
+    #[derive(Copy, Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct ReadIndexReq {
+        /// The leader's current ballot.
+        pub n: Ballot,
+        /// Unique ID for this read-index request.
+        pub read_id: u64,
+    }
+
+    /// Follower response confirming or denying leader authority.
+    #[derive(Copy, Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct ReadIndexResp {
+        /// The leader's ballot from the request.
+        pub n: Ballot,
+        /// The read-index request ID.
+        pub read_id: u64,
+        /// True if the follower's promise matches the leader's ballot.
+        pub ok: bool,
+    }
+
+    /// Message sent by a leader to a target node to initiate leadership transfer.
+    #[derive(Clone, Debug)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct TransferLeader {
+        /// The current leader's ballot.
+        pub n: Ballot,
+        /// Suggested ballot number for the target to use (higher than leader's).
+        pub suggested_n: u32,
     }
 
     /// A struct for a Paxos message that also includes sender and receiver.
