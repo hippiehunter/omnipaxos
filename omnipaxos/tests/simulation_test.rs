@@ -8,7 +8,8 @@ use omnipaxos::{
         memory_storage::MemoryStorage, StopSign, Storage, StorageOp, StorageResult,
     },
     util::{FlexibleQuorum, LogEntry},
-    ClusterConfig, CompactionErr, OmniPaxos, OmniPaxosConfig, ProposeErr, ServerConfig,
+    ClusterConfig, CompactionErr, OmniPaxos, OmniPaxosConfig, ProposeErr, ReadError,
+    ReconfigurationStatus, ServerConfig,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -351,7 +352,7 @@ impl SimCluster {
 
     async fn propose(&mut self, node_id: u64, entry: Value) {
         let node = self.nodes.get_mut(&node_id).expect("node not found");
-        node.append(entry).await.unwrap();
+        let _ = node.append(entry).await.unwrap();
     }
 
     async fn try_propose(&mut self, node_id: u64, entry: Value) -> Result<(), ProposeErr<Value>> {
@@ -4104,5 +4105,317 @@ fn test_proposal_ordering_preserved_per_proposer() {
                 );
             }
         }
+    });
+}
+
+// ===========================================================================
+// Reconfiguration safety tests
+// ===========================================================================
+
+#[test]
+fn test_reconfigure_config_id_monotonicity() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Attempt reconfig with same config_id as current (1) — should fail
+        let same_config = ClusterConfig {
+            configuration_id: 1,
+            nodes: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        let result = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .reconfigure(same_config, None)
+            .await;
+        assert!(
+            matches!(result, Err(ProposeErr::ConfigError(..))),
+            "reconfigure with same config_id should be rejected, got {:?}",
+            result
+        );
+
+        // Successful reconfig with config_id=2
+        let good_config = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        let result = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .reconfigure(good_config, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "reconfigure with higher config_id should succeed"
+        );
+    });
+}
+
+#[test]
+fn test_reads_blocked_during_reconfiguration() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Propose some entries so leader is in Accept phase with decided entries
+        for i in 1..=3 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(100).await;
+
+        // Reads should work before reconfiguration
+        let leader_node = cluster.nodes.get_mut(&leader).unwrap();
+        let read_result = leader_node.ensure_linearizable();
+        assert!(
+            read_result.is_ok(),
+            "reads should work before reconfiguration"
+        );
+
+        // Accept reconfiguration
+        let new_config = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        leader_node.reconfigure(new_config, None).await.unwrap();
+
+        // Now reads should be blocked
+        let read_result = leader_node.ensure_linearizable();
+        assert!(
+            matches!(read_result, Err(ReadError::Reconfigured)),
+            "reads should be blocked during reconfiguration, got {:?}",
+            read_result
+        );
+    });
+}
+
+#[test]
+fn test_reconfigure_during_network_partition() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Propose some entries first
+        for i in 1..=5 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(100).await;
+
+        // Partition: isolate one follower
+        let followers: Vec<u64> = cluster
+            .nodes
+            .keys()
+            .copied()
+            .filter(|&pid| pid != leader)
+            .collect();
+        let isolated = followers[0];
+        let filter_handle = cluster.isolate_node(isolated);
+
+        // Propose reconfiguration while partitioned
+        let new_config = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .reconfigure(new_config, None)
+            .await
+            .unwrap();
+
+        // Tick while partitioned — leader + one follower should form quorum
+        cluster.tick_and_route(200).await;
+
+        // Heal partition
+        cluster.remove_filter(filter_handle);
+        cluster.tick_and_route(500).await;
+
+        // All nodes should agree on the reconfiguration
+        for (&pid, node) in &cluster.nodes {
+            assert!(
+                node.is_reconfigured().is_some(),
+                "node {} should see reconfiguration as decided",
+                pid
+            );
+        }
+    });
+}
+
+#[test]
+fn test_chain_reconfiguration_sealed() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Reconfig 1 -> 2
+        let config2 = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3],
+            ..Default::default()
+        };
+        cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .reconfigure(config2, None)
+            .await
+            .unwrap();
+        cluster.tick_and_route(200).await;
+
+        // Verify decided
+        for node in cluster.nodes.values() {
+            let ss = node.is_reconfigured();
+            assert!(ss.is_some(), "reconfiguration 1->2 should be decided");
+            assert_eq!(ss.unwrap().next_config.configuration_id, 2);
+        }
+
+        // Attempting further reconfiguration on the sealed cluster should fail
+        let config3 = ClusterConfig {
+            configuration_id: 3,
+            nodes: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        let result = cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .reconfigure(config3, None)
+            .await;
+        assert!(
+            matches!(result, Err(ProposeErr::PendingReconfigConfig(..))),
+            "reconfiguration on sealed cluster should fail, got {:?}",
+            result
+        );
+    });
+}
+
+#[test]
+fn test_follower_initiated_reconfiguration() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+        let follower = cluster
+            .nodes
+            .keys()
+            .copied()
+            .find(|&pid| pid != leader)
+            .unwrap();
+
+        // Follower initiates reconfiguration
+        let new_config = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        cluster
+            .nodes
+            .get_mut(&follower)
+            .unwrap()
+            .reconfigure(new_config, None)
+            .await
+            .unwrap();
+
+        // Let the forwarded StopSign propagate and get decided
+        cluster.tick_and_route(500).await;
+
+        // All nodes should agree on the reconfiguration
+        for (&pid, node) in &cluster.nodes {
+            assert!(
+                node.is_reconfigured().is_some(),
+                "node {} should see reconfiguration as decided after follower-initiated reconfig",
+                pid
+            );
+        }
+        let ss = cluster
+            .nodes
+            .values()
+            .next()
+            .unwrap()
+            .is_reconfigured()
+            .unwrap();
+        assert_eq!(ss.next_config.nodes, vec![1, 2, 3, 4]);
+    });
+}
+
+#[test]
+fn test_reconfiguration_status_lifecycle() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Propose entries to ensure leader is in Accept phase
+        for i in 1..=3 {
+            cluster.propose(leader, Value::with_id(i)).await;
+        }
+        cluster.tick_and_route(100).await;
+
+        // Initially: no reconfiguration
+        let status = cluster
+            .nodes
+            .get(&leader)
+            .unwrap()
+            .reconfiguration_status();
+        assert!(
+            matches!(status, ReconfigurationStatus::Idle),
+            "initial status should be Idle, got {:?}",
+            status
+        );
+
+        // Isolate followers so leader can accept but not reach quorum for decision
+        let followers: Vec<u64> = cluster
+            .nodes
+            .keys()
+            .copied()
+            .filter(|&pid| pid != leader)
+            .collect();
+        let filter_handle = cluster.partition(vec![leader], followers.clone());
+
+        // Propose reconfiguration (leader accepts locally but can't reach quorum)
+        let new_config = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3, 4],
+            ..Default::default()
+        };
+        cluster
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .reconfigure(new_config, None)
+            .await
+            .unwrap();
+
+        // Status should be Pending on leader
+        let status = cluster
+            .nodes
+            .get(&leader)
+            .unwrap()
+            .reconfiguration_status();
+        assert!(
+            matches!(status, ReconfigurationStatus::Pending(_)),
+            "status should be Pending after accepting StopSign, got {:?}",
+            status
+        );
+
+        // Heal partition and let it decide
+        cluster.remove_filter(filter_handle);
+        cluster.tick_and_route(500).await;
+
+        // Status should be Decided on leader
+        let status = cluster
+            .nodes
+            .get(&leader)
+            .unwrap()
+            .reconfiguration_status();
+        assert!(
+            matches!(status, ReconfigurationStatus::Decided(_)),
+            "status should be Decided after quorum, got {:?}",
+            status
+        );
     });
 }

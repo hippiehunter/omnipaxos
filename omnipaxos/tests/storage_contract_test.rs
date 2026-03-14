@@ -569,7 +569,7 @@ fn test_storage_error_on_tick_propagates() {
         }
 
         // Propose entries (stays in batch buffer, not flushed yet)
-        node.append(Value::with_id(1)).await.unwrap();
+        let _ = node.append(Value::with_id(1)).await.unwrap();
 
         // Inject failure on WriteAtomically — the batch flush path uses
         // write_atomically() for atomic append+decide.
@@ -605,7 +605,7 @@ fn test_storage_error_on_handle_incoming_propagates() {
             .insert(FailOn::WriteAtomically);
 
         // Propose entries through leader
-        nodes
+        let _ = nodes
             .get_mut(&leader)
             .unwrap()
             .append(Value::with_id(1))
@@ -700,7 +700,7 @@ fn test_transient_failure_recovers() {
 
         // Propose entries through leader
         for i in 1..=5 {
-            nodes
+            let _ = nodes
                 .get_mut(&leader)
                 .unwrap()
                 .append(Value::with_id(i))
@@ -857,7 +857,7 @@ fn test_write_atomically_is_used_for_critical_paths() {
         for _ in 0..50 {
             node.tick().await.unwrap();
         }
-        node.append(Value::with_id(1)).await.unwrap();
+        let _ = node.append(Value::with_id(1)).await.unwrap();
         for _ in 0..20 {
             node.tick().await.unwrap();
         }
@@ -1015,7 +1015,7 @@ fn test_leader_batch_flush_atomicity() {
 
         // Propose entries (buffered in batch)
         for i in 1..=5 {
-            node.append(Value::with_id(i)).await.unwrap();
+            let _ = node.append(Value::with_id(i)).await.unwrap();
         }
 
         // Tick enough for batch flush timeout to fire
@@ -1082,7 +1082,7 @@ fn test_batch_cache_preserved_on_write_failure() {
         }
 
         // Propose an entry (stays in batch buffer, not flushed yet)
-        node.append(Value::with_id(42)).await.unwrap();
+        let _ = node.append(Value::with_id(42)).await.unwrap();
 
         // Inject write failure — the next batch flush will fail
         ctrl.borrow_mut()
@@ -1131,7 +1131,7 @@ fn test_follower_batch_cache_preserved_on_write_failure() {
 
         // Propose entries through leader
         for i in 1..=5 {
-            nodes
+            let _ = nodes
                 .get_mut(&leader)
                 .unwrap()
                 .append(Value::with_id(i))
@@ -1152,7 +1152,7 @@ fn test_follower_batch_cache_preserved_on_write_failure() {
 
         // Propose more entries — node 2 will fail to flush
         for i in 6..=10 {
-            nodes
+            let _ = nodes
                 .get_mut(&leader)
                 .unwrap()
                 .append(Value::with_id(i))
@@ -1238,7 +1238,7 @@ fn test_leader_state_reverted_on_flush_failure() {
         // Propose entries through the leader. With batch_size=100, these
         // accumulate in the batch buffer and don't flush immediately.
         for i in 1..=5 {
-            nodes
+            let _ = nodes
                 .get_mut(&leader)
                 .unwrap()
                 .append(Value::with_id(i))
@@ -1481,7 +1481,7 @@ fn test_cache_consistent_after_decided_idx_failure() {
         }
 
         // Propose and decide an entry (single-node cluster decides immediately)
-        node.append(Value { id: 1 }).await.unwrap();
+        let _ = node.append(Value { id: 1 }).await.unwrap();
         node.tick().await.unwrap();
 
         let decided_before = node.get_decided_idx();
@@ -1623,7 +1623,7 @@ fn test_stopsign_atomicity_on_failure() {
 
         // Propose some entries first
         for i in 1..=3 {
-            node.append(Value { id: i }).await.unwrap();
+            let _ = node.append(Value { id: i }).await.unwrap();
         }
         node.tick().await.unwrap();
 
@@ -1690,7 +1690,7 @@ fn test_decided_idx_clamping_on_flush() {
 
         // Propose a few entries (less than batch_size) — they stay in cache
         for i in 1..=3 {
-            node.append(Value { id: i }).await.unwrap();
+            let _ = node.append(Value { id: i }).await.unwrap();
         }
 
         // Tick enough for flush_batch_timeout
@@ -1740,7 +1740,7 @@ fn test_flush_batch_failure_leaves_cache_consistent() {
 
         // Propose entries (stay in batch cache)
         for i in 1..=3 {
-            node.append(Value { id: i }).await.unwrap();
+            let _ = node.append(Value { id: i }).await.unwrap();
         }
 
         let decided_before = node.get_decided_idx();
@@ -2040,16 +2040,11 @@ fn test_crash_recovery_with_torn_write() {
         // Build a 3-node cluster with FailableStorage on all nodes
         let (mut nodes, ctrls) = build_cluster_all_failable().await;
 
-        // Elect leader and decide 10 entries
-        tick_and_route_cluster(&mut nodes, 50);
-        let leader = nodes
-            .values()
-            .filter_map(|n| n.get_current_leader().map(|(pid, _)| pid))
-            .next()
-            .unwrap();
+        // Elect leader (waits for majority agreement, up to 500 rounds)
+        let leader = elect_leader_cluster(&mut nodes);
 
         for i in 1..=10 {
-            nodes
+            let _ = nodes
                 .get_mut(&leader)
                 .unwrap()
                 .append(Value::with_id(i))
@@ -2302,7 +2297,7 @@ fn test_snapshot_deferred_when_storage_not_ready() {
             node.tick().await.unwrap();
         }
         for i in 1..=3 {
-            node.append(Value::with_id(i)).await.unwrap();
+            let _ = node.append(Value::with_id(i)).await.unwrap();
         }
         for _ in 0..10 {
             node.tick().await.unwrap();
@@ -2331,7 +2326,7 @@ fn test_lease_read_disabled_by_default() {
 
         // Elect leader + decide something
         for _ in 0..10 { node.tick().await.unwrap(); }
-        node.append(Value::with_id(1)).await.unwrap();
+        let _ = node.append(Value::with_id(1)).await.unwrap();
         for _ in 0..5 { node.tick().await.unwrap(); }
 
         let result = node.ensure_linearizable();
@@ -2363,7 +2358,7 @@ fn test_lease_read_fast_path() {
         for _ in 0..10 { node.tick().await.unwrap(); }
 
         // Decide an entry to set last_quorum_ack_tick
-        node.append(Value::with_id(1)).await.unwrap();
+        let _ = node.append(Value::with_id(1)).await.unwrap();
         for _ in 0..5 { node.tick().await.unwrap(); }
 
         // Now ensure_linearizable should use the lease fast path
@@ -2393,7 +2388,7 @@ fn test_lease_read_expires() {
 
         // Elect leader and decide
         for _ in 0..10 { node.tick().await.unwrap(); }
-        node.append(Value::with_id(1)).await.unwrap();
+        let _ = node.append(Value::with_id(1)).await.unwrap();
         for _ in 0..3 { node.tick().await.unwrap(); }
 
         // Lease should be valid immediately

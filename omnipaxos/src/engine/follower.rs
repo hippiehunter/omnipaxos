@@ -227,11 +227,7 @@ impl<T: Entry> Engine<T> {
                 self.s.batched_entries.clear();
             }
             self.s.accepted_idx += num_new;
-            if !acc_ss.ss.clone().next_config.nodes.is_empty() && self.s.stopsign.is_none() {
-                self.s.accepted_idx += 1;
-            } else if self.s.stopsign.is_some() {
-                // stopsign already exists, don't increment
-            } else {
+            if self.s.stopsign.is_none() {
                 self.s.accepted_idx += 1;
             }
             self.s.stopsign = Some(acc_ss.ss);

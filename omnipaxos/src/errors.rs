@@ -185,6 +185,7 @@ impl error::Error for StorageError {
 
 /// Top-level OmniPaxos error
 #[derive(Debug)]
+#[must_use = "OmniPaxos errors are often fatal — ignoring them risks silent data corruption"]
 pub enum OmniPaxosError {
     /// Fatal storage error — the node should stop processing.
     Fatal(StorageError),

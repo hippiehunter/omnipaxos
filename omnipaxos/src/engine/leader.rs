@@ -122,6 +122,15 @@ impl<T: Entry> Engine<T> {
         if self.accepted_reconfiguration() {
             return;
         }
+        if ss.next_config.configuration_id <= self.s.promise.config_id {
+            tracing::warn!(
+                pid = self.s.pid,
+                new_config_id = ss.next_config.configuration_id,
+                current_config_id = self.s.promise.config_id,
+                "rejecting forwarded stopsign with non-monotonic config_id"
+            );
+            return;
+        }
         match self.s.state {
             (Role::Leader, Phase::Prepare) => self.s.buffered_stopsign = Some(ss),
             (Role::Leader, Phase::Accept) => self.accept_stopsign_leader(ss),
@@ -656,6 +665,9 @@ impl<T: Entry> Engine<T> {
                     None
                 },
             });
+        }
+        if self.accepted_reconfiguration() {
+            return Err(ReadError::Reconfigured);
         }
         let read_id = self.s.next_read_id;
         self.s.next_read_id += 1;

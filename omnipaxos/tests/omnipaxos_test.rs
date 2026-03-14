@@ -93,7 +93,7 @@ impl TestCluster {
     /// Propose an entry through a specific node.
     async fn propose(&mut self, node_id: u64, entry: Value) {
         let node = self.nodes.get_mut(&node_id).expect("node not found");
-        node.append(entry).await.unwrap();
+        let _ = node.append(entry).await.unwrap();
     }
 }
 
@@ -510,7 +510,7 @@ fn test_single_node_recovery() {
         }
 
         // Verify it can accept new entries.
-        recovered.append(Value::with_id(10)).await.unwrap();
+        let _ = recovered.append(Value::with_id(10)).await.unwrap();
         for _ in 0..10 {
             recovered.tick().await.unwrap();
         }

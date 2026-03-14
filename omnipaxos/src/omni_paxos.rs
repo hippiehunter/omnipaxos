@@ -139,6 +139,7 @@ impl OmniPaxosConfig {
             last_quorum_ack_tick: None,
             lease_tick_timeout: self.server_config.lease_tick_timeout,
             metrics_recorder: None,
+            configuration_id: self.cluster_config.configuration_id,
         })
     }
 }
@@ -346,6 +347,7 @@ where
     last_quorum_ack_tick: Option<u64>,
     lease_tick_timeout: Option<u64>,
     metrics_recorder: Option<Box<dyn crate::metrics::MetricsRecorder>>,
+    configuration_id: ConfigurationId,
 }
 
 impl<T, B> OmniPaxos<T, B>
@@ -669,6 +671,18 @@ where
         self.engine.is_reconfigured()
     }
 
+    /// Returns the current reconfiguration status, distinguishing between
+    /// no reconfig, pending (accepted but not decided), and decided (sealed).
+    pub fn reconfiguration_status(&self) -> ReconfigurationStatus {
+        match &self.engine.s.stopsign {
+            Some(ss) if self.engine.s.stopsign_is_decided() => {
+                ReconfigurationStatus::Decided(ss.clone())
+            }
+            Some(ss) => ReconfigurationStatus::Pending(ss.clone()),
+            None => ReconfigurationStatus::Idle,
+        }
+    }
+
     /// Append an entry to the replicated log.
     ///
     /// Returns `Ok(AppendResult)` describing how the entry was handled, or an error
@@ -721,6 +735,16 @@ where
         if let Err(config_error) = new_configuration.validate() {
             return Err(ProposeErr::ConfigError(
                 config_error,
+                new_configuration,
+                metadata,
+            ));
+        }
+        if new_configuration.configuration_id <= self.configuration_id {
+            return Err(ProposeErr::ConfigError(
+                ConfigError::InvalidConfig(format!(
+                    "new configuration_id ({}) must be greater than current ({})",
+                    new_configuration.configuration_id, self.configuration_id
+                )),
                 new_configuration,
                 metadata,
             ));
@@ -937,6 +961,12 @@ where
     ///
     /// For single-node clusters, the ReadIndex barrier is also immediately available.
     pub fn ensure_linearizable(&mut self) -> Result<ReadGuard, ReadError> {
+        if self.running_state == crate::metrics::RunningState::StorageError {
+            return Err(ReadError::StorageFailed);
+        }
+        if self.engine.accepted_reconfiguration() {
+            return Err(ReadError::Reconfigured);
+        }
         use crate::engine::state::{Role, Phase as EngPhase};
         // Lease fast path: skip network round-trip if within lease window
         if let Some(lease_timeout) = self.lease_tick_timeout {
@@ -1017,6 +1047,17 @@ where
     }
 }
 
+/// Status of a cluster reconfiguration.
+#[derive(Debug, Clone)]
+pub enum ReconfigurationStatus {
+    /// No reconfiguration in progress.
+    Idle,
+    /// StopSign accepted but not yet decided. Proposals and reads are blocked.
+    Pending(StopSign),
+    /// StopSign decided. Old configuration is sealed.
+    Decided(StopSign),
+}
+
 /// Runtime-switchable configuration flags.
 /// These can be changed without restarting the node.
 #[derive(Clone, Debug)]
@@ -1069,6 +1110,7 @@ impl ReadBarrier {
 
 /// Error type for linearizable read operations.
 #[derive(Debug)]
+#[must_use = "read errors must be handled — ignoring them can serve stale data"]
 pub enum ReadError {
     /// This node is not the leader.
     NotLeader {
@@ -1079,6 +1121,10 @@ pub enum ReadError {
     QuorumLost,
     /// Quorum not yet reached; poll again.
     QuorumPending,
+    /// A reconfiguration is pending or decided. Reads should use the new configuration.
+    Reconfigured,
+    /// A storage error has occurred. The node cannot serve reads.
+    StorageFailed,
 }
 
 impl Display for ReadError {
@@ -1087,6 +1133,8 @@ impl Display for ReadError {
             ReadError::NotLeader { leader } => write!(f, "not leader (leader: {:?})", leader),
             ReadError::QuorumLost => write!(f, "read-index quorum lost"),
             ReadError::QuorumPending => write!(f, "read-index quorum pending"),
+            ReadError::Reconfigured => write!(f, "reconfiguration pending or decided"),
+            ReadError::StorageFailed => write!(f, "node in storage-error state"),
         }
     }
 }
@@ -1095,6 +1143,7 @@ impl Error for ReadError {}
 
 /// Error type for leader transfer operations.
 #[derive(Debug)]
+#[must_use = "transfer errors indicate the transfer did not start"]
 pub enum TransferError {
     /// Not the current leader.
     NotLeader {
@@ -1130,22 +1179,33 @@ impl Display for TransferError {
 impl Error for TransferError {}
 
 /// Describes how an appended entry was handled.
+///
+/// **Important:** Only `Accepted` means the entry has been persisted to the
+/// leader's storage. Both `Forwarded` and `Buffered` are best-effort — the
+/// entry may be lost if the node crashes before it is replicated.
 #[derive(Debug)]
+#[must_use = "AppendResult must be checked — only Accepted means the entry was persisted to the leader's storage"]
 pub enum AppendResult {
-    /// Leader accepted the entry directly.
+    /// Leader accepted the entry directly and persisted it to storage.
     Accepted,
-    /// Entry forwarded to the known leader.
+    /// Entry forwarded to the known leader via a network message. The leader
+    /// may not have received it — the caller should confirm the entry appears
+    /// in the decided log before acknowledging to clients.
     Forwarded {
         /// The leader the entry was forwarded to.
         leader: NodeId,
     },
-    /// Entry buffered (leader in Prepare phase).
+    /// Entry buffered locally (leader in Prepare phase). **Not durable** — if
+    /// this node crashes before transitioning to Accept phase, the entry is lost.
+    /// The caller should not acknowledge the write to clients until it appears
+    /// in the decided log.
     Buffered,
 }
 
 /// An error indicating a failed proposal due to the current cluster configuration being already stopped
 /// or due to an invalid proposed configuration. Returns the failed proposal.
 #[derive(Debug)]
+#[must_use = "proposal errors return the rejected entry — ignoring them silently loses data"]
 pub enum ProposeErr<T>
 where
     T: Entry,
@@ -1227,8 +1287,9 @@ impl<T: Entry> ProposeErr<T> {
     }
 }
 
-/// An error returning the proposal that was failed due to that the current configuration is stopped.
+/// An error from a compaction (trim or snapshot) operation.
 #[derive(Debug)]
+#[must_use = "compaction errors indicate the operation did not complete"]
 pub enum CompactionErr {
     /// Snapshot was called with an index that is not decided yet. Returns the currently decided index.
     UndecidedIndex(usize),
