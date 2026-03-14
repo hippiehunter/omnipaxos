@@ -6,7 +6,7 @@ use crate::{
         commands::Command,
         Engine, EngineAction, LogSyncContinuation, SnapshotContinuation,
     },
-    errors::{AnyError, StorageError, StorageOperation},
+    errors::{AnyError, ErrorSubject, StorageError, StorageOperation},
     storage::{Entry, Snapshot, SnapshotType, Storage, StorageOp},
     util::{IndexEntry, LogEntry, LogSync, SnapshottedEntry},
 };
@@ -29,9 +29,10 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     /// Wrap an `AnyError` from a storage call into a `StorageError` with context.
     fn wrap_storage<V>(
         op: StorageOperation,
+        subject: ErrorSubject,
         result: Result<V, AnyError>,
     ) -> Result<V, StorageError> {
-        result.map_err(|e| StorageError::new(op, e))
+        result.map_err(|e| StorageError::new(op, subject, e))
     }
 
     /// Execute all pending commands from the engine.
@@ -44,12 +45,14 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                 Command::WriteAtomic(ops) => {
                     Self::wrap_storage(
                         StorageOperation::WriteAtomic,
+                        ErrorSubject::Batch,
                         self.storage.write_atomically(ops).await,
                     )?;
                 }
                 Command::AppendEntries(entries) => {
                     Self::wrap_storage(
                         StorageOperation::WriteAtomic,
+                        ErrorSubject::Batch,
                         self.storage
                             .write_atomically(vec![StorageOp::AppendEntries(entries)])
                             .await,
@@ -124,6 +127,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                     SnapshotContinuation::CompleteSyncLogDelta { delta, compact_idx: _ } => {
                         let existing = Self::wrap_storage(
                             StorageOperation::ReadSnapshot,
+                            ErrorSubject::Snapshot,
                             self.storage.get_snapshot().await,
                         )?;
                         let merged = match existing {
@@ -135,6 +139,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                         };
                         Self::wrap_storage(
                             StorageOperation::WriteAtomic,
+                            ErrorSubject::Snapshot,
                             self.storage
                                 .write_atomically(vec![StorageOp::SetSnapshot(Some(merged))])
                                 .await,
@@ -161,12 +166,14 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                     .await?;
                 let suffix = Self::wrap_storage(
                     StorageOperation::ReadSuffix,
+                    ErrorSubject::LogEntries { from: decided_idx, to: usize::MAX },
                     self.storage.get_suffix(decided_idx).await,
                 )?;
                 (delta_snapshot, suffix, compacted_idx)
             } else {
                 let suffix = Self::wrap_storage(
                     StorageOperation::ReadSuffix,
+                    ErrorSubject::LogEntries { from: common_prefix_idx, to: usize::MAX },
                     self.storage.get_suffix(common_prefix_idx).await,
                 )?;
                 (None, suffix, common_prefix_idx)
@@ -195,6 +202,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
             } else {
                 Self::wrap_storage(
                     StorageOperation::ReadSnapshot,
+                    ErrorSubject::Snapshot,
                     self.storage.get_snapshot().await,
                 )?
                 .map(SnapshotType::Complete)
@@ -202,6 +210,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         } else {
             let diff_entries = Self::wrap_storage(
                 StorageOperation::ReadEntries,
+                ErrorSubject::LogEntries { from: from_idx, to: log_decided_idx },
                 self.storage.get_entries(from_idx, log_decided_idx).await,
             )?;
             Some(SnapshotType::Delta(T::Snapshot::create(
@@ -220,6 +229,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         let current_compacted_idx = engine.get_compacted_idx();
         let entries = Self::wrap_storage(
             StorageOperation::ReadEntries,
+            ErrorSubject::LogEntries { from: current_compacted_idx, to: compact_idx },
             self.storage
                 .get_entries(current_compacted_idx, compact_idx)
                 .await,
@@ -227,6 +237,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         let delta = T::Snapshot::create(entries.as_slice());
         match Self::wrap_storage(
             StorageOperation::ReadSnapshot,
+            ErrorSubject::Snapshot,
             self.storage.get_snapshot().await,
         )? {
             Some(mut s) => {
@@ -352,6 +363,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         let decided_idx = engine.get_decided_idx();
         let entries = Self::wrap_storage(
             StorageOperation::ReadEntries,
+            ErrorSubject::LogEntries { from, to },
             self.storage.get_entries(from, to).await,
         )?
         .into_iter()
@@ -374,6 +386,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
     ) -> Result<LogEntry<T>, StorageError> {
         Self::wrap_storage(
             StorageOperation::ReadSnapshot,
+            ErrorSubject::Snapshot,
             self.storage.get_snapshot().await,
         )
         .map(|snap| match snap {
@@ -407,6 +420,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                 .map_err(crate::CompactionErr::Storage)?;
             Self::wrap_storage(
                 StorageOperation::WriteAtomic,
+                ErrorSubject::Snapshot,
                 self.storage
                     .write_atomically(vec![
                         StorageOp::Trim(new_compacted_idx),

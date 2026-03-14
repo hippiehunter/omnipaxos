@@ -6,8 +6,6 @@ use crate::{
     util::{defaults::*, ConfigurationId, FlexibleQuorum, Quorum},
 };
 
-#[cfg(feature = "logging")]
-use crate::utils::logger::create_logger;
 use crate::{
     messages::ballot_leader_election::{
         BLEMessage, HeartbeatMsg, HeartbeatReply, HeartbeatRequest,
@@ -17,8 +15,6 @@ use crate::{
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "logging")]
-use slog::{info, trace, Logger};
 
 /// Used to define a Sequence Paxos epoch
 #[derive(Clone, Copy, Eq, Debug, Default, PartialEq)]
@@ -103,9 +99,6 @@ pub(crate) struct BallotLeaderElection {
     buffer_size: usize,
     /// Vector which holds all the outgoing messages of the BLE instance.
     outgoing: Vec<BLEMessage>,
-    /// Logger used to output the status of the component.
-    #[cfg(feature = "logging")]
-    logger: Logger,
 }
 
 impl BallotLeaderElection {
@@ -147,25 +140,8 @@ impl BallotLeaderElection {
             quorum,
             buffer_size: config.buffer_size,
             outgoing: Vec::with_capacity(config.buffer_size),
-            #[cfg(feature = "logging")]
-            logger: {
-                if let Some(logger) = config.custom_logger {
-                    logger
-                } else {
-                    let s = config
-                        .logger_file_path
-                        .unwrap_or_else(|| format!("logs/paxos_{}.log", pid));
-                    create_logger(s.as_str())
-                }
-            },
         };
-        #[cfg(feature = "logging")]
-        {
-            info!(
-                ble.logger,
-                "Ballot Leader Election component pid: {} created!", pid
-            );
-        }
+        tracing::info!(pid, "Ballot Leader Election component created");
         ble.new_hb_round();
         ble
     }
@@ -206,12 +182,7 @@ impl BallotLeaderElection {
     pub(crate) fn new_hb_round(&mut self) {
         self.prev_replies = std::mem::take(&mut self.heartbeat_replies);
         self.hb_round += 1;
-        #[cfg(feature = "logging")]
-        trace!(
-            self.logger,
-            "Initiate new heartbeat round: {}",
-            self.hb_round
-        );
+        tracing::trace!(pid = self.pid, round = self.hb_round, "new_heartbeat_round");
         for i in 0..self.peers.len() {
             let peer = self.peers[i];
             let hb_request = HeartbeatRequest {
@@ -333,6 +304,13 @@ impl BallotLeaderElection {
                     .wrapping_add(self.hb_round);
                 let delay_rounds = backoff_hash % (self.peers.len() as u32 + 1);
                 if delay_rounds == 0 {
+                    tracing::info!(
+                        pid = self.pid,
+                        old_leader_pid = self.leader.pid,
+                        new_ballot_n = self.leader.n + 1,
+                        consecutive_unhappy = self.consecutive_unhappy_rounds,
+                        "leader_takeover"
+                    );
                     self.current_ballot.n = self.leader.n + 1;
                     self.leader = self.current_ballot;
                     self.happy = true;
@@ -409,7 +387,6 @@ impl BallotLeaderElection {
 /// * `priority`: Set custom priority for this node to be elected as the leader.
 /// * `flexible_quorum` : Defines read and write quorum sizes. Can be used for different latency vs fault tolerance tradeoffs.
 /// * `buffer_size`: The buffer size for outgoing messages.
-/// * `logger_file_path`: The path where the default logger logs events.
 #[derive(Clone, Debug)]
 pub(crate) struct BLEConfig {
     configuration_id: ConfigurationId,
@@ -418,10 +395,6 @@ pub(crate) struct BLEConfig {
     priority: u32,
     flexible_quorum: Option<FlexibleQuorum>,
     buffer_size: usize,
-    #[cfg(feature = "logging")]
-    logger_file_path: Option<String>,
-    #[cfg(feature = "logging")]
-    custom_logger: Option<Logger>,
 }
 
 impl From<OmniPaxosConfig> for BLEConfig {
@@ -441,10 +414,6 @@ impl From<OmniPaxosConfig> for BLEConfig {
             priority: config.server_config.leader_priority,
             flexible_quorum: config.cluster_config.flexible_quorum,
             buffer_size: BLE_BUFFER_SIZE,
-            #[cfg(feature = "logging")]
-            logger_file_path: config.server_config.logger_file_path,
-            #[cfg(feature = "logging")]
-            custom_logger: config.server_config.custom_logger,
         }
     }
 }

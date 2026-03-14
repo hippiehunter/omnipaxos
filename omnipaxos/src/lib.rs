@@ -5,8 +5,6 @@
 //!
 //! # Crate feature flags
 //! The following crate feature flags are available. They are configured in your Cargo.toml.
-//! * `batch_accept` - Batch multiple log entries into a single message to reduce overhead.
-//! * `logging` - System-wide logging with the slog crate
 //! * `toml_config` - Create an OmniPaxos instance from a TOML configuration file
 //! * `serde` - Serialization and deserialization of messages and internal structs with serde. Disable this if you want to implement your own custom ser/deserialization or want to store data that is not serde-supported.
 
@@ -16,7 +14,7 @@
 pub mod ballot_leader_election;
 /// OmniPaxos error definitions
 pub mod errors;
-pub use errors::{AnyError, StorageOperation};
+pub use errors::{AnyError, ErrorSubject, StorageOperation};
 /// The different messages OmniPaxos servers can communicate to each other with.
 pub mod messages;
 /// The user-facing OmniPaxos struct.
@@ -35,8 +33,6 @@ pub mod storage;
 
 /// A module containing helper functions and structs.
 pub mod util;
-/// A module containing helper functions and structs.
-pub mod utils;
 
 #[cfg(feature = "macros")]
 #[allow(unused_imports)]

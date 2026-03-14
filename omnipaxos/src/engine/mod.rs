@@ -105,7 +105,6 @@ impl<T: Entry> Engine<T> {
     pub(crate) fn try_push_message(&mut self, msg: Message<T>) -> bool {
         if self.outgoing.len() >= self.s.buffer_size {
             self.s.dropped_messages += 1;
-            #[cfg(feature = "tracing")]
             tracing::warn!(
                 pid = self.s.pid,
                 buffer_size = self.s.buffer_size,
@@ -372,7 +371,6 @@ impl<T: Entry> Engine<T> {
             return; // Can't trim beyond decided
         };
         if new_compacted_idx > self.s.compacted_idx {
-            #[cfg(feature = "tracing")]
             tracing::info!(
                 pid = self.s.pid,
                 kind = "trim",
@@ -392,8 +390,19 @@ impl<T: Entry> Engine<T> {
 
     pub(crate) fn resend_message_timeout(&mut self) {
         match self.s.state.0 {
-            Role::Leader => self.resend_messages_leader(),
+            Role::Leader => {
+                // Reset backoff so resend path can re-sync all followers
+                self.s.leader_state.reset_backoff();
+                self.resend_messages_leader();
+            }
             Role::Follower => self.resend_messages_follower(),
+        }
+    }
+
+    /// Tick per-follower backoff counters. Called once per tick when leader.
+    pub(crate) fn tick_backoff(&mut self) {
+        if self.s.state.0 == Role::Leader {
+            self.s.leader_state.tick_backoff();
         }
     }
 

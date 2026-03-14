@@ -88,6 +88,11 @@ where
     latest_accept_meta: Vec<Option<(Ballot, usize)>>,
     /// Cached list of promised follower PIDs, updated on promise state changes.
     promised_followers: Vec<NodeId>,
+    /// Per-follower backoff counters. Incremented each tick when a follower's
+    /// accepted_idx hasn't advanced; reset on receiving Accepted.
+    follower_backoff: Vec<u32>,
+    /// Snapshot of accepted_indexes at last backoff tick, for detecting stalls.
+    prev_accepted_indexes: Vec<usize>,
     pub quorum: Quorum,
 }
 
@@ -115,6 +120,8 @@ where
             max_promise_sync: None,
             latest_accept_meta: vec![None; num],
             promised_followers: Vec::new(),
+            follower_backoff: vec![0; num],
+            prev_accepted_indexes: vec![0; num],
             quorum,
         }
     }
@@ -128,7 +135,6 @@ where
                     "BUG: Unknown PID {} in LeaderState (leader: {:?}, known PIDs: {:?})",
                     pid, self.n_leader, self.peers
                 );
-                #[cfg(feature = "tracing")]
                 tracing::error!(pid, "unknown PID in LeaderState");
                 0
             }
@@ -230,7 +236,6 @@ where
                     "BUG: No Metadata found for promised follower {}",
                     pid
                 );
-                #[cfg(feature = "tracing")]
                 tracing::error!(pid, "no promise metadata for follower");
                 &self.max_promise_meta
             }
@@ -317,6 +322,60 @@ where
             }
         }
         false
+    }
+
+    // --- Per-follower backpressure ---
+
+    /// Returns true if this follower should be skipped for new AcceptDecide
+    /// messages due to sustained unresponsiveness. Threshold is 20 ticks
+    /// without progress — generous enough for normal RTT while protecting
+    /// against buffer overflow from truly unreachable followers.
+    pub fn should_skip_follower(&self, pid: NodeId) -> bool {
+        let idx = self.idx(pid);
+        self.follower_backoff[idx] > 20
+    }
+
+    /// Record that a follower has acknowledged entries (reset its backoff).
+    pub fn record_follower_ack(&mut self, pid: NodeId) {
+        let idx = self.idx(pid);
+        if self.follower_backoff[idx] > 0 {
+            tracing::debug!(
+                follower = pid,
+                old_backoff = self.follower_backoff[idx],
+                "follower_backoff_reset"
+            );
+        }
+        self.follower_backoff[idx] = 0;
+    }
+
+    /// Tick backoff counters: increment for followers whose accepted_idx
+    /// hasn't advanced since the last tick.
+    pub fn tick_backoff(&mut self) {
+        for i in 0..self.peers.len() {
+            if self.accepted_indexes[i] == self.prev_accepted_indexes[i] {
+                self.follower_backoff[i] = self.follower_backoff[i].saturating_add(1);
+                if self.follower_backoff[i] == 21 {
+                    tracing::warn!(
+                        follower = self.peers[i],
+                        accepted_idx = self.accepted_indexes[i],
+                        "follower_backed_off"
+                    );
+                }
+            } else {
+                self.follower_backoff[i] = 0;
+            }
+            self.prev_accepted_indexes[i] = self.accepted_indexes[i];
+        }
+    }
+
+    /// Reset all backoff counters (called on resend_message_timeout).
+    pub fn reset_backoff(&mut self) {
+        self.follower_backoff.fill(0);
+    }
+
+    /// Returns whether a follower is currently backed off (for metrics).
+    pub fn is_backed_off(&self, pid: NodeId) -> bool {
+        self.should_skip_follower(pid)
     }
 }
 

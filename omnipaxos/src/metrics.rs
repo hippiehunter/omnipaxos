@@ -56,6 +56,8 @@ pub struct FollowerMetrics {
     pub replication_lag: usize,
     /// The tick at which the last heartbeat was received from this peer (if tracked).
     pub last_heartbeat_tick: Option<u64>,
+    /// Whether this follower is currently backed off due to sustained unresponsiveness.
+    pub backed_off: bool,
 }
 
 /// A snapshot of the current metrics for an OmniPaxos node.

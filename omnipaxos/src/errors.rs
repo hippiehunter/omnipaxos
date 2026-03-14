@@ -86,6 +86,38 @@ impl fmt::Display for StorageOperation {
     }
 }
 
+/// Describes what data was being operated on when a storage error occurred.
+///
+/// Provides context for debugging — e.g., which log index or snapshot was
+/// involved in the failed operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorSubject {
+    /// General storage state (e.g., loading persisted state on startup).
+    State,
+    /// A range of log entries.
+    LogEntries {
+        /// Start index (inclusive).
+        from: usize,
+        /// End index (exclusive).
+        to: usize,
+    },
+    /// Snapshot data.
+    Snapshot,
+    /// Multiple operations in an atomic batch.
+    Batch,
+}
+
+impl fmt::Display for ErrorSubject {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ErrorSubject::State => write!(f, "state"),
+            ErrorSubject::LogEntries { from, to } => write!(f, "log[{}..{}]", from, to),
+            ErrorSubject::Snapshot => write!(f, "snapshot"),
+            ErrorSubject::Batch => write!(f, "batch"),
+        }
+    }
+}
+
 /// Error from the storage backend, enriched with the operation that failed.
 ///
 /// Always fatal by convention — callers should stop processing and surface
@@ -94,20 +126,42 @@ impl fmt::Display for StorageOperation {
 pub struct StorageError {
     /// Which storage operation failed.
     pub operation: StorageOperation,
+    /// What data was being operated on.
+    pub subject: ErrorSubject,
     /// The underlying error from the storage backend.
     pub source: AnyError,
 }
 
 impl StorageError {
     /// Create a new `StorageError` with context.
-    pub fn new(operation: StorageOperation, source: AnyError) -> Self {
-        StorageError { operation, source }
+    pub fn new(operation: StorageOperation, subject: ErrorSubject, source: AnyError) -> Self {
+        StorageError { operation, subject, source }
+    }
+
+    /// Create a storage error for a read_entries failure.
+    pub fn read_entries(from: usize, to: usize, source: AnyError) -> Self {
+        Self::new(StorageOperation::ReadEntries, ErrorSubject::LogEntries { from, to }, source)
+    }
+
+    /// Create a storage error for a read_snapshot failure.
+    pub fn read_snapshot(source: AnyError) -> Self {
+        Self::new(StorageOperation::ReadSnapshot, ErrorSubject::Snapshot, source)
+    }
+
+    /// Create a storage error for a write_atomically failure.
+    pub fn write_batch(source: AnyError) -> Self {
+        Self::new(StorageOperation::WriteAtomic, ErrorSubject::Batch, source)
+    }
+
+    /// Create a storage error for load_state failure.
+    pub fn load_state(source: AnyError) -> Self {
+        Self::new(StorageOperation::LoadState, ErrorSubject::State, source)
     }
 }
 
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "storage error during {}: {}", self.operation, self.source)
+        write!(f, "storage error during {} on {}: {}", self.operation, self.subject, self.source)
     }
 }
 

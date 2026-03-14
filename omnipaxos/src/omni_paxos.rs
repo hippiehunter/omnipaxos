@@ -2,7 +2,7 @@ use crate::{
     ballot_leader_election::{Ballot, BallotLeaderElection},
     engine::{Engine, EngineAction, InitialEngineState, Phase},
     engine::state::EngineStateSnapshot,
-    errors::{valid_config, ConfigError, OmniPaxosError, StorageError, StorageOperation},
+    errors::{valid_config, ConfigError, OmniPaxosError, StorageError},
     messages::Message,
     runtime::Runtime,
     storage::{Entry, StopSign, Storage},
@@ -75,7 +75,7 @@ impl OmniPaxosConfig {
         let state = storage
             .load_state()
             .await
-            .map_err(|e| StorageError::new(StorageOperation::LoadState, e))?;
+            .map_err(StorageError::load_state)?;
 
         let mut accepted_idx = state.log_len + state.compacted_idx;
         if state.stopsign.is_some() {
@@ -117,7 +117,7 @@ impl OmniPaxosConfig {
                     .storage
                     .write_atomically(vec![crate::storage::StorageOp::SetPromise(b)])
                     .await
-                    .map_err(|e| OmniPaxosError::Fatal(StorageError::new(StorageOperation::WriteAtomic, e)))?;
+                    .map_err(|e| OmniPaxosError::Fatal(StorageError::write_batch(e)))?;
             }
         }
 
@@ -237,13 +237,6 @@ pub struct ServerConfig {
     pub flush_batch_tick_timeout: u64,
     /// Custom priority for this node to be elected as the leader.
     pub leader_priority: u32,
-    /// The path where the default logger logs events.
-    #[cfg(feature = "logging")]
-    pub logger_file_path: Option<String>,
-    /// Custom logger, if provided, will be used instead of the default logger.
-    #[cfg(feature = "logging")]
-    #[cfg_attr(feature = "toml_config", serde(skip_deserializing))]
-    pub custom_logger: Option<slog::Logger>,
 }
 
 impl ServerConfig {
@@ -274,10 +267,6 @@ impl Default for ServerConfig {
             batch_size: 1,
             flush_batch_tick_timeout: FLUSH_BATCH_TIMEOUT,
             leader_priority: 0,
-            #[cfg(feature = "logging")]
-            logger_file_path: None,
-            #[cfg(feature = "logging")]
-            custom_logger: None,
         }
     }
 }
@@ -321,6 +310,9 @@ where
         self.engine.s.restore(snap.state);
         self.engine.outgoing.truncate(snap.outgoing_len);
         self.engine.commands.clear();
+        // Reset backoff — the stall was caused by our storage failure, not
+        // the followers' unresponsiveness.
+        self.engine.s.leader_state.reset_backoff();
     }
 
     /// Helper: run engine, execute commands, handle action.
@@ -713,6 +705,8 @@ where
         }
         // Tick leader transfer timeout
         self.engine.tick_transfer();
+        // Tick per-follower backoff counters
+        self.engine.tick_backoff();
         if self.flush_batch_clock.tick_and_check_timeout() {
             let snap = self.snapshot_engine();
             let old_leader_accepted_idx = self
@@ -792,6 +786,7 @@ where
                             is_promised,
                             replication_lag: leader_accepted_idx.saturating_sub(acc_idx),
                             last_heartbeat_tick: None,
+                            backed_off: self.engine.s.leader_state.is_backed_off(pid),
                         },
                     )
                 })
@@ -851,6 +846,22 @@ where
     /// if any observable state has changed since the last poll.
     pub fn metrics_version(&self) -> u64 {
         self.metrics_version
+    }
+
+    /// Check whether the current metrics satisfy a condition.
+    /// Useful for polling loops and tests.
+    ///
+    /// # Example
+    /// ```ignore
+    /// while !node.check_condition(|m| m.decided_idx >= 5) {
+    ///     node.tick().await?;
+    /// }
+    /// ```
+    pub fn check_condition<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(&crate::metrics::Metrics) -> bool,
+    {
+        f(&self.metrics())
     }
 
     /// Start a linearizable read by confirming leader authority.
@@ -1103,6 +1114,24 @@ impl<T: Entry> std::error::Error for ProposeErr<T> {
     }
 }
 
+impl<T: Entry> ProposeErr<T> {
+    /// Returns `true` if this is a fatal storage error (node should stop).
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, ProposeErr::Storage(_))
+    }
+
+    /// Extract the rejected entry, if one was returned.
+    pub fn into_entry(self) -> Option<T> {
+        match self {
+            ProposeErr::PendingReconfigEntry(e)
+            | ProposeErr::NoLeader(e)
+            | ProposeErr::ProposalsDisabled(e)
+            | ProposeErr::TransferInProgress(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// An error returning the proposal that was failed due to that the current configuration is stopped.
 #[derive(Debug)]
 pub enum CompactionErr {
@@ -1116,6 +1145,13 @@ pub enum CompactionErr {
     NotCurrentLeader(NodeId),
     /// A storage backend error occurred during the compaction operation.
     Storage(StorageError),
+}
+
+impl CompactionErr {
+    /// Returns `true` if this is a fatal storage error (node should stop).
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, CompactionErr::Storage(_))
+    }
 }
 
 impl Error for CompactionErr {

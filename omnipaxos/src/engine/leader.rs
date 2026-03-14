@@ -21,7 +21,6 @@ impl<T: Entry> Engine<T> {
             return EngineAction::Done;
         }
         if self.s.pid == n.pid {
-            #[cfg(feature = "tracing")]
             tracing::info!(
                 pid = self.s.pid,
                 old_role = "follower",
@@ -90,7 +89,6 @@ impl<T: Entry> Engine<T> {
     }
 
     pub(crate) fn become_follower(&mut self) {
-        #[cfg(feature = "tracing")]
         if self.s.state.0 == Role::Leader {
             tracing::info!(
                 pid = self.s.pid,
@@ -281,6 +279,10 @@ impl<T: Entry> Engine<T> {
         let decided_idx = self.s.decided_idx;
         let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
         for pid in followers {
+            // Skip backed-off followers to avoid wasting buffer space
+            if self.s.leader_state.should_skip_follower(pid) {
+                continue;
+            }
             let latest_accdec = self.get_latest_accdec_message(pid);
             match latest_accdec {
                 Some(accdec) => {
@@ -503,16 +505,22 @@ impl<T: Entry> Engine<T> {
         if accepted.n == self.s.leader_state.n_leader
             && self.s.state == (Role::Leader, Phase::Accept)
         {
+            tracing::debug!(
+                pid = self.s.pid,
+                from,
+                accepted_idx = accepted.accepted_idx,
+                "accepted_received"
+            );
             self.s
                 .leader_state
                 .set_accepted_idx(from, accepted.accepted_idx);
+            self.s.leader_state.record_follower_ack(from);
             // Check if a pending transfer target has caught up
             self.check_transfer_on_accepted(from);
             if accepted.accepted_idx > self.s.decided_idx
                 && self.s.leader_state.is_chosen(accepted.accepted_idx)
             {
                 let decided_idx = accepted.accepted_idx;
-                #[cfg(feature = "tracing")]
                 {
                     let old_idx = self.s.decided_idx;
                     tracing::info!(
@@ -556,6 +564,12 @@ impl<T: Entry> Engine<T> {
 
     pub(crate) fn handle_notaccepted(&mut self, not_acc: NotAccepted, from: NodeId) {
         if self.s.state.0 == Role::Leader && self.s.leader_state.n_leader < not_acc.n {
+            tracing::debug!(
+                pid = self.s.pid,
+                from,
+                higher_ballot_n = not_acc.n.n,
+                "not_accepted"
+            );
             self.s.leader_state.lost_promise(from);
         }
     }
@@ -754,7 +768,6 @@ impl<T: Entry> Engine<T> {
         }));
         // Clear transfer state
         self.s.transfer_state = None;
-        #[cfg(feature = "tracing")]
         tracing::info!(
             pid = self.s.pid,
             target,

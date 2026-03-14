@@ -17,6 +17,13 @@ impl<T: Entry> Engine<T> {
     pub(crate) fn handle_prepare(&mut self, prep: Prepare, from: NodeId) -> EngineAction<T> {
         let old_promise = self.s.promise;
         if old_promise < prep.n || (old_promise == prep.n && self.s.state.1 == Phase::Recover) {
+            tracing::debug!(
+                pid = self.s.pid,
+                from,
+                ballot_n = prep.n.n,
+                ballot_pid = prep.n.pid,
+                "prepare_received"
+            );
             // Emit: flush batch + set promise atomically
             let num_new = self.s.batched_entries.len();
             let mut ops = Vec::with_capacity(2);
@@ -112,6 +119,14 @@ impl<T: Entry> Engine<T> {
         from: NodeId,
     ) -> super::EngineAction<T> {
         if self.check_valid_ballot(accsync.n) && self.s.state == (Role::Follower, Phase::Prepare) {
+            tracing::debug!(
+                pid = self.s.pid,
+                from,
+                ballot_n = accsync.n.n,
+                sync_idx = accsync.log_sync.sync_idx,
+                decided_idx = accsync.decided_idx,
+                "accept_sync_received"
+            );
             self.s.cached_promise_message = None;
 
             // sync_log: emit WriteAtomic
@@ -163,6 +178,13 @@ impl<T: Entry> Engine<T> {
             && self.s.state == (Role::Follower, Phase::Accept)
             && self.handle_sequence_num(acc_dec.seq_num, acc_dec.n.pid) == MessageStatus::Expected
         {
+            tracing::debug!(
+                pid = self.s.pid,
+                from = acc_dec.n.pid,
+                num_entries = acc_dec.entries.len(),
+                decided_idx = acc_dec.decided_idx,
+                "accept_decide_received"
+            );
             let entries = Arc::try_unwrap(acc_dec.entries).unwrap_or_else(|arc| (*arc).clone());
             // Batch the entries
             let append_res = self.s.append_entries_to_batch(entries);
@@ -223,6 +245,11 @@ impl<T: Entry> Engine<T> {
             && self.s.state.1 == Phase::Accept
             && self.handle_sequence_num(dec.seq_num, dec.n.pid) == MessageStatus::Expected
         {
+            tracing::debug!(
+                pid = self.s.pid,
+                decided_idx = dec.decided_idx,
+                "decide_received"
+            );
             let new_accepted_idx = self.update_decided_idx_and_flush(dec.decided_idx);
             if let Some(idx) = new_accepted_idx {
                 self.reply_accepted(dec.n, idx);

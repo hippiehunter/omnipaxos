@@ -2977,14 +2977,14 @@ fn test_buffer_overflow_recovered_via_resend() {
 #[test]
 fn test_compaction_err_storage_error_variant() {
     // Verify the Storage variant works in the CompactionErr enum
-    use omnipaxos::errors::{AnyError, StorageError, StorageOperation};
+    use omnipaxos::errors::{AnyError, StorageError};
     use omnipaxos::CompactionErr;
 
     let any_err = AnyError::new(std::io::Error::new(
         std::io::ErrorKind::Other,
         "test error",
     ));
-    let storage_err = StorageError::new(StorageOperation::WriteAtomic, any_err);
+    let storage_err = StorageError::write_batch(any_err);
     let compaction_err = CompactionErr::Storage(storage_err);
 
     // Should display properly
