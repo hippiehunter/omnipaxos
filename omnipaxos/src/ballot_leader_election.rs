@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 /// Used to define a Sequence Paxos epoch
 #[derive(Clone, Copy, Eq, Debug, Default, PartialEq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Ballot {
     /// The identifier for the configuration that the replica with this ballot is part of.

@@ -9,6 +9,7 @@ use std::{cmp::Ordering, collections::HashMap, fmt::Debug, marker::PhantomData, 
 
 /// Struct used to help another server synchronize their log with the current state of our own log.
 #[derive(Clone, Debug)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LogSync<T>
 where
@@ -484,6 +485,7 @@ pub(crate) enum MessageStatus {
 
 /// Keeps track of the ordering of messages in the accept phase
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SequenceNumber {
     /// Meant to refer to a TCP session
@@ -529,6 +531,7 @@ impl LogicalClock {
 /// Flexible quorums can be used to increase/decrease the read and write quorum sizes,
 /// for different latency vs fault tolerance tradeoffs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(any(feature = "serde", feature = "toml_config"), derive(Deserialize))]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct FlexibleQuorum {

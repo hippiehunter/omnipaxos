@@ -190,6 +190,7 @@ fn validate_persisted_state<T: Entry>(state: &PersistedState<T>) -> Result<(), O
 /// * `nodes`: The nodes in the cluster i.e. the `pid`s of the other servers in the configuration.
 /// * `flexible_quorum` : Defines read and write quorum sizes. Can be used for different latency vs fault tolerance tradeoffs.
 #[derive(Clone, Debug, PartialEq, Default)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(any(feature = "serde", feature = "toml_config"), derive(Deserialize))]
 #[cfg_attr(feature = "toml_config", serde(default))]
 #[cfg_attr(feature = "serde", derive(Serialize))]
