@@ -1,14 +1,14 @@
 use super::{
+    Engine, EngineAction, LogSyncContinuation, LogSyncRequest,
     commands::Command,
     state::{Phase, Role},
-    Engine, EngineAction, LogSyncContinuation, LogSyncRequest,
 };
 use crate::{
+    ReadBarrier, ReadError, TransferError,
     ballot_leader_election::Ballot,
-    messages::{sequence_paxos::*, Message},
+    messages::{Message, sequence_paxos::*},
     storage::{Entry, StopSign, StorageOp},
     util::{AcceptedMetaData, LeaderState, NodeId, PromiseMetaData},
-    ReadBarrier, ReadError, TransferError,
 };
 use std::sync::Arc;
 
@@ -38,7 +38,10 @@ impl<T: Entry> Engine<T> {
             let num_new = self.s.batched_entries.len();
             let mut ops = Vec::with_capacity(2);
             if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
+                ops.push(StorageOp::AppendEntries(
+                    self.s.batched_entries.clone(),
+                    false,
+                ));
             }
             ops.push(StorageOp::SetPromise(n));
             self.commands.push(Command::WriteAtomic(ops));
@@ -60,7 +63,10 @@ impl<T: Entry> Engine<T> {
                 accepted_idx,
                 log_sync: None,
             };
-            let received_majority = self.s.leader_state.set_promise(my_promise, self.s.pid, true);
+            let received_majority = self
+                .s
+                .leader_state
+                .set_promise(my_promise, self.s.pid, true);
             self.s.state = (Role::Leader, Phase::Prepare);
 
             if received_majority {
@@ -157,8 +163,7 @@ impl<T: Entry> Engine<T> {
         if let Some(flushed_entries) = append_res {
             let shared = Arc::new(flushed_entries.clone());
             // Emit append command
-            self.commands
-                .push(Command::AppendEntries(flushed_entries));
+            self.commands.push(Command::AppendEntries(flushed_entries));
             let num = shared.len() as u64;
             self.s.accepted_idx += num;
             let metadata = AcceptedMetaData {
@@ -177,8 +182,7 @@ impl<T: Entry> Engine<T> {
         let append_res = self.s.append_entries_to_batch(entries);
         if let Some(flushed_entries) = append_res {
             let shared = Arc::new(flushed_entries.clone());
-            self.commands
-                .push(Command::AppendEntries(flushed_entries));
+            self.commands.push(Command::AppendEntries(flushed_entries));
             let num = shared.len() as u64;
             self.s.accepted_idx += num;
             let metadata = AcceptedMetaData {
@@ -199,7 +203,10 @@ impl<T: Entry> Engine<T> {
         // Build atomic transaction: flush entries + set stopsign
         let mut ops = Vec::with_capacity(2);
         if has_batched {
-            ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
+            ops.push(StorageOp::AppendEntries(
+                self.s.batched_entries.clone(),
+                false,
+            ));
         }
         ops.push(StorageOp::SetStopsign(Some(ss.clone())));
         self.commands.push(Command::WriteAtomic(ops));
@@ -222,7 +229,9 @@ impl<T: Entry> Engine<T> {
             self.send_acceptdecide(metadata);
         }
         let accepted_idx = self.s.accepted_idx;
-        self.s.leader_state.set_accepted_idx(self.s.pid, accepted_idx);
+        self.s
+            .leader_state
+            .set_accepted_idx(self.s.pid, accepted_idx);
         // Send AcceptStopSign to followers BEFORE potentially deciding
         let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
         for pid in followers {
@@ -247,11 +256,7 @@ impl<T: Entry> Engine<T> {
             pid,
             ..
         } = self.s.leader_state.get_promise_meta(to);
-        let followers_decided_idx = self
-            .s
-            .leader_state
-            .get_decided_idx(*pid)
-            .unwrap_or(0);
+        let followers_decided_idx = self.s.leader_state.get_decided_idx(*pid).unwrap_or(0);
         let followers_valid_entries_idx = if *followers_promise_n == current_n {
             *followers_accepted_idx
         } else if *followers_promise_n == *prev_round_max_promise_n {
@@ -263,11 +268,7 @@ impl<T: Entry> Engine<T> {
     }
 
     /// Complete sending AcceptSync after Runtime has built the LogSync.
-    pub(crate) fn complete_accsync(
-        &mut self,
-        to: NodeId,
-        log_sync: crate::util::LogSync<T>,
-    ) {
+    pub(crate) fn complete_accsync(&mut self, to: NodeId, log_sync: crate::util::LogSync<T>) {
         let current_n = self.s.leader_state.n_leader;
         self.s.leader_state.increment_seq_num_session(to);
         let acc_sync = AcceptSync {
@@ -288,10 +289,6 @@ impl<T: Entry> Engine<T> {
         let decided_idx = self.s.decided_idx;
         let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
         for pid in followers {
-            // Skip backed-off followers to avoid wasting buffer space
-            if self.s.leader_state.should_skip_follower(pid) {
-                continue;
-            }
             let latest_accdec = self.get_latest_accdec_message(pid);
             match latest_accdec {
                 Some(accdec) => {
@@ -363,11 +360,8 @@ impl<T: Entry> Engine<T> {
         // Sync log: emit WriteAtomic command
         // Delta merge on the leader path is a no-op: the leader already has the
         // full log and the trim/compacted_idx are set correctly by sync_log_engine.
-        let _delta_merge = self.sync_log_engine(
-            self.s.leader_state.n_leader,
-            decided_idx,
-            max_promise_sync,
-        );
+        let _delta_merge =
+            self.sync_log_engine(self.s.leader_state.n_leader, decided_idx, max_promise_sync);
 
         if !self.accepted_reconfiguration() {
             if !self.s.buffered_proposals.is_empty() {
@@ -540,9 +534,10 @@ impl<T: Entry> Engine<T> {
                         "entries_decided"
                     );
                 }
-                self.commands.push(Command::WriteAtomic(vec![
-                    StorageOp::SetDecidedIndex(decided_idx),
-                ]));
+                self.commands
+                    .push(Command::WriteAtomic(vec![StorageOp::SetDecidedIndex(
+                        decided_idx,
+                    )]));
                 self.s.decided_idx = decided_idx;
                 let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
                 for pid in followers {
@@ -620,9 +615,10 @@ impl<T: Entry> Engine<T> {
     pub(crate) fn try_decide_self_accepted(&mut self) {
         let accepted_idx = self.s.leader_state.get_accepted_idx(self.s.pid);
         if accepted_idx > self.s.decided_idx && self.s.leader_state.is_chosen(accepted_idx) {
-            self.commands.push(Command::WriteAtomic(vec![
-                StorageOp::SetDecidedIndex(accepted_idx),
-            ]));
+            self.commands
+                .push(Command::WriteAtomic(vec![StorageOp::SetDecidedIndex(
+                    accepted_idx,
+                )]));
             self.s.decided_idx = accepted_idx;
             let decided_idx = self.s.decided_idx;
             let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
@@ -675,27 +671,27 @@ impl<T: Entry> Engine<T> {
 
         if self.s.peers.is_empty() {
             // Single-node: immediate quorum
-            self.s.pending_read_indexes.push(
-                crate::engine::state::PendingReadIndex {
+            self.s
+                .pending_read_indexes
+                .push(crate::engine::state::PendingReadIndex {
                     read_id,
                     read_idx,
                     confirmations: 1,
                     quorum_size: 1,
                     quorum_reached: true,
-                },
-            );
+                });
         } else {
             let quorum_size = self.s.leader_state.quorum.prepare_quorum_size();
             // Count self
-            self.s.pending_read_indexes.push(
-                crate::engine::state::PendingReadIndex {
+            self.s
+                .pending_read_indexes
+                .push(crate::engine::state::PendingReadIndex {
                     read_id,
                     read_idx,
                     confirmations: 1, // self
                     quorum_size,
                     quorum_reached: 1 >= quorum_size,
-                },
-            );
+                });
             // Send ReadIndexReq to all peers
             let n = self.s.leader_state.n_leader;
             let peers = self.s.peers.clone();
@@ -781,11 +777,7 @@ impl<T: Entry> Engine<T> {
         }));
         // Clear transfer state
         self.s.transfer_state = None;
-        tracing::info!(
-            pid = self.s.pid,
-            target,
-            "leader_transfer_sent"
-        );
+        tracing::info!(pid = self.s.pid, target, "leader_transfer_sent");
     }
 
     /// Check transfer state in handle_accepted - if target catches up, send transfer.
@@ -823,14 +815,13 @@ impl<T: Entry> Engine<T> {
             .leader_state
             .set_accepted_idx(self.s.pid, projected_accepted_idx);
 
-        let decided_idx =
-            if projected_accepted_idx > self.s.decided_idx
-                && self.s.leader_state.is_chosen(projected_accepted_idx)
-            {
-                projected_accepted_idx
-            } else {
-                self.s.decided_idx
-            };
+        let decided_idx = if projected_accepted_idx > self.s.decided_idx
+            && self.s.leader_state.is_chosen(projected_accepted_idx)
+        {
+            projected_accepted_idx
+        } else {
+            self.s.decided_idx
+        };
 
         let entries = self.s.take_batched_entries();
         if entries.is_empty() {

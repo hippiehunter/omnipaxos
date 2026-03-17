@@ -1,8 +1,9 @@
 use omnipaxos::{
-    messages::Message,
-    storage::{memory_storage::MemoryStorage, Storage as _},
-    util::LogEntry,
     ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
+    messages::Message,
+    messages::sequence_paxos::PaxosMsg,
+    storage::{Storage as _, memory_storage::MemoryStorage},
+    util::LogEntry,
 };
 use std::collections::HashMap;
 
@@ -51,6 +52,15 @@ impl TestCluster {
 
     /// Collect outgoing messages from all nodes and deliver them to their recipients.
     async fn route_messages(&mut self) {
+        self.route_messages_matching(|_| true).await;
+    }
+
+    /// Collect outgoing messages from all nodes and deliver only those that
+    /// satisfy the provided predicate.
+    async fn route_messages_matching(
+        &mut self,
+        mut should_deliver: impl FnMut(&Message<Value>) -> bool,
+    ) {
         let mut all_msgs: Vec<Message<Value>> = Vec::new();
         let mut buf = Vec::new();
         for node in self.nodes.values_mut() {
@@ -58,6 +68,9 @@ impl TestCluster {
             all_msgs.append(&mut buf);
         }
         for msg in all_msgs {
+            if !should_deliver(&msg) {
+                continue;
+            }
             let receiver = msg.get_receiver();
             if let Some(node) = self.nodes.get_mut(&receiver) {
                 node.handle_incoming(msg).await.unwrap();
@@ -238,6 +251,41 @@ fn test_follower_forwarding() {
         }
         for log in &logs {
             assert_eq!(log, &logs[0], "all nodes must have the same decided log");
+        }
+    });
+}
+
+#[test]
+fn test_replication_recovers_after_followers_are_marked_backed_off() {
+    smol::block_on(async {
+        let mut cluster = TestCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // Keep the leader stable but drop Accepted replies long enough for its
+        // follower backoff counters to trip.
+        for _ in 0..25 {
+            cluster.tick_all().await;
+            cluster
+                .route_messages_matching(|msg| {
+                    !matches!(
+                        msg,
+                        Message::SequencePaxos(paxos)
+                            if paxos.to == leader && matches!(paxos.msg, PaxosMsg::Accepted(_))
+                    )
+                })
+                .await;
+        }
+
+        cluster.propose(leader, Value::with_id(1)).await;
+        cluster.tick_and_route(100).await;
+
+        for (&pid, node) in &cluster.nodes {
+            assert_eq!(
+                node.get_decided_idx(),
+                1,
+                "node {} should decide the post-backoff proposal",
+                pid
+            );
         }
     });
 }
@@ -478,11 +526,10 @@ fn test_single_node_recovery() {
             .write_atomically(vec![
                 StorageOp::SetPromise(ballot),
                 StorageOp::SetAcceptedRound(ballot),
-                StorageOp::AppendEntries(vec![
-                    Value::with_id(1),
-                    Value::with_id(2),
-                    Value::with_id(3),
-                ], false),
+                StorageOp::AppendEntries(
+                    vec![Value::with_id(1), Value::with_id(2), Value::with_id(3)],
+                    false,
+                ),
                 StorageOp::SetDecidedIndex(3),
             ])
             .await
