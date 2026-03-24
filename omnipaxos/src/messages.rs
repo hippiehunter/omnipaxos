@@ -6,10 +6,77 @@ use crate::{
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+/// Opaque reference to pre-staged payload bytes.
+///
+/// Used by the RDMA data plane to disseminate bulk entry data before the
+/// consensus control message arrives. The transport layer maps this to
+/// physical RDMA addresses internally — the consensus engine only sees
+/// identity and validation fields.
+#[derive(Clone, Debug, PartialEq)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct PayloadRef {
+    /// Leader's ballot epoch — invalid after leader change.
+    pub leader_epoch: u64,
+    /// Connection incarnation — invalid after reconnect/QP reset.
+    pub conn_epoch: u64,
+    /// Monotonic within (leader_epoch, conn_epoch).
+    pub batch_id: u64,
+    /// Payload byte length.
+    pub len: u32,
+    /// Number of entries (for AcceptDecide) or 0 for opaque blobs.
+    pub entry_count: u32,
+    /// CRC32C of staged bytes.
+    pub crc: u32,
+}
+
+/// Entry data is either inline or referenced via a [`PayloadRef`].
+///
+/// The RDMA data plane stages bulk entry bytes on the remote follower before
+/// the consensus control message arrives. The pump layer resolves `Ref`
+/// variants to `Inline` before the engine processes them. On the send side,
+/// the pump converts `Inline` to `Ref` after staging via the data transport.
+#[derive(Clone, Debug)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum InlineOrRef<T> {
+    /// Payload data is carried inline in the message.
+    Inline(T),
+    /// Payload data was pre-staged via the RDMA data plane.
+    Ref(PayloadRef),
+}
+
+impl<T> InlineOrRef<T> {
+    /// Returns the inline value, panicking if this is a `Ref`.
+    ///
+    /// The pump layer must resolve all `Ref` variants before the engine
+    /// processes messages. If this panics, the pump failed to resolve.
+    pub fn into_inner(self) -> T {
+        match self {
+            InlineOrRef::Inline(v) => v,
+            InlineOrRef::Ref(_) => panic!("unresolved PayloadRef reached engine"),
+        }
+    }
+
+    /// Returns a reference to the inline value, or `None` if `Ref`.
+    pub fn as_inline(&self) -> Option<&T> {
+        match self {
+            InlineOrRef::Inline(v) => Some(v),
+            InlineOrRef::Ref(_) => None,
+        }
+    }
+
+    /// Returns true if this is an inline value.
+    pub fn is_inline(&self) -> bool {
+        matches!(self, InlineOrRef::Inline(_))
+    }
+}
+
 /// Internal component for log replication
 pub mod sequence_paxos {
     use crate::{
         ballot_leader_election::Ballot,
+        messages::InlineOrRef,
         storage::{Entry, StopSign},
         util::{LogSync, NodeId, SequenceNumber},
     };
@@ -60,7 +127,8 @@ pub mod sequence_paxos {
         pub accepted_idx: u64,
         /// The log update which the leader applies to its log in order to sync
         /// with this follower (if the follower is more up-to-date).
-        pub log_sync: Option<LogSync<T>>,
+        /// May be a `Ref` if the payload was staged via RDMA data plane.
+        pub log_sync: Option<InlineOrRef<LogSync<T>>>,
     }
 
     /// AcceptSync message sent by the leader to synchronize the logs of all replicas in the prepare phase.
@@ -78,8 +146,8 @@ pub mod sequence_paxos {
         /// The decided index
         pub decided_idx: u64,
         /// The log update which the follower applies to its log in order to sync
-        /// with the leader.
-        pub log_sync: LogSync<T>,
+        /// with the leader. May be a `Ref` if staged via RDMA data plane.
+        pub log_sync: InlineOrRef<LogSync<T>>,
     }
 
     /// Message with entries to be replicated and the latest decided index sent by the leader in the accept phase.
@@ -96,8 +164,8 @@ pub mod sequence_paxos {
         pub seq_num: SequenceNumber,
         /// The decided index.
         pub decided_idx: u64,
-        /// Entries to be replicated.
-        pub entries: Arc<Vec<T>>,
+        /// Entries to be replicated. May be a `Ref` if staged via RDMA data plane.
+        pub entries: InlineOrRef<Arc<Vec<T>>>,
     }
 
     /// Message sent by follower to leader when entries has been accepted.

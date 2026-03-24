@@ -167,7 +167,7 @@ where
         };
         if check_max_prom && promise_meta > self.max_promise_meta {
             self.max_promise_meta = promise_meta.clone();
-            self.max_promise_sync = prom.log_sync;
+            self.max_promise_sync = prom.log_sync.map(|ior| ior.into_inner());
         }
         let idx = self.idx(from);
         self.promises_meta[idx] = PromiseState::Promised(promise_meta);

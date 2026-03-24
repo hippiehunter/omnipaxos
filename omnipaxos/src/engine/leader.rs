@@ -4,7 +4,7 @@ use super::{
     state::{Phase, Role},
 };
 use crate::{
-    ReadBarrier, ReadError, TransferError,
+    InlineOrRef, ReadBarrier, ReadError, TransferError,
     ballot_leader_election::Ballot,
     messages::{Message, sequence_paxos::*},
     storage::{Entry, StopSign, StorageOp},
@@ -275,7 +275,7 @@ impl<T: Entry> Engine<T> {
             n: current_n,
             seq_num: self.s.leader_state.next_seq_num(to),
             decided_idx: self.s.decided_idx,
-            log_sync,
+            log_sync: InlineOrRef::Inline(log_sync),
         };
         let msg = Message::SequencePaxos(PaxosMessage {
             from: self.s.pid,
@@ -292,7 +292,16 @@ impl<T: Entry> Engine<T> {
             let latest_accdec = self.get_latest_accdec_message(pid);
             match latest_accdec {
                 Some(accdec) => {
-                    Arc::make_mut(&mut accdec.entries).extend(accepted.entries.iter().cloned());
+                    match &mut accdec.entries {
+                        InlineOrRef::Inline(arc_entries) => {
+                            Arc::make_mut(arc_entries)
+                                .extend(accepted.entries.iter().cloned());
+                        }
+                        InlineOrRef::Ref(_) => {
+                            // Outgoing messages from the leader are always Inline.
+                            // Ref is only used on the wire after transport staging.
+                        }
+                    }
                     accdec.decided_idx = decided_idx;
                 }
                 None => {
@@ -301,7 +310,7 @@ impl<T: Entry> Engine<T> {
                         n: self.s.leader_state.n_leader,
                         seq_num: self.s.leader_state.next_seq_num(pid),
                         decided_idx,
-                        entries: Arc::clone(&accepted.entries),
+                        entries: InlineOrRef::Inline(Arc::clone(&accepted.entries)),
                     };
                     let pushed = self.try_push_message(Message::SequencePaxos(PaxosMessage {
                         from: self.s.pid,

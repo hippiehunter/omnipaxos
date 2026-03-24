@@ -17,6 +17,7 @@ pub mod errors;
 pub use errors::{AnyError, ErrorSubject, StorageOperation};
 /// The different messages OmniPaxos servers can communicate to each other with.
 pub mod messages;
+pub use messages::{InlineOrRef, PayloadRef};
 /// The user-facing OmniPaxos struct.
 mod omni_paxos;
 pub use omni_paxos::*;

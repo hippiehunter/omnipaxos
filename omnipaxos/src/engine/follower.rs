@@ -4,6 +4,7 @@ use super::{
     Engine, EngineAction, LogSyncContinuation,
 };
 use crate::{
+    InlineOrRef,
     ballot_leader_election::Ballot,
     messages::{sequence_paxos::*, Message},
     storage::{Entry, StorageOp},
@@ -103,7 +104,7 @@ impl<T: Entry> Engine<T> {
             n_accepted: na,
             decided_idx: self.s.decided_idx,
             accepted_idx,
-            log_sync: Some(log_sync),
+            log_sync: Some(InlineOrRef::Inline(log_sync)),
         };
         self.s.cached_promise_message = Some(promise.clone());
         self.try_push_message(Message::SequencePaxos(PaxosMessage {
@@ -119,11 +120,12 @@ impl<T: Entry> Engine<T> {
         from: NodeId,
     ) -> super::EngineAction<T> {
         if self.check_valid_ballot(accsync.n) && self.s.state == (Role::Follower, Phase::Prepare) {
+            let log_sync = accsync.log_sync.into_inner();
             tracing::debug!(
                 pid = self.s.pid,
                 from,
                 ballot_n = accsync.n.n,
-                sync_idx = accsync.log_sync.sync_idx,
+                sync_idx = log_sync.sync_idx,
                 decided_idx = accsync.decided_idx,
                 "accept_sync_received"
             );
@@ -131,7 +133,7 @@ impl<T: Entry> Engine<T> {
 
             // sync_log: emit WriteAtomic
             let delta_merge =
-                self.sync_log_engine(accsync.n, accsync.decided_idx, Some(accsync.log_sync));
+                self.sync_log_engine(accsync.n, accsync.decided_idx, Some(log_sync));
 
             if self.s.stopsign.is_none() {
                 self.forward_buffered_proposals();
@@ -178,14 +180,15 @@ impl<T: Entry> Engine<T> {
             && self.s.state == (Role::Follower, Phase::Accept)
             && self.handle_sequence_num(acc_dec.seq_num, acc_dec.n.pid) == MessageStatus::Expected
         {
+            let arc_entries = acc_dec.entries.into_inner();
             tracing::debug!(
                 pid = self.s.pid,
                 from = acc_dec.n.pid,
-                num_entries = acc_dec.entries.len(),
+                num_entries = arc_entries.len(),
                 decided_idx = acc_dec.decided_idx,
                 "accept_decide_received"
             );
-            let entries = Arc::try_unwrap(acc_dec.entries).unwrap_or_else(|arc| (*arc).clone());
+            let entries = Arc::try_unwrap(arc_entries).unwrap_or_else(|arc| (*arc).clone());
             // Batch the entries
             let append_res = self.s.append_entries_to_batch(entries);
             let mut new_accepted_idx: Option<u64> = None;
