@@ -585,9 +585,33 @@ where
         self.engine.get_decided_idx()
     }
 
+    /// Return the decided index over real log entries only, excluding the
+    /// protocol slot a decided StopSign occupies. With a decided StopSign this
+    /// is `get_decided_idx() - 1` and equals the StopSign's own 0-based slot;
+    /// otherwise it equals `get_decided_idx()`.
+    pub fn get_decided_idx_without_stopsign(&self) -> u64 {
+        self.engine.s.get_decided_idx_without_stopsign()
+    }
+
+    /// Return the accepted index, including the protocol slot of an accepted
+    /// StopSign. Equal to `get_decided_idx()` exactly when every accepted
+    /// entry (and any accepted StopSign) has been decided.
+    pub fn get_accepted_idx(&self) -> u64 {
+        self.engine.s.accepted_idx
+    }
+
     /// Return trim index from storage.
     pub fn get_compacted_idx(&self) -> u64 {
         self.engine.get_compacted_idx()
+    }
+
+    /// Consume the instance and hand back its storage backend.
+    ///
+    /// Intended for the epoch transition: once `reconfiguration_status()` is
+    /// `Decided` the instance is permanently sealed, and the application
+    /// recovers the backend to build the next configuration's instance on it.
+    pub fn into_storage(self) -> B {
+        self.runtime.storage
     }
 
     /// Returns the cluster configuration this OmniPaxos instance was built with.
