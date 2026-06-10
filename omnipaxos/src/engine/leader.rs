@@ -264,6 +264,13 @@ impl<T: Entry> Engine<T> {
         } else {
             followers_decided_idx
         };
+        // Promise accepted_idx values count an accepted StopSign's virtual
+        // slot, but the sync point is a real-log index: clamp to the real
+        // log frontier or the follower re-counts the StopSign on top of an
+        // already-inclusive index, deciding the StopSign one slot higher
+        // than the original quorum did (divergent config_base_lsn).
+        let real_log_head = self.s.accepted_idx - u64::from(self.s.stopsign.is_some());
+        let followers_valid_entries_idx = followers_valid_entries_idx.min(real_log_head);
         (followers_valid_entries_idx, followers_decided_idx)
     }
 
