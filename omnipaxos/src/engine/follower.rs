@@ -423,18 +423,14 @@ impl<T: Entry> Engine<T> {
     ) {
         // Only accept if the ballot is from our current leader
         if tl.n >= self.s.promise {
-            // Start an election with a ballot higher than the leader's
-            let _suggested_n = if tl.suggested_n > tl.n.n {
-                tl.suggested_n
-            } else {
-                tl.n.n + 1
-            };
-            // We don't directly call handle_leader here - that's done by the
-            // OmniPaxos layer which coordinates with BLE.
-            // Instead, we store the suggested ballot so the OmniPaxos layer can use it.
+            // The election itself is started by the OmniPaxos layer, which
+            // coordinates with BLE: a zero-tick transfer state targeting
+            // self is the handoff marker its tick() consumes. The takeover
+            // ballot is derived from the current promise there, which the
+            // leader's `suggested_n` (promise.n + 1) equals.
             self.s.transfer_state = Some(crate::engine::state::TransferState {
                 target: self.s.pid,
-                ticks_remaining: 0, // signal to OmniPaxos to initiate election
+                ticks_remaining: 0,
             });
         }
     }

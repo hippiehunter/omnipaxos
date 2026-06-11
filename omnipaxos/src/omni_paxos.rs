@@ -823,6 +823,27 @@ where
         if self.resend_message_clock.tick_and_check_timeout() {
             self.engine.resend_message_timeout();
         }
+        // Complete a leader handoff aimed at this node: handle_transfer_leader
+        // recorded the old leader's TransferLeader as a zero-tick marker
+        // (target == self). Consume it here — before tick_transfer, which
+        // treats a zero-tick state as an expired countdown — and start the
+        // election that takes leadership over with a ballot above the old
+        // leader's promise.
+        if self
+            .engine
+            .s
+            .transfer_state
+            .as_ref()
+            .is_some_and(|ts| {
+                ts.target == self.engine.s.pid && ts.ticks_remaining == 0
+            })
+            && self.engine.s.state.0 == crate::engine::state::Role::Follower
+        {
+            self.engine.s.transfer_state = None;
+            if self.runtime_config.enable_election {
+                self.try_become_leader().await?;
+            }
+        }
         // Tick leader transfer timeout
         self.engine.tick_transfer();
         // Tick per-follower backoff counters
