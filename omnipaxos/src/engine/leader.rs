@@ -616,6 +616,37 @@ impl<T: Entry> Engine<T> {
                             self.send_accept_stopsign(follower, ss.clone(), true);
                         }
                     }
+                } else {
+                    // AcceptDecide is fire-and-forget on the transport, and in
+                    // Accept phase nothing else re-delivers a lost log suffix:
+                    // the follower only detects the gap if a later sequenced
+                    // message arrives, which never happens once proposals stop.
+                    // A promised follower that is behind and whose backoff
+                    // counter tripped (no accepted progress for many ticks
+                    // leading into this resend) has lost its in-flight
+                    // entries — drop its promise so the re-prepare below
+                    // resyncs it from its current accepted index.
+                    let stalled: Vec<NodeId> = self
+                        .s
+                        .leader_state
+                        .get_promised_followers()
+                        .iter()
+                        .copied()
+                        .filter(|&pid| {
+                            self.s.leader_state.get_accepted_idx(pid) < self.s.accepted_idx
+                                && self.s.leader_state.is_backed_off(pid)
+                        })
+                        .collect();
+                    for pid in stalled {
+                        tracing::warn!(
+                            follower = pid,
+                            follower_accepted_idx = self.s.leader_state.get_accepted_idx(pid),
+                            leader_accepted_idx = self.s.accepted_idx,
+                            "resyncing stalled follower via re-prepare"
+                        );
+                        self.s.leader_state.reset_promise(pid);
+                        self.s.leader_state.set_latest_accept_meta(pid, None);
+                    }
                 }
                 let preparable_peers = self.s.leader_state.get_preparable_peers(&self.s.peers);
                 for peer in preparable_peers {

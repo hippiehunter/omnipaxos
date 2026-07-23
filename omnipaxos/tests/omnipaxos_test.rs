@@ -291,6 +291,58 @@ fn test_replication_recovers_after_followers_are_marked_backed_off() {
 }
 
 #[test]
+fn test_lost_acceptdecide_resyncs_without_new_proposals() {
+    smol::block_on(async {
+        let mut cluster = TestCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+
+        // One follower loses every AcceptDecide for this proposal. With no
+        // further proposals there is no later sequenced message to expose the
+        // gap, so recovery must come from the leader's resend timeout alone.
+        let victim = *cluster
+            .nodes
+            .keys()
+            .find(|&&pid| pid != leader)
+            .expect("cluster has followers");
+        // Drain any election-tail traffic so the victim is fully synced
+        // before the entry it will miss is proposed.
+        cluster.tick_and_route(10).await;
+        cluster.propose(leader, Value::with_id(1)).await;
+        for _ in 0..5 {
+            cluster.tick_all().await;
+            cluster
+                .route_messages_matching(|msg| {
+                    !matches!(
+                        msg,
+                        Message::SequencePaxos(paxos)
+                            if paxos.to == victim
+                                && matches!(
+                                    paxos.msg,
+                                    PaxosMsg::AcceptDecide(_) | PaxosMsg::AcceptSync(_)
+                                )
+                    )
+                })
+                .await;
+        }
+        let victim_accepted = cluster.nodes[&victim].get_accepted_idx();
+        assert_eq!(victim_accepted, 0, "victim must have missed the entry");
+
+        // Quorum decided without the victim; now deliver everything and tick
+        // past the resend timeout (100 ticks) plus the backoff threshold.
+        cluster.tick_and_route(250).await;
+
+        for (&pid, node) in &cluster.nodes {
+            assert_eq!(
+                node.get_decided_idx(),
+                1,
+                "node {} should converge on the dropped entry via resync",
+                pid
+            );
+        }
+    });
+}
+
+#[test]
 fn test_non_contiguous_pids() {
     smol::block_on(async {
         let mut cluster = TestCluster::new(vec![3, 7, 100]).await;
