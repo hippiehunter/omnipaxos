@@ -1287,6 +1287,45 @@ fn test_competing_try_become_leader() {
     });
 }
 
+#[test]
+fn test_try_become_leader_outranks_the_initial_round_of_a_fresh_configuration() {
+    smol::block_on(async {
+        let cluster_config = ClusterConfig {
+            configuration_id: 2,
+            nodes: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let mut server_configs = BTreeMap::new();
+        for (pid, leader_priority) in [(1, 0), (2, 0), (3, 100)] {
+            server_configs.insert(
+                pid,
+                ServerConfig {
+                    pid,
+                    leader_priority,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut cluster = SimCluster::with_configs(cluster_config, server_configs).await;
+        // Node 1 claims before any election round: every fresh member holds
+        // the initial round, where node 3's priority would otherwise win.
+        cluster
+            .nodes
+            .get_mut(&1)
+            .unwrap()
+            .try_become_leader()
+            .await
+            .unwrap();
+        let leader = elect_leader(&mut cluster).await;
+        assert_eq!(leader, 1, "the claim must outrank the initial round");
+        cluster.tick_and_route(300).await;
+        for node in cluster.nodes.values() {
+            let (lpid, _) = node.get_current_leader().unwrap();
+            assert_eq!(lpid, 1, "the claimant keeps leadership");
+        }
+    });
+}
+
 // ===========================================================================
 // Group 8: Snapshot / Compaction with Recovery
 // ===========================================================================
