@@ -877,7 +877,11 @@ where
     pub async fn try_become_leader(&mut self) -> Result<(), OmniPaxosError> {
         let mut my_ballot = self.ble.get_current_ballot();
         let promise = self.engine.get_promise();
-        my_ballot.n = promise.n + 1;
+        // Increment above both this instance's ballot and its promise. On a
+        // fresh configuration the promise is the default ballot, so
+        // `promise.n + 1` would reproduce the initial round every member
+        // already holds, where priority and pid decide instead of the claim.
+        my_ballot.n = my_ballot.n.max(promise.n) + 1;
         // Sync BLE state so it's aware of the new ballot
         self.ble.set_current_ballot(my_ballot);
         self.ble.set_leader(my_ballot);
