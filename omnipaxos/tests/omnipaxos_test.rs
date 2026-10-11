@@ -291,6 +291,49 @@ fn test_replication_recovers_after_followers_are_marked_backed_off() {
 }
 
 #[test]
+fn test_resync_of_every_follower_keeps_the_leader_deciding() {
+    smol::block_on(async {
+        let mut cluster = TestCluster::new(vec![1, 2, 3]).await;
+        let leader = elect_leader(&mut cluster).await;
+        cluster.tick_and_route(10).await;
+
+        // Both followers miss the entry, as when each is busy applying an
+        // earlier one: the leader cannot decide it, and its resend timeout
+        // drops both promises to resync them. Each must promise again or the
+        // leader has no quorum for this entry or any later one.
+        cluster.propose(leader, Value::with_id(1)).await;
+        for _ in 0..5 {
+            cluster.tick_all().await;
+            cluster
+                .route_messages_matching(|msg| {
+                    !matches!(
+                        msg,
+                        Message::SequencePaxos(paxos)
+                            if paxos.to != leader
+                                && matches!(
+                                    paxos.msg,
+                                    PaxosMsg::AcceptDecide(_) | PaxosMsg::AcceptSync(_)
+                                )
+                    )
+                })
+                .await;
+        }
+        assert_eq!(cluster.nodes[&leader].get_decided_idx(), 0);
+
+        cluster.tick_and_route(250).await;
+        for (&pid, node) in &cluster.nodes {
+            assert_eq!(node.get_decided_idx(), 1, "node {pid} after the resync");
+        }
+
+        cluster.propose(leader, Value::with_id(2)).await;
+        cluster.tick_and_route(20).await;
+        for (&pid, node) in &cluster.nodes {
+            assert_eq!(node.get_decided_idx(), 2, "node {pid} after a later proposal");
+        }
+    });
+}
+
+#[test]
 fn test_lost_acceptdecide_resyncs_without_new_proposals() {
     smol::block_on(async {
         let mut cluster = TestCluster::new(vec![1, 2, 3]).await;
