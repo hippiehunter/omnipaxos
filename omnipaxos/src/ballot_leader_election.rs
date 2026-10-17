@@ -203,19 +203,22 @@ impl BallotLeaderElection {
         seq_paxos_state: &(Role, Phase),
         seq_paxos_promise: Ballot,
     ) -> Option<Ballot> {
-        self.update_leader();
-        self.update_happiness(seq_paxos_state);
-        self.check_takeover();
-        self.new_hb_round();
+        // A promise newer than the BLE leader names a leader this node already
+        // follows (its ballot may not have reached BLE, or become_leader() was
+        // called). Leader health and any takeover ballot are judged against it,
+        // never against the older leader it replaced.
         if seq_paxos_promise > self.leader {
-            // Sync leader with Paxos promise in case ballot didn't make it to BLE followers
-            // or become_leader() was called.
             self.leader = seq_paxos_promise;
             if seq_paxos_promise.pid == self.pid {
                 self.current_ballot = seq_paxos_promise;
             }
             self.happy = true;
+            self.consecutive_unhappy_rounds = 0;
         }
+        self.update_leader();
+        self.update_happiness(seq_paxos_state);
+        self.check_takeover();
+        self.new_hb_round();
         if self.leader == self.current_ballot {
             Some(self.current_ballot)
         } else {
@@ -415,6 +418,63 @@ impl From<OmniPaxosConfig> for BLEConfig {
             priority: config.server_config.leader_priority,
             flexible_quorum: config.cluster_config.flexible_quorum,
             buffer_size: BLE_BUFFER_SIZE,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG: ConfigurationId = 1;
+
+    fn ble(pid: NodeId, peers: Vec<NodeId>, priority: u32) -> BallotLeaderElection {
+        BallotLeaderElection::with(
+            BLEConfig {
+                configuration_id: CONFIG,
+                pid,
+                peers,
+                priority,
+                flexible_quorum: None,
+                buffer_size: 16,
+            },
+            None,
+        )
+    }
+
+    /// A follower whose BLE still names a partitioned leader, but which has
+    /// promised a newer, live leader, must not take over against the stale
+    /// one: that ballot would tie the live leader's round and preempt it.
+    #[test]
+    fn promised_newer_leader_blocks_takeover_against_a_stale_unreachable_leader() {
+        let mut node = ble(1, vec![2, 3], 100);
+        let stale = Ballot::with(CONFIG, 2, 0, 2);
+        let promised = Ballot::with(CONFIG, 3, 0, 3);
+        let follower = (Role::Follower, Phase::Accept);
+        node.set_leader(stale);
+        node.consecutive_unhappy_rounds = 2;
+        // (pid * 7 + round) % (peers + 1) == 0: the backoff admits a takeover now.
+        node.hb_round = 2;
+        node.handle_reply(HeartbeatReply {
+            round: node.hb_round,
+            ballot: Ballot::with(CONFIG, 1, 0, 3),
+            leader: stale,
+            happy: false,
+        });
+        assert_eq!(node.hb_timeout(&follower, promised), None);
+        assert_eq!(node.leader, promised);
+        assert_eq!(node.current_ballot.n, INITIAL_ROUND);
+
+        // The live leader's own reply is delayed, but a peer is happy with it.
+        for _ in 0..6 {
+            node.handle_reply(HeartbeatReply {
+                round: node.hb_round,
+                ballot: Ballot::with(CONFIG, 1, 0, 2),
+                leader: promised,
+                happy: true,
+            });
+            assert_eq!(node.hb_timeout(&follower, promised), None);
+            assert_eq!(node.leader, promised);
         }
     }
 }
