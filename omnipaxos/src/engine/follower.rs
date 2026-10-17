@@ -1,14 +1,14 @@
 use super::{
     commands::Command,
-    state::{Phase, Role},
+    state::{FollowerAck, Phase, Role},
     Engine, EngineAction, LogSyncContinuation,
 };
 use crate::{
-    InlineOrRef,
     ballot_leader_election::Ballot,
     messages::{sequence_paxos::*, Message},
     storage::{Entry, StorageOp},
     util::{MessageStatus, NodeId, SequenceNumber},
+    InlineOrRef,
 };
 use std::sync::Arc;
 
@@ -33,7 +33,10 @@ impl<T: Entry> Engine<T> {
             let num_new = self.s.batched_entries.len();
             let mut ops = Vec::with_capacity(2);
             if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
+                ops.push(StorageOp::AppendEntries(
+                    self.s.batched_entries.clone(),
+                    false,
+                ));
             }
             ops.push(StorageOp::SetPromise(prep.n));
             self.commands.push(Command::WriteAtomic(ops));
@@ -46,7 +49,11 @@ impl<T: Entry> Engine<T> {
 
             self.s.state = (Role::Follower, Phase::Prepare);
             self.s.current_seq_num = SequenceNumber::default();
+            self.s.follower_ack = None;
 
+            // The Promise reports the appended (in-memory) log, durable or
+            // not: hiding a non-durable accepted entry could hide the only
+            // witness of a chosen value.
             let na = self.s.accepted_round;
             let accepted_idx = self.s.accepted_idx;
 
@@ -123,8 +130,37 @@ impl<T: Entry> Engine<T> {
         accsync: AcceptSync<T>,
         from: NodeId,
     ) -> super::EngineAction<T> {
-        if self.check_valid_ballot(accsync.n) && self.s.state == (Role::Follower, Phase::Prepare) {
+        if !self.check_valid_ballot(accsync.n) {
+            return super::EngineAction::Done;
+        }
+        if self.s.state == (Role::Follower, Phase::Accept) {
+            self.handle_acceptsync_in_accept(accsync, from);
+            return super::EngineAction::Done;
+        }
+        if self.s.state == (Role::Follower, Phase::Prepare) {
             let log_sync = accsync.log_sync.into_inner();
+            // The leader built this sync from a Promise of ours. If our
+            // accepted state no longer matches it (e.g. we restarted and
+            // recovered less of the log than we promised with), applying it
+            // could leave a gap or keep a stale suffix: ask to be prepared
+            // again instead.
+            let stale = accsync.promised != (self.s.accepted_round, self.s.accepted_idx)
+                || (log_sync.decided_snapshot.is_none() && log_sync.sync_idx > self.s.accepted_idx);
+            if stale {
+                tracing::warn!(
+                    pid = self.s.pid,
+                    from,
+                    ballot_n = accsync.n.n,
+                    promised_round_n = accsync.promised.0.n,
+                    promised_accepted_idx = accsync.promised.1,
+                    accepted_round_n = self.s.accepted_round.n,
+                    accepted_idx = self.s.accepted_idx,
+                    sync_idx = log_sync.sync_idx,
+                    "accept_sync_does_not_match_promise"
+                );
+                self.reconnected(from);
+                return super::EngineAction::Done;
+            }
             tracing::debug!(
                 pid = self.s.pid,
                 from,
@@ -135,41 +171,67 @@ impl<T: Entry> Engine<T> {
             );
             self.s.cached_promise_message = None;
 
-            // sync_log: emit WriteAtomic
-            let delta_merge =
-                self.sync_log_engine(accsync.n, accsync.decided_idx, Some(log_sync));
+            self.sync_log_engine(accsync.n, accsync.decided_idx, Some(log_sync));
 
             if self.s.stopsign.is_none() {
                 self.forward_buffered_proposals();
             }
 
-            let accepted = Accepted {
-                n: accsync.n,
-                accepted_idx: self.s.accepted_idx,
-            };
             self.s.state = (Role::Follower, Phase::Accept);
             self.s.current_seq_num = accsync.seq_num;
-            let cached_idx = self.outgoing.len();
-            let pushed = self.try_push_message(Message::SequencePaxos(PaxosMessage {
-                from: self.s.pid,
-                to: from,
-                msg: PaxosMsg::Accepted(accepted),
-            }));
-            if pushed {
-                self.s.latest_accepted_meta = Some((accsync.n, cached_idx));
-            }
-
-            if let Some((delta, compact_idx)) = delta_merge {
-                return super::EngineAction::NeedSnapshot {
-                    compact_idx,
-                    continuation: super::SnapshotContinuation::CompleteSyncLogDelta {
-                        delta,
-                        compact_idx,
-                    },
-                };
-            }
+            // The Accepted for this round is sent by on_durability_changed
+            // once the synced log and the round are durable.
+            self.s.follower_ack = Some(FollowerAck {
+                ballot: accsync.n,
+                acked: None,
+            });
         }
         super::EngineAction::Done
+    }
+
+    /// An AcceptSync for our current ballot while we already follow it: the
+    /// leader answered a duplicate Promise (a second Prepare, a resent cached
+    /// Promise, a duplicated message) after an earlier sync of ours, and its
+    /// later messages carry this sync's newer session. If the sync leaves the
+    /// log exactly as we hold it, adopt its session; ignoring it would make
+    /// the next AcceptDecide look like a gap and restart the prepare. A sync
+    /// that does not match our log means we missed messages: ask to be
+    /// prepared again. Older or equal sessions are stale copies.
+    ///
+    /// The `promised` fence does not apply: it was built from the duplicate
+    /// Promise, which predates our current state. Within one round every
+    /// acceptor's log is a prefix of the leader's, so a sync of this round
+    /// ending where our log ends carries exactly our log.
+    fn handle_acceptsync_in_accept(&mut self, accsync: AcceptSync<T>, from: NodeId) {
+        if accsync.seq_num.session <= self.s.current_seq_num.session {
+            return;
+        }
+        let log_sync = accsync.log_sync.into_inner();
+        let sync_head = log_sync.sync_idx + log_sync.suffix.len() as u64;
+        let own_head = self.s.real_log_head() + self.s.batched_entries.len() as u64;
+        if self.s.accepted_round == accsync.n
+            && log_sync.stopsign == self.s.stopsign
+            && sync_head == own_head
+        {
+            tracing::debug!(
+                pid = self.s.pid,
+                from,
+                session = accsync.seq_num.session,
+                "accept_sync_session_adopted"
+            );
+            self.s.current_seq_num = accsync.seq_num;
+            self.update_decided_idx_and_flush(accsync.decided_idx);
+        } else {
+            tracing::warn!(
+                pid = self.s.pid,
+                from,
+                session = accsync.seq_num.session,
+                sync_head,
+                own_head,
+                "accept_sync_does_not_match_log"
+            );
+            self.reconnected(from);
+        }
     }
 
     fn forward_buffered_proposals(&mut self) {
@@ -193,26 +255,14 @@ impl<T: Entry> Engine<T> {
                 "accept_decide_received"
             );
             let entries = Arc::try_unwrap(arc_entries).unwrap_or_else(|arc| (*arc).clone());
-            // Batch the entries
-            let append_res = self.s.append_entries_to_batch(entries);
-            let mut new_accepted_idx: Option<u64> = None;
-            if let Some(flushed_entries) = append_res {
+            // Batch the entries. The Accepted is sent by on_durability_changed
+            // once they are durable.
+            if let Some(flushed_entries) = self.s.append_entries_to_batch(entries) {
                 let num = flushed_entries.len() as u64;
-                self.commands
-                    .push(Command::AppendEntries(flushed_entries));
+                self.commands.push(Command::AppendEntries(flushed_entries));
                 self.s.accepted_idx += num;
-                new_accepted_idx = Some(self.s.accepted_idx);
             }
-
-            // Update decided idx
-            let flushed_after_decide =
-                self.update_decided_idx_and_flush(acc_dec.decided_idx);
-            if flushed_after_decide.is_some() {
-                new_accepted_idx = flushed_after_decide;
-            }
-            if let Some(idx) = new_accepted_idx {
-                self.reply_accepted(acc_dec.n, idx);
-            }
+            self.update_decided_idx_and_flush(acc_dec.decided_idx);
         }
     }
 
@@ -225,10 +275,15 @@ impl<T: Entry> Engine<T> {
             let num_new = self.s.batched_entries.len();
             let mut ops = Vec::with_capacity(2);
             if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
+                ops.push(StorageOp::AppendEntries(
+                    self.s.batched_entries.clone(),
+                    false,
+                ));
             }
-            ops.push(StorageOp::SetStopsign(Some(acc_ss.ss.clone())));
-            self.commands.push(Command::WriteAtomic(ops));
+            self.stage_stopsign(&mut ops, Some(acc_ss.ss.clone()));
+            if !ops.is_empty() {
+                self.commands.push(Command::WriteAtomic(ops));
+            }
             // Update shadow state
             if num_new > 0 {
                 self.s.batched_entries.clear();
@@ -238,8 +293,6 @@ impl<T: Entry> Engine<T> {
                 self.s.accepted_idx += 1;
             }
             self.s.stopsign = Some(acc_ss.ss);
-            let new_accepted_idx = self.s.accepted_idx;
-            self.reply_accepted(acc_ss.n, new_accepted_idx);
         }
     }
 
@@ -253,18 +306,15 @@ impl<T: Entry> Engine<T> {
                 decided_idx = dec.decided_idx,
                 "decide_received"
             );
-            let new_accepted_idx = self.update_decided_idx_and_flush(dec.decided_idx);
-            if let Some(idx) = new_accepted_idx {
-                self.reply_accepted(dec.n, idx);
-            }
+            self.update_decided_idx_and_flush(dec.decided_idx);
         }
     }
 
-    /// Update decided index, flushing batch if needed.
-    /// Returns Some(new_accepted_idx) if entries were flushed.
-    fn update_decided_idx_and_flush(&mut self, new_decided_idx: u64) -> Option<u64> {
+    /// Update decided index, flushing the batch if the decided index reaches
+    /// past the appended log.
+    fn update_decided_idx_and_flush(&mut self, new_decided_idx: u64) {
         if new_decided_idx <= self.s.decided_idx {
-            return None;
+            return;
         }
         if new_decided_idx > self.s.accepted_idx {
             // Need to flush batch to maintain decided <= accepted
@@ -273,7 +323,10 @@ impl<T: Entry> Engine<T> {
             let clamped_decided_idx = new_decided_idx.min(new_accepted_idx);
             let mut ops = Vec::with_capacity(2);
             if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(self.s.batched_entries.clone(), false));
+                ops.push(StorageOp::AppendEntries(
+                    self.s.batched_entries.clone(),
+                    false,
+                ));
             }
             ops.push(StorageOp::SetDecidedIndex(clamped_decided_idx));
             self.commands.push(Command::WriteAtomic(ops));
@@ -282,14 +335,13 @@ impl<T: Entry> Engine<T> {
             }
             self.s.accepted_idx = new_accepted_idx;
             self.s.decided_idx = clamped_decided_idx;
-            Some(new_accepted_idx)
         } else {
             // Simple set decided idx
-            self.commands.push(Command::WriteAtomic(vec![
-                StorageOp::SetDecidedIndex(new_decided_idx),
-            ]));
+            self.commands
+                .push(Command::WriteAtomic(vec![StorageOp::SetDecidedIndex(
+                    new_decided_idx,
+                )]));
             self.s.decided_idx = new_decided_idx;
-            None
         }
     }
 
@@ -347,7 +399,11 @@ impl<T: Entry> Engine<T> {
         }
     }
 
-    fn handle_sequence_num(&mut self, seq_num: crate::util::SequenceNumber, _from: NodeId) -> MessageStatus {
+    fn handle_sequence_num(
+        &mut self,
+        seq_num: crate::util::SequenceNumber,
+        _from: NodeId,
+    ) -> MessageStatus {
         let msg_status = self.s.current_seq_num.check_msg_status(seq_num);
         match msg_status {
             MessageStatus::Expected => self.s.current_seq_num = seq_num,
@@ -361,25 +417,35 @@ impl<T: Entry> Engine<T> {
 
     pub(crate) fn resend_messages_follower(&mut self) {
         match self.s.state.1 {
-            Phase::Prepare => {
-                match &self.s.cached_promise_message {
-                    Some(promise) => {
-                        self.try_push_message(Message::SequencePaxos(PaxosMessage {
-                            from: self.s.pid,
-                            to: promise.n.pid,
-                            msg: PaxosMsg::Promise(promise.clone()),
-                        }));
-                    }
-                    None => {
-                        self.s.state = (Role::Follower, Phase::Recover);
-                        self.send_preparereq_to_all_peers();
-                    }
+            Phase::Prepare => match &self.s.cached_promise_message {
+                Some(promise) => {
+                    self.try_push_message(Message::SequencePaxos(PaxosMessage {
+                        from: self.s.pid,
+                        to: promise.n.pid,
+                        msg: PaxosMsg::Promise(promise.clone()),
+                    }));
                 }
-            }
+                None => {
+                    self.s.state = (Role::Follower, Phase::Recover);
+                    self.send_preparereq_to_all_peers();
+                }
+            },
             Phase::Recover => {
                 self.send_preparereq_to_all_peers();
             }
-            Phase::Accept => (),
+            Phase::Accept => {
+                // The final Accepted of a burst has no other retry: resend
+                // the last durable acknowledgement.
+                if let Some(FollowerAck {
+                    ballot,
+                    acked: Some(acked),
+                }) = self.s.follower_ack
+                {
+                    if ballot == self.s.promise {
+                        self.reply_accepted(ballot, acked);
+                    }
+                }
+            }
             Phase::None => (),
         }
     }
@@ -440,7 +506,6 @@ impl<T: Entry> Engine<T> {
     }
 
     pub(crate) fn flush_batch_follower(&mut self) {
-        let accepted_idx = self.s.accepted_idx;
         if self.s.batched_entries.is_empty() {
             return;
         }
@@ -448,9 +513,5 @@ impl<T: Entry> Engine<T> {
         let num = entries.len() as u64;
         self.commands.push(Command::AppendEntries(entries));
         self.s.accepted_idx += num;
-        let new_accepted_idx = self.s.accepted_idx;
-        if new_accepted_idx > accepted_idx {
-            self.reply_accepted(self.get_promise(), new_accepted_idx);
-        }
     }
 }

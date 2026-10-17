@@ -10,6 +10,14 @@ omnipaxos_storage = { version = "LATEST_VERSION", default-features = true }
 **If** you **do** decide to implement your own storage, we recommend taking a look at `MemoryStorage` as a reference for implementing the functions required by `Storage`.
 Upon receiving a `StorageResult::Error(_)` from the storage implementation, Omnipaxos tries to roll back incomplete changes, to enable crash-recovery, and then panicks.
 
+## Log durability
+A node votes for an entry (a follower's `Accepted`, or the leader counting itself toward a write quorum) only once the entry is durable, so every decided entry is durable on a write quorum. By default `Storage::log_writes_durable_on_return()` is `true`: `Ok` from `write_atomically` means every op is durable, and a node votes for the entries a call appended before that call returns.
+
+A storage backend that makes log writes durable asynchronously (e.g. a group-committed write-ahead log) returns `false` and reports its durable log prefix with `OmniPaxos::on_log_durable(durable_log_len)` whenever it advances. Then:
+- Log ops (`AppendEntry`, `AppendEntries`, `AppendOnPrefix`, and the `SetDecidedIndex`, `Trim` and `SetCompactedIdx` that follow them) may become durable after `write_atomically` returns. The node acknowledges them only once they are reported durable; `get_durable_accepted_idx()` is the index its votes have reached, `get_accepted_idx()` counts every appended entry.
+- `SetPromise`, `SetAcceptedRound` and `SetStopsign` must still be durable when `write_atomically` returns.
+- An AcceptSync arrives as a batch starting with `StorageOp::BeginSync { round, sync_idx }` and carrying no `SetAcceptedRound`. Its log rewrite, and every log write after it, belongs to an uncommitted accept of `round` until a later `SetAcceptedRound(round)` is durable. Recovery before that commit must reproduce the previously committed accepted round and log.
+
 ## MemoryStorage
 `MemoryStorage` is an in-memory storage implementation and it will be used in our examples. For simplicity, we leave out some parts of the implementation for now (such as [Snapshots](../compaction)).
 ```rust

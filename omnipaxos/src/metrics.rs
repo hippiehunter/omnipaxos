@@ -48,11 +48,13 @@ pub enum RunningState {
 pub struct FollowerMetrics {
     /// The follower's node ID.
     pub node_id: NodeId,
-    /// The follower's last known accepted index.
+    /// The follower's last acknowledged accepted index: the prefix durable in
+    /// its storage under the leader's round.
     pub accepted_idx: u64,
     /// Whether the follower has promised to this leader.
     pub is_promised: bool,
-    /// How far behind the leader's accepted_idx this follower is.
+    /// How far the follower's durable `accepted_idx` trails the leader's
+    /// appended accepted index.
     pub replication_lag: u64,
     /// The tick at which the last heartbeat was received from this peer (if tracked).
     pub last_heartbeat_tick: Option<u64>,
@@ -75,7 +77,7 @@ pub struct Metrics {
     pub promise: Ballot,
     /// The decided log index.
     pub decided_idx: u64,
-    /// The accepted log index.
+    /// The accepted log index: every appended entry, durable or not.
     pub accepted_idx: u64,
     /// The compacted log index.
     pub compacted_idx: u64,

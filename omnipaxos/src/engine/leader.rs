@@ -1,14 +1,14 @@
 use super::{
-    Engine, EngineAction, LogSyncContinuation, LogSyncRequest,
     commands::Command,
-    state::{Phase, Role},
+    state::{PendingCommit, Phase, Role},
+    Engine, EngineAction, LogSyncContinuation, LogSyncRequest,
 };
 use crate::{
-    InlineOrRef, ReadBarrier, ReadError, TransferError,
     ballot_leader_election::Ballot,
-    messages::{Message, sequence_paxos::*},
+    messages::{sequence_paxos::*, Message},
     storage::{Entry, StopSign, StorageOp},
     util::{AcceptedMetaData, LeaderState, NodeId, PromiseMetaData},
+    InlineOrRef, ReadBarrier, ReadError, TransferError,
 };
 use std::sync::Arc;
 
@@ -33,6 +33,7 @@ impl<T: Entry> Engine<T> {
             );
             self.s.leader_state =
                 LeaderState::with(n, &self.s.peers, self.s.pid, self.s.leader_state.quorum);
+            self.s.follower_ack = None;
 
             // Emit command: flush batch + set promise atomically
             let num_new = self.s.batched_entries.len();
@@ -159,42 +160,25 @@ impl<T: Entry> Engine<T> {
     }
 
     pub(crate) fn accept_entry_leader(&mut self, entry: T) {
-        let append_res = self.s.append_entry_to_batch(entry);
-        if let Some(flushed_entries) = append_res {
-            let shared = Arc::new(flushed_entries.clone());
-            // Emit append command
-            self.commands.push(Command::AppendEntries(flushed_entries));
-            let num = shared.len() as u64;
-            self.s.accepted_idx += num;
-            let metadata = AcceptedMetaData {
-                accepted_idx: self.s.accepted_idx,
-                entries: shared,
-            };
-            self.s
-                .leader_state
-                .set_accepted_idx(self.s.pid, metadata.accepted_idx);
-            self.send_acceptdecide(metadata);
-            self.try_decide_self_accepted();
+        if let Some(flushed_entries) = self.s.append_entry_to_batch(entry) {
+            self.append_and_replicate_leader(flushed_entries);
         }
     }
 
     pub(crate) fn accept_entries_leader(&mut self, entries: Vec<T>) {
-        let append_res = self.s.append_entries_to_batch(entries);
-        if let Some(flushed_entries) = append_res {
-            let shared = Arc::new(flushed_entries.clone());
-            self.commands.push(Command::AppendEntries(flushed_entries));
-            let num = shared.len() as u64;
-            self.s.accepted_idx += num;
-            let metadata = AcceptedMetaData {
-                accepted_idx: self.s.accepted_idx,
-                entries: shared,
-            };
-            self.s
-                .leader_state
-                .set_accepted_idx(self.s.pid, metadata.accepted_idx);
-            self.send_acceptdecide(metadata);
-            self.try_decide_self_accepted();
+        if let Some(flushed_entries) = self.s.append_entries_to_batch(entries) {
+            self.append_and_replicate_leader(flushed_entries);
         }
+    }
+
+    /// Append flushed entries to the leader's log and pipeline them to the
+    /// followers. The leader's own vote for them is cast by
+    /// `on_durability_changed` once they are durable.
+    fn append_and_replicate_leader(&mut self, entries: Vec<T>) {
+        let shared = Arc::new(entries.clone());
+        self.commands.push(Command::AppendEntries(entries));
+        self.s.accepted_idx += shared.len() as u64;
+        self.send_acceptdecide(AcceptedMetaData { entries: shared });
     }
 
     pub(crate) fn accept_stopsign_leader(&mut self, ss: StopSign) {
@@ -208,15 +192,16 @@ impl<T: Entry> Engine<T> {
                 false,
             ));
         }
-        ops.push(StorageOp::SetStopsign(Some(ss.clone())));
-        self.commands.push(Command::WriteAtomic(ops));
+        self.stage_stopsign(&mut ops, Some(ss.clone()));
+        if !ops.is_empty() {
+            self.commands.push(Command::WriteAtomic(ops));
+        }
 
         // Update shadow state
         let accepted_entries_metadata = if has_batched {
             let entries = self.s.take_batched_entries();
             self.s.accepted_idx += num_new as u64;
             Some(AcceptedMetaData {
-                accepted_idx: self.s.accepted_idx,
                 entries: Arc::new(entries),
             })
         } else {
@@ -228,16 +213,10 @@ impl<T: Entry> Engine<T> {
         if let Some(metadata) = accepted_entries_metadata {
             self.send_acceptdecide(metadata);
         }
-        let accepted_idx = self.s.accepted_idx;
-        self.s
-            .leader_state
-            .set_accepted_idx(self.s.pid, accepted_idx);
-        // Send AcceptStopSign to followers BEFORE potentially deciding
         let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
         for pid in followers {
             self.send_accept_stopsign(pid, ss.clone(), false);
         }
-        self.try_decide_self_accepted();
     }
 
     /// Build AcceptSync message. This needs storage reads (create_log_sync),
@@ -269,20 +248,22 @@ impl<T: Entry> Engine<T> {
         // log frontier or the follower re-counts the StopSign on top of an
         // already-inclusive index, deciding the StopSign one slot higher
         // than the original quorum did (divergent config_base_lsn).
-        let real_log_head = self.s.accepted_idx - u64::from(self.s.stopsign.is_some());
-        let followers_valid_entries_idx = followers_valid_entries_idx.min(real_log_head);
+        let followers_valid_entries_idx = followers_valid_entries_idx.min(self.s.real_log_head());
         (followers_valid_entries_idx, followers_decided_idx)
     }
 
     /// Complete sending AcceptSync after Runtime has built the LogSync.
     pub(crate) fn complete_accsync(&mut self, to: NodeId, log_sync: crate::util::LogSync<T>) {
         let current_n = self.s.leader_state.n_leader;
+        let promise_meta = self.s.leader_state.get_promise_meta(to);
+        let promised = (promise_meta.n_accepted, promise_meta.accepted_idx);
         self.s.leader_state.increment_seq_num_session(to);
         let acc_sync = AcceptSync {
             n: current_n,
             seq_num: self.s.leader_state.next_seq_num(to),
             decided_idx: self.s.decided_idx,
             log_sync: InlineOrRef::Inline(log_sync),
+            promised,
         };
         let msg = Message::SequencePaxos(PaxosMessage {
             from: self.s.pid,
@@ -301,8 +282,7 @@ impl<T: Entry> Engine<T> {
                 Some(accdec) => {
                     match &mut accdec.entries {
                         InlineOrRef::Inline(arc_entries) => {
-                            Arc::make_mut(arc_entries)
-                                .extend(accepted.entries.iter().cloned());
+                            Arc::make_mut(arc_entries).extend(accepted.entries.iter().cloned());
                         }
                         InlineOrRef::Ref(_) => {
                             // Outgoing messages from the leader are always Inline.
@@ -373,11 +353,7 @@ impl<T: Entry> Engine<T> {
         let max_promise_sync = self.s.leader_state.take_max_promise_sync();
         let decided_idx = self.s.leader_state.get_max_decided_idx();
 
-        // Sync log: emit WriteAtomic command
-        // Delta merge on the leader path is a no-op: the leader already has the
-        // full log and the trim/compacted_idx are set correctly by sync_log_engine.
-        let _delta_merge =
-            self.sync_log_engine(self.s.leader_state.n_leader, decided_idx, max_promise_sync);
+        self.sync_log_engine(self.s.leader_state.n_leader, decided_idx, max_promise_sync);
 
         if !self.accepted_reconfiguration() {
             if !self.s.buffered_proposals.is_empty() {
@@ -391,12 +367,9 @@ impl<T: Entry> Engine<T> {
             }
         }
 
+        // The leader's own vote is cast by on_durability_changed once the
+        // synced log is durable under this round.
         self.s.state = (Role::Leader, Phase::Accept);
-        let new_accepted_idx = self.s.accepted_idx;
-        self.s
-            .leader_state
-            .set_accepted_idx(self.s.pid, new_accepted_idx);
-        self.try_decide_self_accepted();
 
         // Now need to send AcceptSync to all followers - this requires storage reads
         let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
@@ -418,32 +391,71 @@ impl<T: Entry> Engine<T> {
 
     /// Helper to accept stopsign after sync (during handle_majority_promises).
     fn accept_stopsign_after_sync(&mut self, ss: StopSign) {
-        let ops = vec![StorageOp::SetStopsign(Some(ss.clone()))];
-        self.commands.push(Command::WriteAtomic(ops));
+        let mut ops = Vec::with_capacity(1);
+        self.stage_stopsign(&mut ops, Some(ss.clone()));
+        if !ops.is_empty() {
+            self.commands.push(Command::WriteAtomic(ops));
+        }
         self.s.stopsign = Some(ss);
         self.s.accepted_idx += 1;
     }
 
-    /// Sync log: compute ops and emit WriteAtomic command.
-    /// Returns `Some((delta, compact_idx))` if a delta snapshot merge is needed
-    /// (requiring async storage reads), or `None` if fully handled synchronously.
+    /// Sync log: compute ops and emit the WriteAtomic command that applies
+    /// `log_sync`. A delta snapshot is merged into the stored snapshot together
+    /// with this node's own decided entries below the delta, in the same atomic
+    /// write that trims them, so the trimmed prefix stays readable from the
+    /// snapshot (and a later AcceptSync this node sends can ship it).
+    ///
+    /// With storage whose log writes are durable on return, the batch sets the
+    /// accepted round directly. Otherwise it opens the accept with
+    /// `BeginSync` and leaves `SetAcceptedRound` (and any StopSign change) to
+    /// the pending commit that `on_durability_changed` writes once the synced
+    /// log is durable: a crash before then recovers the previous round's log.
     pub(crate) fn sync_log_engine(
         &mut self,
         accepted_round: Ballot,
         decided_idx: u64,
         log_sync: Option<crate::util::LogSync<T>>,
-    ) -> Option<(T::Snapshot, u64)> {
+    ) {
         use crate::storage::SnapshotType;
 
+        let async_durability = self.s.async_log_durability;
+        let old_compacted_idx = self.s.compacted_idx;
+        let old_decided_idx = self.s.get_decided_idx_without_stopsign();
         let mut new_compacted_idx = self.s.compacted_idx;
         let mut new_stopsign = self.s.stopsign.clone();
         let mut new_accepted_idx = self.s.accepted_idx;
-        let mut needs_delta_merge: Option<(T::Snapshot, u64)> = None;
+        // (delta, position of its SetSnapshot in the batch, delta start)
+        let mut delta_snapshot: Option<(T::Snapshot, usize, u64)> = None;
+        let mut stopsign_change: Option<Option<StopSign>> = None;
+        let old_real_log_head = self.s.real_log_head();
+        let sync_idx = log_sync
+            .as_ref()
+            .map_or(old_real_log_head, |sync| sync.sync_idx);
+        // A snapshot replaces the log below sync_idx as well.
+        let mut unchanged_prefix = match log_sync.as_ref().map(|sync| &sync.decided_snapshot) {
+            Some(Some(_)) => sync_idx.min(old_real_log_head),
+            _ => sync_idx,
+        };
+        // A superseded uncommitted sync commits together with this one: its
+        // rewrite stays uncommitted, and its StopSign change, not in storage
+        // yet, is written with this sync unless this sync changes it again.
+        let mut superseded_stopsign = None;
+        if let Some(superseded) = self.s.pending_commit.take() {
+            unchanged_prefix = unchanged_prefix.min(superseded.unchanged_prefix);
+            superseded_stopsign = superseded.stopsign;
+        }
 
-        let mut sync_txn: Vec<StorageOp<T>> = vec![
-            StorageOp::SetAcceptedRound(accepted_round),
-            StorageOp::SetDecidedIndex(decided_idx),
-        ];
+        let mut sync_txn: Vec<StorageOp<T>> = Vec::with_capacity(6);
+        if async_durability {
+            sync_txn.push(StorageOp::BeginSync {
+                round: accepted_round,
+                sync_idx,
+            });
+        } else {
+            sync_txn.push(StorageOp::SetAcceptedRound(accepted_round));
+        }
+        sync_txn.push(StorageOp::SetDecidedIndex(decided_idx));
 
         if let Some(sync) = log_sync {
             match sync.decided_snapshot {
@@ -454,38 +466,65 @@ impl<T: Entry> Engine<T> {
                     sync_txn.push(StorageOp::SetSnapshot(Some(c)));
                 }
                 Some(SnapshotType::Delta(d)) => {
-                    needs_delta_merge = Some((d, sync.sync_idx));
+                    // The sender built the delta from our decided index:
+                    // our own decided entries below it are folded in.
                     new_compacted_idx = sync.sync_idx;
                     sync_txn.push(StorageOp::Trim(sync.sync_idx));
                     sync_txn.push(StorageOp::SetCompactedIdx(sync.sync_idx));
-                    // Snapshot will be set by Runtime after merge
+                    delta_snapshot = Some((d, sync_txn.len(), old_decided_idx.min(sync.sync_idx)));
                 }
                 None => (),
             }
             new_accepted_idx = sync.sync_idx + sync.suffix.len() as u64;
             sync_txn.push(StorageOp::AppendOnPrefix(sync.sync_idx, sync.suffix, false));
+            // The rewritten suffix is durable only once the host reports it.
+            self.s.durable_log_idx = self.s.durable_log_idx.min(sync.sync_idx);
             match sync.stopsign {
                 Some(ss) => {
                     new_stopsign = Some(ss.clone());
                     new_accepted_idx += 1;
-                    sync_txn.push(StorageOp::SetStopsign(Some(ss)));
+                    stopsign_change = Some(Some(ss));
                 }
                 None if new_stopsign.is_some() => {
                     new_stopsign = None;
-                    sync_txn.push(StorageOp::SetStopsign(None));
+                    stopsign_change = Some(None);
                 }
                 None => (),
             }
         }
+        let stopsign_change = stopsign_change.or(superseded_stopsign);
 
-        self.commands.push(Command::WriteAtomic(sync_txn));
+        if async_durability {
+            self.s.pending_commit = Some(PendingCommit {
+                round: accepted_round,
+                unchanged_prefix,
+                head: new_accepted_idx - u64::from(new_stopsign.is_some()),
+                stopsign: stopsign_change,
+            });
+        } else {
+            if let Some(ss) = stopsign_change {
+                sync_txn.push(StorageOp::SetStopsign(ss));
+            }
+            self.s.durable_accepted_round = accepted_round;
+        }
+
+        match delta_snapshot {
+            Some((delta, snapshot_at, own_to)) => {
+                self.commands.push(Command::WriteAtomicWithDelta {
+                    ops: sync_txn,
+                    snapshot_at,
+                    own_from: old_compacted_idx,
+                    own_to: own_to.max(old_compacted_idx),
+                    delta,
+                })
+            }
+            None => self.commands.push(Command::WriteAtomic(sync_txn)),
+        }
         self.s.accepted_round = accepted_round;
         self.s.decided_idx = decided_idx;
         self.s.compacted_idx = new_compacted_idx;
         self.s.stopsign = new_stopsign;
         self.s.accepted_idx = new_accepted_idx;
-
-        needs_delta_merge
     }
 
     pub(crate) fn handle_promise_prepare(
@@ -530,40 +569,15 @@ impl<T: Entry> Engine<T> {
                 accepted_idx = accepted.accepted_idx,
                 "accepted_received"
             );
+            // A follower's accepted index is durable in its storage under
+            // this round, so it counts toward a write quorum.
             self.s
                 .leader_state
                 .set_accepted_idx(from, accepted.accepted_idx);
             self.s.leader_state.record_follower_ack(from);
             // Check if a pending transfer target has caught up
             self.check_transfer_on_accepted(from);
-            if accepted.accepted_idx > self.s.decided_idx
-                && self.s.leader_state.is_chosen(accepted.accepted_idx)
-            {
-                let decided_idx = accepted.accepted_idx;
-                {
-                    let old_idx = self.s.decided_idx;
-                    tracing::info!(
-                        pid = self.s.pid,
-                        old_idx,
-                        new_idx = decided_idx,
-                        count = decided_idx - old_idx,
-                        "entries_decided"
-                    );
-                }
-                self.commands
-                    .push(Command::WriteAtomic(vec![StorageOp::SetDecidedIndex(
-                        decided_idx,
-                    )]));
-                self.s.decided_idx = decided_idx;
-                let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
-                for pid in followers {
-                    let latest_accdec = self.get_latest_accdec_message(pid);
-                    match latest_accdec {
-                        Some(accdec) => accdec.decided_idx = decided_idx,
-                        None => self.send_decide(pid, decided_idx, false),
-                    }
-                }
-            }
+            self.try_decide_chosen();
         }
     }
 
@@ -627,19 +641,31 @@ impl<T: Entry> Engine<T> {
         }
     }
 
-    /// Check if leader's own accept forms a quorum and advance decided_idx.
-    pub(crate) fn try_decide_self_accepted(&mut self) {
-        let accepted_idx = self.s.leader_state.get_accepted_idx(self.s.pid);
-        if accepted_idx > self.s.decided_idx && self.s.leader_state.is_chosen(accepted_idx) {
-            self.commands
-                .push(Command::WriteAtomic(vec![StorageOp::SetDecidedIndex(
-                    accepted_idx,
-                )]));
-            self.s.decided_idx = accepted_idx;
-            let decided_idx = self.s.decided_idx;
-            let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
-            for pid in followers {
-                self.send_decide(pid, decided_idx, false);
+    /// Decide up to the highest index a write quorum of promised nodes has
+    /// durably accepted, and tell the followers.
+    pub(crate) fn try_decide_chosen(&mut self) {
+        let chosen = self.s.leader_state.quorum_accepted_idx();
+        if chosen <= self.s.decided_idx {
+            return;
+        }
+        let old_idx = self.s.decided_idx;
+        tracing::info!(
+            pid = self.s.pid,
+            old_idx,
+            new_idx = chosen,
+            count = chosen - old_idx,
+            "entries_decided"
+        );
+        self.commands
+            .push(Command::WriteAtomic(vec![StorageOp::SetDecidedIndex(
+                chosen,
+            )]));
+        self.s.decided_idx = chosen;
+        let followers: Vec<NodeId> = self.s.leader_state.get_promised_followers().to_vec();
+        for pid in followers {
+            match self.get_latest_accdec_message(pid) {
+                Some(accdec) => accdec.decided_idx = chosen,
+                None => self.send_decide(pid, chosen, false),
             }
         }
     }
@@ -825,47 +851,7 @@ impl<T: Entry> Engine<T> {
         if self.s.batched_entries.is_empty() {
             return;
         }
-        let projected_accepted_idx = self.s.accepted_idx + self.s.batched_entries.len() as u64;
-        let old_accepted_idx = self.s.leader_state.get_accepted_idx(self.s.pid);
-        self.s
-            .leader_state
-            .set_accepted_idx(self.s.pid, projected_accepted_idx);
-
-        let decided_idx = if projected_accepted_idx > self.s.decided_idx
-            && self.s.leader_state.is_chosen(projected_accepted_idx)
-        {
-            projected_accepted_idx
-        } else {
-            self.s.decided_idx
-        };
-
         let entries = self.s.take_batched_entries();
-        if entries.is_empty() {
-            // Shouldn't happen since we checked above, but be safe
-            self.s
-                .leader_state
-                .set_accepted_idx(self.s.pid, old_accepted_idx);
-            return;
-        }
-
-        let num_new = entries.len() as u64;
-        let entries_for_msg = entries.clone();
-        let new_accepted_idx = self.s.accepted_idx + num_new;
-        let clamped_decided_idx = decided_idx.min(new_accepted_idx);
-
-        // Emit atomic flush + decide
-        self.commands.push(Command::WriteAtomic(vec![
-            StorageOp::AppendEntries(entries, false),
-            StorageOp::SetDecidedIndex(clamped_decided_idx),
-        ]));
-
-        self.s.accepted_idx = new_accepted_idx;
-        self.s.decided_idx = clamped_decided_idx;
-
-        let metadata = AcceptedMetaData {
-            accepted_idx: new_accepted_idx,
-            entries: Arc::new(entries_for_msg),
-        };
-        self.send_acceptdecide(metadata);
+        self.append_and_replicate_leader(entries);
     }
 }

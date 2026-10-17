@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 /// Struct used to help another server synchronize their log with the current state of our own log.
-#[derive(Clone, Debug)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LogSync<T>
 where
@@ -247,6 +246,7 @@ where
     /// promised ones). This is conservative: disconnected nodes retain their last-known
     /// accepted_idx (initialized to 0), so trim is blocked until all nodes catch up.
     /// This prevents trimming entries that a disconnected node still needs.
+    /// Every accepted index here, the leader's own included, is a durable vote.
     pub fn get_min_all_accepted_idx(&self) -> u64 {
         self.accepted_indexes.iter().copied().min().unwrap_or(0)
     }
@@ -311,18 +311,27 @@ where
             .collect()
     }
 
-    /// Returns true if a quorum of *promised* nodes have accepted up to `idx`.
-    pub fn is_chosen(&self, idx: u64) -> bool {
-        let mut count = 0;
-        for (i, p) in self.promises_meta.iter().enumerate() {
-            if matches!(p, PromiseState::Promised(_)) && self.accepted_indexes[i] >= idx {
-                count += 1;
-                if self.quorum.is_accept_quorum(count) {
-                    return true;
-                }
-            }
-        }
-        false
+    /// Returns the highest index that a write quorum of *promised* nodes has
+    /// accepted: the write-quorum-th largest accepted index among them, or 0
+    /// without a write quorum of promised nodes. Accepted indexes are durable
+    /// votes, so everything below the result is chosen.
+    pub fn quorum_accepted_idx(&self) -> u64 {
+        let promised_accepted = || {
+            self.promises_meta
+                .iter()
+                .zip(&self.accepted_indexes)
+                .filter(|(p, _)| matches!(p, PromiseState::Promised(_)))
+                .map(|(_, &idx)| idx)
+        };
+        // Cluster sizes are small: count instead of sorting to stay off the
+        // allocator on every Accepted.
+        promised_accepted()
+            .filter(|&candidate| {
+                let at_least = promised_accepted().filter(|&idx| idx >= candidate).count();
+                self.quorum.is_accept_quorum(at_least)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     // --- Per-follower backpressure ---
@@ -484,8 +493,19 @@ pub(crate) enum MessageStatus {
 }
 
 /// Keeps track of the ordering of messages in the accept phase
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SequenceNumber {
     /// Meant to refer to a TCP session
@@ -530,8 +550,7 @@ impl LogicalClock {
 
 /// Flexible quorums can be used to increase/decrease the read and write quorum sizes,
 /// for different latency vs fault tolerance tradeoffs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(any(feature = "serde", feature = "toml_config"), derive(Deserialize))]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct FlexibleQuorum {
@@ -602,7 +621,6 @@ impl Quorum {
 
 /// The entries flushed due to an append operation
 pub(crate) struct AcceptedMetaData<T: Entry> {
-    pub accepted_idx: u64,
     pub entries: Arc<Vec<T>>,
 }
 
@@ -636,34 +654,82 @@ mod tests {
         assert_eq!(prep_peers, peers);
     }
 
+    fn promise(leader: NodeId) -> Promise<Value> {
+        Promise {
+            n: Ballot::with(1, 1, 1, leader),
+            n_accepted: Ballot::default(),
+            decided_idx: 0,
+            accepted_idx: 0,
+            log_sync: None,
+        }
+    }
+
     #[test]
-    fn non_contiguous_pid_is_chosen() {
+    fn non_contiguous_pid_quorum_accepted_idx() {
         let self_pid = 3;
         let peers = vec![7, 100];
         let quorum = Quorum::Majority(2);
         let mut ls =
             LeaderState::<Value>::with(Ballot::with(1, 1, 1, self_pid), &peers, self_pid, quorum);
-        // Self promised
-        let prom = crate::messages::sequence_paxos::Promise {
-            n: Ballot::with(1, 1, 1, self_pid),
-            n_accepted: Ballot::default(),
-            decided_idx: 0,
-            accepted_idx: 0,
-            log_sync: None,
-        };
-        ls.set_promise(prom, self_pid, true);
+        ls.set_promise(promise(self_pid), self_pid, true);
         ls.set_accepted_idx(self_pid, 5);
-        // Node 7 promised
-        let prom7 = crate::messages::sequence_paxos::Promise {
-            n: Ballot::with(1, 1, 1, self_pid),
-            n_accepted: Ballot::default(),
-            decided_idx: 0,
-            accepted_idx: 0,
-            log_sync: None,
-        };
-        ls.set_promise(prom7, 7, true);
+        // A lone vote is not a quorum.
+        assert_eq!(ls.quorum_accepted_idx(), 0);
+        ls.set_promise(promise(self_pid), 7, true);
         ls.set_accepted_idx(7, 5);
-        assert!(ls.is_chosen(5));
-        assert!(!ls.is_chosen(6));
+        assert_eq!(ls.quorum_accepted_idx(), 5);
+    }
+
+    #[test]
+    fn quorum_accepted_idx_is_the_write_quorum_order_statistic() {
+        let self_pid = 1;
+        let peers = vec![2, 3, 4, 5];
+        let mut ls = LeaderState::<Value>::with(
+            Ballot::with(1, 1, 1, self_pid),
+            &peers,
+            self_pid,
+            Quorum::Majority(3),
+        );
+        for pid in [1, 2, 3, 4, 5] {
+            ls.set_promise(promise(self_pid), pid, true);
+        }
+        // The leader's own vote may lag its followers'.
+        for (pid, idx) in [(1, 2), (2, 9), (3, 7), (4, 4), (5, 0)] {
+            ls.set_accepted_idx(pid, idx);
+        }
+        assert_eq!(ls.quorum_accepted_idx(), 4);
+
+        // Only promised nodes vote: a node promised higher drops out.
+        ls.lost_promise(4);
+        assert_eq!(ls.quorum_accepted_idx(), 2);
+        ls.lost_promise(2);
+        ls.lost_promise(3);
+        assert_eq!(ls.quorum_accepted_idx(), 0);
+    }
+
+    #[test]
+    fn quorum_accepted_idx_uses_the_flexible_write_quorum() {
+        let self_pid = 1;
+        let peers = vec![2, 3, 4, 5];
+        let mut ls = LeaderState::<Value>::with(
+            Ballot::with(1, 1, 1, self_pid),
+            &peers,
+            self_pid,
+            Quorum::Flexible(FlexibleQuorum {
+                read_quorum_size: 4,
+                write_quorum_size: 2,
+            }),
+        );
+        for pid in [1, 2, 3, 4] {
+            ls.set_promise(promise(self_pid), pid, true);
+        }
+        for (pid, idx) in [(1, 3), (2, 8), (3, 6), (4, 1), (5, 10)] {
+            ls.set_accepted_idx(pid, idx);
+        }
+        // Node 5 never promised, so its 10 does not count: the second
+        // largest promised vote is 6.
+        assert_eq!(ls.quorum_accepted_idx(), 6);
+        ls.set_accepted_idx(2, 0);
+        assert_eq!(ls.quorum_accepted_idx(), 3);
     }
 }

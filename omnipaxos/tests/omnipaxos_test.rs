@@ -1,9 +1,9 @@
 use omnipaxos::{
-    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
-    messages::Message,
     messages::sequence_paxos::PaxosMsg,
-    storage::{Storage as _, memory_storage::MemoryStorage},
+    messages::Message,
+    storage::{memory_storage::MemoryStorage, Storage as _},
     util::LogEntry,
+    ClusterConfig, OmniPaxos, OmniPaxosConfig, ServerConfig,
 };
 use std::collections::HashMap;
 
@@ -163,7 +163,7 @@ fn test_basic_replication() {
         for (&pid, node) in &cluster.nodes {
             let decided_idx = node.get_decided_idx();
             assert_eq!(
-                decided_idx, num_entries as u64,
+                decided_idx, num_entries,
                 "node {} should have decided {} entries, got {}",
                 pid, num_entries, decided_idx
             );
@@ -226,7 +226,7 @@ fn test_follower_forwarding() {
         for (&pid, node) in &cluster.nodes {
             let decided_idx = node.get_decided_idx();
             assert_eq!(
-                decided_idx, num_entries as u64,
+                decided_idx, num_entries,
                 "node {} should have decided {} entries, got {}",
                 pid, num_entries, decided_idx
             );
@@ -312,7 +312,7 @@ fn test_non_contiguous_pids() {
         for (&pid, node) in &cluster.nodes {
             let decided_idx = node.get_decided_idx();
             assert_eq!(
-                decided_idx, num_entries as u64,
+                decided_idx, num_entries,
                 "node {} should have decided {} entries, got {}",
                 pid, num_entries, decided_idx
             );
@@ -335,7 +335,7 @@ fn test_trim() {
 
         // Verify all decided.
         for node in cluster.nodes.values() {
-            assert_eq!(node.get_decided_idx(), num_entries as u64);
+            assert_eq!(node.get_decided_idx(), num_entries);
         }
 
         // Trim: must be called on the leader and only up to the min decided idx of all nodes.
@@ -383,7 +383,7 @@ fn test_snapshot() {
 
         // Verify all decided.
         for node in cluster.nodes.values() {
-            assert_eq!(node.get_decided_idx(), num_entries as u64);
+            assert_eq!(node.get_decided_idx(), num_entries);
         }
 
         // Snapshot the first 5 entries on all nodes.
@@ -450,7 +450,7 @@ fn test_single_node_replication() {
         let node = cluster.nodes.get(&1).unwrap();
         assert_eq!(
             node.get_decided_idx(),
-            num_entries as u64,
+            num_entries,
             "single node should decide all entries"
         );
 

@@ -42,7 +42,8 @@ impl<T: Entry> MemoryStorage<T> {
             StorageOp::AppendEntry(entry, _decided) => self.log.push_back(entry),
             StorageOp::AppendEntries(entries, _decided) => self.log.extend(entries),
             StorageOp::AppendOnPrefix(from_idx, entries, _decided) => {
-                self.log.truncate(from_idx.saturating_sub(self.trimmed_idx) as usize);
+                self.log
+                    .truncate(from_idx.saturating_sub(self.trimmed_idx) as usize);
                 self.log.extend(entries);
             }
             StorageOp::SetPromise(bal) => self.n_prom = Some(bal),
@@ -56,6 +57,7 @@ impl<T: Entry> MemoryStorage<T> {
             }
             StorageOp::SetStopsign(ss) => self.stopsign = ss,
             StorageOp::SetSnapshot(snap) => self.snapshot = snap,
+            StorageOp::BeginSync { .. } => {}
         }
     }
 }

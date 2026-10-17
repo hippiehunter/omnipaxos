@@ -7,22 +7,19 @@
 pub(crate) mod commands;
 pub(crate) mod state;
 
-pub(crate) mod leader;
 pub(crate) mod follower;
+pub(crate) mod leader;
 
 pub(crate) use state::{Phase, Role};
 
 use crate::{
     ballot_leader_election::Ballot,
-    messages::{
-        sequence_paxos::*,
-        Message,
-    },
-    storage::{Entry, StopSign},
+    messages::{sequence_paxos::*, Message},
+    storage::{Entry, StopSign, StorageOp},
     util::{LeaderState, NodeId, Quorum, SequenceNumber},
 };
 use commands::Command;
-use state::EngineState;
+use state::{EngineState, FollowerAck};
 
 /// The pure, synchronous Paxos engine.
 ///
@@ -68,6 +65,10 @@ impl<T: Entry> Engine<T> {
         };
 
         let leader_state = LeaderState::<T>::with(leader_ballot, &peers, pid, quorum);
+        let accepted_round = initial_state.accepted_round.unwrap_or_default();
+        // Everything loaded from storage is durable.
+        let durable_log_idx =
+            initial_state.accepted_idx - u64::from(initial_state.stopsign.is_some());
 
         Engine {
             s: EngineState {
@@ -89,11 +90,16 @@ impl<T: Entry> Engine<T> {
                 batch_size,
                 batched_entries: Vec::with_capacity(batch_size),
                 promise: initial_state.promise.unwrap_or_default(),
-                accepted_round: initial_state.accepted_round.unwrap_or_default(),
+                accepted_round,
                 decided_idx: initial_state.decided_idx,
                 accepted_idx: initial_state.accepted_idx,
                 compacted_idx: initial_state.compacted_idx,
                 stopsign: initial_state.stopsign,
+                async_log_durability: initial_state.async_log_durability,
+                durable_log_idx,
+                durable_accepted_round: accepted_round,
+                pending_commit: None,
+                follower_ack: None,
             },
             outgoing,
             commands: Vec::new(),
@@ -187,6 +193,69 @@ impl<T: Entry> Engine<T> {
 
     pub(crate) fn accepted_reconfiguration(&self) -> bool {
         self.s.stopsign.is_some()
+    }
+
+    // --- Log durability ---
+
+    /// Stage a StopSign change. While an AcceptSync is uncommitted the change
+    /// is written with its commit, since storage must not hold it under the
+    /// previous round; otherwise it is appended to `ops`.
+    pub(crate) fn stage_stopsign(&mut self, ops: &mut Vec<StorageOp<T>>, ss: Option<StopSign>) {
+        match &mut self.s.pending_commit {
+            Some(pending) => pending.stopsign = Some(ss),
+            None => ops.push(StorageOp::SetStopsign(ss)),
+        }
+    }
+
+    /// Act on the durable state after `durable_log_idx`, a pending commit, or
+    /// the role changed: commit a pending AcceptSync whose log is durable,
+    /// then cast this node's vote for its committed accepted index — the
+    /// leader's self-vote, or a follower's `Accepted`. Votes never cover an
+    /// entry that is not durable under the voted round.
+    pub(crate) fn on_durability_changed(&mut self) {
+        let durable_log_idx = self.s.durable_log_idx;
+        if let Some(pending) = self
+            .s
+            .pending_commit
+            .take_if(|pending| durable_log_idx >= pending.head)
+        {
+            let mut ops = Vec::with_capacity(2);
+            if let Some(ss) = pending.stopsign {
+                ops.push(StorageOp::SetStopsign(ss));
+            }
+            ops.push(StorageOp::SetAcceptedRound(pending.round));
+            self.commands.push(Command::WriteAtomic(ops));
+            self.s.durable_accepted_round = pending.round;
+        }
+        match self.s.state {
+            (Role::Leader, Phase::Accept) => {
+                let n_leader = self.s.leader_state.n_leader;
+                if let Some(frontier) = self.s.vote_frontier(n_leader) {
+                    if frontier > self.s.leader_state.get_accepted_idx(self.s.pid) {
+                        self.s.leader_state.set_accepted_idx(self.s.pid, frontier);
+                        self.try_decide_chosen();
+                    }
+                }
+            }
+            (Role::Follower, Phase::Accept) => {
+                let Some(ack) = self.s.follower_ack else {
+                    return;
+                };
+                if ack.ballot != self.s.promise {
+                    return;
+                }
+                if let Some(frontier) = self.s.vote_frontier(ack.ballot) {
+                    if ack.acked.is_none_or(|acked| frontier > acked) {
+                        self.reply_accepted(ack.ballot, frontier);
+                        self.s.follower_ack = Some(FollowerAck {
+                            ballot: ack.ballot,
+                            acked: Some(frontier),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     // --- Proposal handling ---
@@ -287,9 +356,7 @@ impl<T: Entry> Engine<T> {
                 (Role::Leader, Phase::Accept) => self.handle_promise_accept(prom, m.from),
                 _ => EngineAction::Done,
             },
-            PaxosMsg::AcceptSync(acc_sync) => {
-                self.handle_acceptsync(acc_sync, m.from)
-            }
+            PaxosMsg::AcceptSync(acc_sync) => self.handle_acceptsync(acc_sync, m.from),
             PaxosMsg::AcceptDecide(acc) => {
                 self.handle_acceptdecide(acc);
                 EngineAction::Done
@@ -440,6 +507,7 @@ pub(crate) struct InitialEngineState {
     pub compacted_idx: u64,
     pub stopsign: Option<StopSign>,
     pub flexible_quorum: Option<crate::util::FlexibleQuorum>,
+    pub async_log_durability: bool,
 }
 
 /// Return type for Engine methods that may need async storage reads.
@@ -462,7 +530,7 @@ pub(crate) enum EngineAction<T: Entry> {
     /// Need to build/merge a snapshot before completing.
     NeedSnapshot {
         compact_idx: u64,
-        continuation: SnapshotContinuation<T>,
+        continuation: SnapshotContinuation,
     },
 }
 
@@ -489,17 +557,11 @@ pub(crate) struct LogSyncRequest<T: Entry> {
 
 /// What to do after building a snapshot.
 /// Fields are consumed by the Runtime, not the Engine.
-pub(crate) enum SnapshotContinuation<T: Entry> {
+pub(crate) enum SnapshotContinuation {
     /// Complete a trim+snapshot compaction.
     CompleteSnapshot {
         #[allow(dead_code)]
         local_only: bool,
         snapshot_idx: Option<u64>,
-    },
-    /// Complete a sync_log delta merge: merge `delta` into the existing snapshot.
-    CompleteSyncLogDelta {
-        delta: T::Snapshot,
-        #[allow(dead_code)]
-        compact_idx: u64,
     },
 }
