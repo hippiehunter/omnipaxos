@@ -392,11 +392,9 @@ impl<T: Entry> Engine<T> {
     pub(crate) fn resend_message_timeout(&mut self) {
         match self.s.state.0 {
             Role::Leader => {
-                // Resend first: the leader path reads the backoff counters to
-                // find followers that made no accepted progress across the
-                // whole resend window, then the counters restart fresh.
-                self.resend_messages_leader();
+                // Reset backoff so resend path can re-sync all followers
                 self.s.leader_state.reset_backoff();
+                self.resend_messages_leader();
             }
             Role::Follower => self.resend_messages_follower(),
         }
