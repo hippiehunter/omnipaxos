@@ -1,5 +1,6 @@
 use super::{
     commands::Command,
+    overlap_last_decided,
     state::{PendingCommit, Phase, Role},
     Engine, EngineAction, LogSyncContinuation, LogSyncRequest,
 };
@@ -249,6 +250,11 @@ impl<T: Entry> Engine<T> {
         // already-inclusive index, deciding the StopSign one slot higher
         // than the original quorum did (divergent config_base_lsn).
         let followers_valid_entries_idx = followers_valid_entries_idx.min(self.s.real_log_head());
+        let followers_valid_entries_idx = overlap_last_decided(
+            followers_valid_entries_idx,
+            followers_decided_idx,
+            self.s.compacted_idx,
+        );
         (followers_valid_entries_idx, followers_decided_idx)
     }
 
@@ -546,10 +552,21 @@ impl<T: Entry> Engine<T> {
         prom: Promise<T>,
         from: NodeId,
     ) -> EngineAction<T> {
+        tracing::debug!(
+            pid = self.s.pid,
+            from,
+            ballot_n = prom.n.n,
+            leader_n = self.s.leader_state.n_leader.n,
+            accepted_round_n = prom.n_accepted.n,
+            decided_idx = prom.decided_idx,
+            accepted_idx = prom.accepted_idx,
+            "promise_received_in_accept"
+        );
         if prom.n == self.s.leader_state.n_leader {
             self.s.leader_state.set_promise(prom, from, false);
             // Need to send AcceptSync which requires storage reads
             let (from_idx, other_decided_idx) = self.prepare_accsync_params(from);
+            tracing::debug!(pid = self.s.pid, to = from, from_idx, "accept_sync_planned");
             return EngineAction::NeedLogSync {
                 from_idx,
                 other_decided_idx,

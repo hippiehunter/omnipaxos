@@ -1,5 +1,6 @@
 use super::{
     commands::Command,
+    overlap_last_decided,
     state::{FollowerAck, Phase, Role},
     Engine, EngineAction, LogSyncContinuation,
 };
@@ -60,7 +61,11 @@ impl<T: Entry> Engine<T> {
             if na > prep.n_accepted {
                 // I'm more up to date: need storage reads to build LogSync
                 return EngineAction::NeedLogSync {
-                    from_idx: prep.decided_idx,
+                    from_idx: overlap_last_decided(
+                        prep.decided_idx,
+                        prep.decided_idx,
+                        self.s.compacted_idx,
+                    ),
                     other_decided_idx: prep.decided_idx,
                     continuation: LogSyncContinuation::CompletePrepare {
                         prep_n: prep.n,
@@ -72,7 +77,11 @@ impl<T: Entry> Engine<T> {
             } else if na == prep.n_accepted && accepted_idx > prep.accepted_idx {
                 // Same round but I have more entries
                 return EngineAction::NeedLogSync {
-                    from_idx: prep.accepted_idx,
+                    from_idx: overlap_last_decided(
+                        prep.accepted_idx,
+                        prep.decided_idx,
+                        self.s.compacted_idx,
+                    ),
                     other_decided_idx: prep.decided_idx,
                     continuation: LogSyncContinuation::CompletePrepare {
                         prep_n: prep.n,
@@ -90,6 +99,14 @@ impl<T: Entry> Engine<T> {
                     accepted_idx,
                     log_sync: None,
                 };
+                tracing::debug!(
+                    pid = self.s.pid,
+                    to = from,
+                    accepted_round_n = na.n,
+                    decided_idx = self.s.decided_idx,
+                    accepted_idx,
+                    "promise_sent"
+                );
                 self.s.cached_promise_message = Some(promise.clone());
                 self.try_push_message(Message::SequencePaxos(PaxosMessage {
                     from: self.s.pid,

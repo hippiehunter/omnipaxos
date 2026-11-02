@@ -21,6 +21,22 @@ use crate::{
 use commands::Command;
 use state::{EngineState, FollowerAck};
 
+/// The index a log sync to a replica that decided `decided_idx` starts from:
+/// `sync_idx`, or one entry before the replica's decided frontier if that is
+/// lower. Storage refuses a sync that changes a decided value, so the re-sent
+/// entry makes a replica whose decided prefix is not the sender's stop instead
+/// of keeping that prefix under the sender's suffix: Raft's consistency check
+/// one entry before the append point. The sender must still hold that entry;
+/// below its compacted prefix, which every replica has decided, nothing is
+/// compared.
+pub(crate) fn overlap_last_decided(sync_idx: u64, decided_idx: u64, compacted_idx: u64) -> u64 {
+    if decided_idx > compacted_idx {
+        sync_idx.min(decided_idx - 1)
+    } else {
+        sync_idx
+    }
+}
+
 /// The pure, synchronous Paxos engine.
 ///
 /// Takes events (messages, ticks), updates in-memory state, emits [`Command`]s
@@ -564,4 +580,29 @@ pub(crate) enum SnapshotContinuation {
         local_only: bool,
         snapshot_idx: Option<u64>,
     },
+}
+
+#[cfg(test)]
+mod sync_start_tests {
+    use super::overlap_last_decided;
+
+    #[test]
+    fn a_sync_re_sends_the_receivers_last_decided_entry() {
+        // Starting at the receiver's decided frontier, or above it, moves one
+        // entry down so the receiver compares its last decided value.
+        assert_eq!(overlap_last_decided(822, 822, 0), 821);
+        assert_eq!(overlap_last_decided(900, 822, 0), 821);
+        // A sync already starting below the frontier is unchanged.
+        assert_eq!(overlap_last_decided(456, 822, 0), 456);
+    }
+
+    #[test]
+    fn nothing_is_re_sent_from_below_the_senders_compacted_prefix() {
+        // The sender no longer holds the entry before its compacted prefix,
+        // which every replica has decided.
+        assert_eq!(overlap_last_decided(822, 822, 822), 822);
+        assert_eq!(overlap_last_decided(822, 822, 900), 822);
+        // A receiver that decided nothing has nothing to compare.
+        assert_eq!(overlap_last_decided(0, 0, 0), 0);
+    }
 }
