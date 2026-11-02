@@ -4,16 +4,17 @@ use omnipaxos::{
         sequence_paxos::{PaxosMessage, PaxosMsg},
         Message,
     },
-    storage::{
-        memory_storage::MemoryStorage, StopSign, Storage, StorageOp, StorageResult,
-    },
+    storage::{memory_storage::MemoryStorage, StopSign, Storage, StorageOp, StorageResult},
     util::{FlexibleQuorum, LogEntry},
     ClusterConfig, CompactionErr, OmniPaxos, OmniPaxosConfig, ProposeErr, ReadError,
     ReconfigurationStatus, ServerConfig,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 mod test_utils;
 use test_utils::{Value, ValueSnapshot};
@@ -43,22 +44,35 @@ impl SharedMemoryStorage {
 
 impl Storage<Value> for SharedMemoryStorage {
     async fn write_atomically(&mut self, ops: Vec<StorageOp<Value>>) -> StorageResult<()> {
-        self.inner.borrow_mut().write_atomically(ops).await
+        now(self.inner.borrow_mut().write_atomically(ops))
     }
     async fn load_state(&self) -> StorageResult<omnipaxos::storage::PersistedState<Value>> {
-        self.inner.borrow().load_state().await
+        now(self.inner.borrow().load_state())
     }
     async fn get_entries(&self, from: u64, to: u64) -> StorageResult<Vec<Value>> {
-        self.inner.borrow().get_entries(from, to).await
+        now(self.inner.borrow().get_entries(from, to))
     }
     async fn get_suffix(&self, from: u64) -> StorageResult<Vec<Value>> {
-        self.inner.borrow().get_suffix(from).await
+        now(self.inner.borrow().get_suffix(from))
     }
     async fn get_snapshot(&self) -> StorageResult<Option<ValueSnapshot>> {
-        self.inner.borrow().get_snapshot().await
+        now(self.inner.borrow().get_snapshot())
     }
     async fn get_log_len(&self) -> StorageResult<u64> {
-        self.inner.borrow().get_log_len().await
+        now(self.inner.borrow().get_log_len())
+    }
+}
+
+/// Run a `MemoryStorage` call, which never suspends, to completion, so the
+/// `RefCell` borrow it holds ends before the wrapping future can yield.
+fn now<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    match future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(output) => output,
+        Poll::Pending => panic!("MemoryStorage suspended"),
     }
 }
 
@@ -185,7 +199,7 @@ impl SimCluster {
             let dominated = self
                 .filters
                 .iter()
-                .any(|f| f.as_ref().map_or(false, |pred| !pred(&msg)));
+                .any(|f| f.as_ref().is_some_and(|pred| !pred(&msg)));
             if dominated {
                 self.dropped_messages.push(msg);
                 continue;
@@ -371,7 +385,8 @@ impl SimCluster {
             .values()
             .map(|node| node.get_decided_idx())
             .collect();
-        if let (Some(&min), Some(&max)) = (decided_indices.iter().min(), decided_indices.iter().max())
+        if let (Some(&min), Some(&max)) =
+            (decided_indices.iter().min(), decided_indices.iter().max())
         {
             assert_eq!(
                 min, max,
@@ -950,11 +965,7 @@ fn test_proposals_during_leader_change() {
 
         // Heal and converge.
         cluster.remove_filter(filter_handle);
-        cluster
-            .nodes
-            .get_mut(&old_leader)
-            .unwrap()
-            .reconnected(nl);
+        cluster.nodes.get_mut(&old_leader).unwrap().reconnected(nl);
         cluster.tick_and_route(300).await;
 
         assert_logs_consistent(&cluster).await;
@@ -1386,12 +1397,7 @@ fn test_trim_then_catchup() {
 
         // Trim while follower is crashed should fail: trim is conservative and
         // requires ALL nodes (including disconnected ones) to have accepted entries.
-        let trim_result = cluster
-            .nodes
-            .get_mut(&leader)
-            .unwrap()
-            .trim(Some(15))
-            .await;
+        let trim_result = cluster.nodes.get_mut(&leader).unwrap().trim(Some(15)).await;
         assert!(
             matches!(trim_result, Err(CompactionErr::NotAllDecided(0))),
             "trim must fail while a disconnected node hasn't accepted the entries"
@@ -1647,21 +1653,18 @@ fn test_default_timeout_leader_crash_reelection() {
 }
 
 // ===========================================================================
-// FIXED: Leader batch flush now uses write_atomically
+// Single-node batch flush decides within the flushing tick
 //
-// Previously, flush_batch_leader() used separate append_entries() and
-// set_decided_idx() calls. Now uses flush_batch_and_decide_with_entries()
-// which wraps both in write_atomically() for crash safety.
+// flush_batch_leader() only appends the batch and replicates it. The leader's
+// self-vote is cast by the durability settlement at the end of the same
+// tick(), after the append returned (MemoryStorage log writes are durable on
+// return), and in a single-node cluster that vote alone decides the batch.
 // ===========================================================================
 
-/// Verifies that the single-node leader batch flush path writes entries
-/// and decided_idx atomically. After the fix, this test passes because
-/// flush_batch_leader() uses flush_batch_and_decide_with_entries() which
-/// calls write_atomically() for the combined operation.
-///
-/// The test verifies that after the batch flush, both entries and decided_idx
-/// are updated in the same storage state (no window where entries exist but
-/// decided_idx lags behind).
+/// Verifies that a single-node leader never leaves storage, between public
+/// calls, holding flushed entries that are not decided: the append and the
+/// SetDecidedIndex its self-vote produces are both written by the tick() that
+/// flushes the batch.
 #[test]
 fn test_single_node_flush_decide_atomicity() {
     smol::block_on(async {
@@ -1683,11 +1686,8 @@ fn test_single_node_flush_decide_atomicity() {
         assert_eq!(leader, 1);
 
         // Record storage state before proposing
-        let pre_log_len = cluster.storage_handles[&1]
-            .borrow()
-            .get_log_len()
-            .await
-            .unwrap();
+        let storage = cluster.storage_handles[&1].borrow().clone();
+        let pre_log_len = storage.get_log_len().await.unwrap();
 
         // Propose entries (buffered in batch, not flushed yet)
         for i in 1..=5 {
@@ -1701,27 +1701,26 @@ fn test_single_node_flush_decide_atomicity() {
             cluster.tick_all().await;
             cluster.route_messages().await;
 
-            let storage = cluster.storage_handles[&1].borrow();
+            let storage = cluster.storage_handles[&1].borrow().clone();
             let log_len = storage.get_log_len().await.unwrap();
             let state = storage.load_state().await.unwrap();
             let decided_idx = state.decided_idx;
 
-            // If entries were written but decided_idx hasn't caught up,
-            // the flush is non-atomic
+            // Entries written but not decided by the end of the tick
             if log_len > pre_log_len && decided_idx < pre_log_len + (log_len - pre_log_len) {
                 saw_entries_without_decided = true;
             }
         }
 
         // Verify final state is correct
-        let storage = cluster.storage_handles[&1].borrow();
+        let storage = cluster.storage_handles[&1].borrow().clone();
         assert_eq!(storage.get_log_len().await.unwrap(), 5);
         assert_eq!(storage.load_state().await.unwrap().decided_idx, 5);
 
-        // With the atomic fix, entries and decided_idx are written together
+        // The flushing tick decides every entry it writes.
         assert!(
             !saw_entries_without_decided,
-            "entries and decided_idx should be written atomically"
+            "the tick that flushes the batch should also decide it"
         );
     });
 }
@@ -2075,7 +2074,7 @@ impl SimCluster {
                 let dominated = self
                     .filters
                     .iter()
-                    .any(|f| f.as_ref().map_or(false, |pred| !pred(&msg)));
+                    .any(|f| f.as_ref().is_some_and(|pred| !pred(&msg)));
                 if dominated {
                     self.dropped_messages.push(msg);
                     continue;
@@ -2200,10 +2199,9 @@ fn test_stress_random_partitions_500() {
         let nodes = vec![1, 2, 3, 4, 5];
         let mut cluster = SimCluster::new(nodes.clone()).await;
         let mut rng = SimpleRng::new(test_seed(123));
-        let mut proposal_id = 1u64;
         let mut active_filter: Option<usize> = None;
 
-        for _iter in 0..500 {
+        for proposal_id in (1u64..).take(500) {
             // Randomly partition or heal
             if rng.next_range(3) == 0 {
                 if let Some(f) = active_filter.take() {
@@ -2233,7 +2231,6 @@ fn test_stress_random_partitions_500() {
             let _ = cluster
                 .try_propose(proposer, Value::with_id(proposal_id))
                 .await;
-            proposal_id += 1;
 
             cluster.tick_and_route(3).await;
         }
@@ -2260,16 +2257,14 @@ fn test_stress_leader_crashes_during_proposals_100() {
     smol::block_on(async {
         let nodes = vec![1, 2, 3, 4, 5];
         let mut cluster = SimCluster::new(nodes.clone()).await;
-        let mut proposal_id = 1u64;
 
-        for _iter in 0..100 {
+        for proposal_id in (1u64..).take(100) {
             let leader = elect_leader(&mut cluster).await;
 
             // Propose immediately then crash
             let _ = cluster
                 .try_propose(leader, Value::with_id(proposal_id))
                 .await;
-            proposal_id += 1;
             cluster.crash_node(leader);
 
             // Let survivors elect and make progress
@@ -3020,10 +3015,7 @@ fn test_compaction_err_storage_error_variant() {
     use omnipaxos::errors::{AnyError, StorageError};
     use omnipaxos::CompactionErr;
 
-    let any_err = AnyError::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "test error",
-    ));
+    let any_err = AnyError::new(std::io::Error::other("test error"));
     let storage_err = StorageError::write_batch(any_err);
     let compaction_err = CompactionErr::Storage(storage_err);
 
@@ -3879,7 +3871,10 @@ fn test_leader_crash_recovery_log_consistency() {
 
         // Elect a new leader among the remaining 4 nodes.
         let new_leader = elect_leader(&mut cluster).await;
-        assert_ne!(new_leader, leader, "new leader should differ from crashed leader");
+        assert_ne!(
+            new_leader, leader,
+            "new leader should differ from crashed leader"
+        );
 
         // Propose 10 more entries to the new leader.
         for i in 11..=20 {
@@ -4395,11 +4390,7 @@ fn test_reconfiguration_status_lifecycle() {
         cluster.tick_and_route(100).await;
 
         // Initially: no reconfiguration
-        let status = cluster
-            .nodes
-            .get(&leader)
-            .unwrap()
-            .reconfiguration_status();
+        let status = cluster.nodes.get(&leader).unwrap().reconfiguration_status();
         assert!(
             matches!(status, ReconfigurationStatus::Idle),
             "initial status should be Idle, got {:?}",
@@ -4430,11 +4421,7 @@ fn test_reconfiguration_status_lifecycle() {
             .unwrap();
 
         // Status should be Pending on leader
-        let status = cluster
-            .nodes
-            .get(&leader)
-            .unwrap()
-            .reconfiguration_status();
+        let status = cluster.nodes.get(&leader).unwrap().reconfiguration_status();
         assert!(
             matches!(status, ReconfigurationStatus::Pending(_)),
             "status should be Pending after accepting StopSign, got {:?}",
@@ -4446,11 +4433,7 @@ fn test_reconfiguration_status_lifecycle() {
         cluster.tick_and_route(500).await;
 
         // Status should be Decided on leader
-        let status = cluster
-            .nodes
-            .get(&leader)
-            .unwrap()
-            .reconfiguration_status();
+        let status = cluster.nodes.get(&leader).unwrap().reconfiguration_status();
         assert!(
             matches!(status, ReconfigurationStatus::Decided(_)),
             "status should be Decided after quorum, got {:?}",

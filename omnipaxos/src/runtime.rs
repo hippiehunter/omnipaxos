@@ -2,10 +2,7 @@
 //! It also handles storage reads needed for split-phase operations.
 
 use crate::{
-    engine::{
-        commands::Command,
-        Engine, EngineAction, LogSyncContinuation, SnapshotContinuation,
-    },
+    engine::{commands::Command, Engine, EngineAction, LogSyncContinuation, SnapshotContinuation},
     errors::{AnyError, ErrorSubject, StorageError, StorageOperation},
     storage::{Entry, Snapshot, SnapshotType, Storage, StorageOp},
     util::{IndexEntry, LogEntry, LogSync, SnapshottedEntry},
@@ -51,6 +48,23 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                     )
                     .map_err(|e| e.with_details(details))?;
                 }
+                Command::WriteAtomicWithDelta {
+                    mut ops,
+                    snapshot_at,
+                    own_from,
+                    own_to,
+                    delta,
+                } => {
+                    let merged = self.merge_delta_snapshot(own_from, own_to, delta).await?;
+                    ops.insert(snapshot_at, StorageOp::SetSnapshot(Some(merged)));
+                    let details = crate::storage::describe_batch(&ops);
+                    Self::wrap_storage(
+                        StorageOperation::WriteAtomic,
+                        ErrorSubject::Batch,
+                        self.storage.write_atomically(ops).await,
+                    )
+                    .map_err(|e| e.with_details(details))?;
+                }
                 Command::AppendEntries(entries) => {
                     let ops = vec![StorageOp::AppendEntries(entries, false)];
                     let details = crate::storage::describe_batch(&ops);
@@ -64,6 +78,51 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
             }
         }
         Ok(())
+    }
+
+    /// The stored snapshot, extended with this node's own decided entries
+    /// `[own_from, own_to)` and then a received `delta` that starts at
+    /// `own_to`.
+    async fn merge_delta_snapshot(
+        &self,
+        own_from: u64,
+        own_to: u64,
+        delta: T::Snapshot,
+    ) -> Result<T::Snapshot, StorageError> {
+        let stored = Self::wrap_storage(
+            StorageOperation::ReadSnapshot,
+            ErrorSubject::Snapshot,
+            self.storage.get_snapshot().await,
+        )?;
+        let own_entries = Self::wrap_storage(
+            StorageOperation::ReadEntries,
+            ErrorSubject::LogEntries {
+                from: own_from,
+                to: own_to,
+            },
+            self.storage.get_entries(own_from, own_to).await,
+        )?;
+        if own_entries.len() as u64 != own_to - own_from {
+            return Err(StorageError::read_entries(
+                own_from,
+                own_to,
+                AnyError::new(std::io::Error::other(format!(
+                    "decided entries [{own_from}, {own_to}) needed for a delta snapshot are \
+                     missing: storage returned {} entries",
+                    own_entries.len()
+                ))),
+            ));
+        }
+        let own = T::Snapshot::create(&own_entries);
+        let mut merged = match stored {
+            Some(mut base) => {
+                base.merge(own);
+                base
+            }
+            None => own,
+        };
+        merged.merge(delta);
+        Ok(merged)
     }
 
     /// Handle an EngineAction that may require storage reads.
@@ -89,13 +148,7 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                         na,
                         accepted_idx,
                     } => {
-                        engine.complete_prepare_with_sync(
-                            prep_n,
-                            from,
-                            na,
-                            accepted_idx,
-                            log_sync,
-                        );
+                        engine.complete_prepare_with_sync(prep_n, from, na, accepted_idx, log_sync);
                     }
                     LogSyncContinuation::CompleteAcceptSync { to } => {
                         engine.complete_accsync(to, log_sync);
@@ -127,27 +180,6 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                         // (follower may not be caught up). Force=true: urgent (catch-up).
                         let _ = self.try_snapshot(engine, snapshot_idx, true).await;
                     }
-                    SnapshotContinuation::CompleteSyncLogDelta { delta, compact_idx: _ } => {
-                        let existing = Self::wrap_storage(
-                            StorageOperation::ReadSnapshot,
-                            ErrorSubject::Snapshot,
-                            self.storage.get_snapshot().await,
-                        )?;
-                        let merged = match existing {
-                            Some(mut base) => {
-                                base.merge(delta);
-                                base
-                            }
-                            None => delta,
-                        };
-                        Self::wrap_storage(
-                            StorageOperation::WriteAtomic,
-                            ErrorSubject::Snapshot,
-                            self.storage
-                                .write_atomically(vec![StorageOp::SetSnapshot(Some(merged))])
-                                .await,
-                        )?;
-                    }
                 }
                 Ok(())
             }
@@ -169,14 +201,20 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
                     .await?;
                 let suffix = Self::wrap_storage(
                     StorageOperation::ReadSuffix,
-                    ErrorSubject::LogEntries { from: decided_idx, to: u64::MAX },
+                    ErrorSubject::LogEntries {
+                        from: decided_idx,
+                        to: u64::MAX,
+                    },
                     self.storage.get_suffix(decided_idx).await,
                 )?;
                 (delta_snapshot, suffix, compacted_idx)
             } else {
                 let suffix = Self::wrap_storage(
                     StorageOperation::ReadSuffix,
-                    ErrorSubject::LogEntries { from: common_prefix_idx, to: u64::MAX },
+                    ErrorSubject::LogEntries {
+                        from: common_prefix_idx,
+                        to: u64::MAX,
+                    },
                     self.storage.get_suffix(common_prefix_idx).await,
                 )?;
                 (None, suffix, common_prefix_idx)
@@ -213,7 +251,10 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         } else {
             let diff_entries = Self::wrap_storage(
                 StorageOperation::ReadEntries,
-                ErrorSubject::LogEntries { from: from_idx, to: log_decided_idx },
+                ErrorSubject::LogEntries {
+                    from: from_idx,
+                    to: log_decided_idx,
+                },
                 self.storage.get_entries(from_idx, log_decided_idx).await,
             )?;
             Some(SnapshotType::Delta(T::Snapshot::create(
@@ -232,7 +273,10 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
         let current_compacted_idx = engine.get_compacted_idx();
         let entries = Self::wrap_storage(
             StorageOperation::ReadEntries,
-            ErrorSubject::LogEntries { from: current_compacted_idx, to: compact_idx },
+            ErrorSubject::LogEntries {
+                from: current_compacted_idx,
+                to: compact_idx,
+            },
             self.storage
                 .get_entries(current_compacted_idx, compact_idx)
                 .await,
@@ -292,31 +336,41 @@ impl<T: Entry, B: Storage<T>> Runtime<T, B> {
             _ => return Ok(None),
         };
         match (from_type, to_type) {
-            (IndexEntry::Entry, IndexEntry::Entry) => {
-                Ok(Some(self.create_read_log_entries(engine, from_idx, to_idx).await?))
-            }
+            (IndexEntry::Entry, IndexEntry::Entry) => Ok(Some(
+                self.create_read_log_entries(engine, from_idx, to_idx)
+                    .await?,
+            )),
             (IndexEntry::Entry, IndexEntry::StopSign(ss)) => {
-                let mut entries = self.create_read_log_entries(engine, from_idx, to_idx - 1).await?;
+                let mut entries = self
+                    .create_read_log_entries(engine, from_idx, to_idx - 1)
+                    .await?;
                 entries.push(LogEntry::StopSign(ss, engine.stopsign_is_decided()));
                 Ok(Some(entries))
             }
             (IndexEntry::Compacted, IndexEntry::Entry) => {
                 let mut entries = Vec::with_capacity((to_idx - compacted_idx + 1) as usize);
                 entries.push(self.create_compacted_entry(compacted_idx).await?);
-                let mut e = self.create_read_log_entries(engine, compacted_idx, to_idx).await?;
+                let mut e = self
+                    .create_read_log_entries(engine, compacted_idx, to_idx)
+                    .await?;
                 entries.append(&mut e);
                 Ok(Some(entries))
             }
             (IndexEntry::Compacted, IndexEntry::StopSign(ss)) => {
                 let mut entries = Vec::with_capacity((to_idx - compacted_idx + 1) as usize);
                 entries.push(self.create_compacted_entry(compacted_idx).await?);
-                let mut e = self.create_read_log_entries(engine, compacted_idx, to_idx - 1).await?;
+                let mut e = self
+                    .create_read_log_entries(engine, compacted_idx, to_idx - 1)
+                    .await?;
                 entries.append(&mut e);
                 entries.push(LogEntry::StopSign(ss, engine.stopsign_is_decided()));
                 Ok(Some(entries))
             }
             (IndexEntry::StopSign(ss), IndexEntry::StopSign(_)) => {
-                Ok(Some(vec![LogEntry::StopSign(ss, engine.stopsign_is_decided())]))
+                Ok(Some(vec![LogEntry::StopSign(
+                    ss,
+                    engine.stopsign_is_decided(),
+                )]))
             }
             _ => Ok(None),
         }

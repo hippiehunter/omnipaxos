@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 /// consensus control message arrives. The transport layer maps this to
 /// physical RDMA addresses internally — the consensus engine only sees
 /// identity and validation fields.
-#[derive(Clone, Debug, PartialEq)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PayloadRef {
     /// Leader's ballot epoch — invalid after leader change.
@@ -36,8 +35,7 @@ pub struct PayloadRef {
 /// the consensus control message arrives. The pump layer resolves `Ref`
 /// variants to `Inline` before the engine processes them. On the send side,
 /// the pump converts `Inline` to `Ref` after staging via the data transport.
-#[derive(Clone, Debug)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum InlineOrRef<T> {
     /// Payload data is carried inline in the message.
@@ -86,8 +84,7 @@ pub mod sequence_paxos {
     use std::sync::Arc;
 
     /// Message sent by a follower on crash-recovery or dropped messages to request its leader to re-prepare them.
-    #[derive(Copy, Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Copy, Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct PrepareReq {
         /// The current round.
@@ -95,8 +92,7 @@ pub mod sequence_paxos {
     }
 
     /// Prepare message sent by a newly-elected leader to initiate the Prepare phase.
-    #[derive(Copy, Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Copy, Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct Prepare {
         /// The current round.
@@ -110,8 +106,7 @@ pub mod sequence_paxos {
     }
 
     /// Promise message sent by a follower in response to a [`Prepare`] sent by the leader.
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct Promise<T>
     where
@@ -132,8 +127,7 @@ pub mod sequence_paxos {
     }
 
     /// AcceptSync message sent by the leader to synchronize the logs of all replicas in the prepare phase.
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct AcceptSync<T>
     where
@@ -148,11 +142,15 @@ pub mod sequence_paxos {
         /// The log update which the follower applies to its log in order to sync
         /// with the leader. May be a `Ref` if staged via RDMA data plane.
         pub log_sync: InlineOrRef<LogSync<T>>,
+        /// The follower's `(n_accepted, accepted_idx)` from the [`Promise`] this
+        /// sync was built from. A follower whose accepted state no longer
+        /// matches (e.g. it restarted with less of its log) refuses the sync
+        /// and asks to be prepared again.
+        pub promised: (Ballot, u64),
     }
 
     /// Message with entries to be replicated and the latest decided index sent by the leader in the accept phase.
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct AcceptDecide<T>
     where
@@ -168,20 +166,20 @@ pub mod sequence_paxos {
         pub entries: InlineOrRef<Arc<Vec<T>>>,
     }
 
-    /// Message sent by follower to leader when entries has been accepted.
-    #[derive(Copy, Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    /// Message sent by follower to leader when entries have been accepted.
+    /// `accepted_idx` is the follower's committed accepted index: every entry
+    /// below it is durable in its storage under the accepted round `n`.
+    #[derive(Copy, Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct Accepted {
         /// The current round.
         pub n: Ballot,
-        /// The accepted index.
+        /// The durable accepted index.
         pub accepted_idx: u64,
     }
 
     /// Message sent by leader to followers to decide up to a certain index in the log.
-    #[derive(Copy, Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Copy, Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct Decide {
         /// The current round.
@@ -193,8 +191,7 @@ pub mod sequence_paxos {
     }
 
     /// Message sent by leader to followers to accept a StopSign
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct AcceptStopSign {
         /// The current round.
@@ -207,8 +204,7 @@ pub mod sequence_paxos {
 
     /// Message sent by follower to leader when accepting an entry is rejected.
     /// This happens when the follower is promised to a greater leader.
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct NotAccepted {
         /// The follower's current ballot
@@ -217,8 +213,7 @@ pub mod sequence_paxos {
 
     /// Compaction Request
     #[allow(missing_docs)]
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub enum Compaction {
         Trim(u64),
@@ -227,8 +222,7 @@ pub mod sequence_paxos {
 
     /// An enum for all the different message types.
     #[allow(missing_docs)]
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub enum PaxosMsg<T>
     where
@@ -258,8 +252,7 @@ pub mod sequence_paxos {
     }
 
     /// Leader sends this to confirm its authority for linearizable reads.
-    #[derive(Copy, Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Copy, Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct ReadIndexReq {
         /// The leader's current ballot.
@@ -269,8 +262,7 @@ pub mod sequence_paxos {
     }
 
     /// Follower response confirming or denying leader authority.
-    #[derive(Copy, Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Copy, Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct ReadIndexResp {
         /// The leader's ballot from the request.
@@ -282,8 +274,7 @@ pub mod sequence_paxos {
     }
 
     /// Message sent by a leader to a target node to initiate leadership transfer.
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct TransferLeader {
         /// The current leader's ballot.
@@ -293,8 +284,7 @@ pub mod sequence_paxos {
     }
 
     /// A struct for a Paxos message that also includes sender and receiver.
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct PaxosMessage<T>
     where
@@ -318,8 +308,7 @@ pub mod ballot_leader_election {
 
     /// An enum for all the different BLE message types.
     #[allow(missing_docs)]
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub enum HeartbeatMsg {
         Request(HeartbeatRequest),
@@ -327,8 +316,7 @@ pub mod ballot_leader_election {
     }
 
     /// Requests a reply from all the other servers.
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct HeartbeatRequest {
         /// Number of the current round.
@@ -336,8 +324,7 @@ pub mod ballot_leader_election {
     }
 
     /// Replies
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct HeartbeatReply {
         /// Number of the current heartbeat round.
@@ -351,8 +338,7 @@ pub mod ballot_leader_election {
     }
 
     /// A struct for a Paxos message that also includes sender and receiver.
-    #[derive(Clone, Debug)]
-    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct BLEMessage {
         /// Sender of `msg`.
@@ -366,8 +352,7 @@ pub mod ballot_leader_election {
 
 #[allow(missing_docs)]
 /// Message in OmniPaxos. Can be either a `SequencePaxos` message (for log replication) or `BLE` message (for leader election)
-#[derive(Clone, Debug)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Message<T>
 where

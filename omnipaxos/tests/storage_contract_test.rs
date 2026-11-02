@@ -57,10 +57,7 @@ impl FailCtrl {
 }
 
 fn make_storage_error(msg: &str) -> AnyError {
-    AnyError::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        msg.to_owned(),
-    ))
+    AnyError::new(std::io::Error::other(msg.to_owned()))
 }
 
 struct FailableStorage {
@@ -92,7 +89,8 @@ impl Storage<Value> for FailableStorage {
         self.ctrl.borrow_mut().write_atomically_count += 1;
 
         // Check partial write limit (simulates non-atomic implementation)
-        if let Some(limit) = self.ctrl.borrow().partial_write_limit {
+        let partial_write_limit = self.ctrl.borrow().partial_write_limit;
+        if let Some(limit) = partial_write_limit {
             let ops_to_apply: Vec<StorageOp<Value>> = ops.into_iter().take(limit).collect();
             return self.inner.write_atomically(ops_to_apply).await;
         }
@@ -474,10 +472,7 @@ fn test_trim_removes_entries() {
 
         // Trim first 5 entries
         storage
-            .write_atomically(vec![
-                StorageOp::Trim(5),
-                StorageOp::SetCompactedIdx(5),
-            ])
+            .write_atomically(vec![StorageOp::Trim(5), StorageOp::SetCompactedIdx(5)])
             .await
             .unwrap();
 
@@ -580,7 +575,7 @@ fn test_storage_error_on_tick_propagates() {
         // tick() should eventually trigger batch flush and return Err
         let mut saw_error = false;
         for _ in 0..20 {
-            if let Err(_) = node.tick().await {
+            if node.tick().await.is_err() {
                 saw_error = true;
                 break;
             }
@@ -627,7 +622,7 @@ fn test_storage_error_on_handle_incoming_propagates() {
             for msg in all_msgs {
                 let receiver = msg.get_receiver();
                 if let Some(node) = nodes.get_mut(&receiver) {
-                    if let Err(_) = node.handle_incoming(msg).await {
+                    if node.handle_incoming(msg).await.is_err() {
                         saw_error = true;
                     }
                 }
@@ -731,10 +726,10 @@ fn test_write_atomically_fails_cleanly() {
 
         // Append some initial entries
         storage
-            .write_atomically(vec![StorageOp::AppendEntries(vec![
-                Value::with_id(1),
-                Value::with_id(2),
-            ], false)])
+            .write_atomically(vec![StorageOp::AppendEntries(
+                vec![Value::with_id(1), Value::with_id(2)],
+                false,
+            )])
             .await
             .unwrap();
         let ballot = make_ballot(1, 1);
@@ -764,11 +759,7 @@ fn test_write_atomically_fails_cleanly() {
             Some(ballot),
             "promise should not have changed"
         );
-        assert_eq!(
-            state.decided_idx,
-            0,
-            "decided_idx should not have changed"
-        );
+        assert_eq!(state.decided_idx, 0, "decided_idx should not have changed");
 
         // After the transient failure, write_atomically should work
         let ops = vec![
@@ -971,20 +962,20 @@ fn test_get_entries_after_trim_underflow() {
 }
 
 // ---------------------------------------------------------------------------
-// FIXED: Leader batch flush now uses write_atomically
+// Leader batch flush writes through write_atomically
 //
-// Previously, flush_batch_leader() used separate append_entries() and
-// set_decided_idx() calls. Now uses flush_batch_and_decide_with_entries()
-// which wraps both in write_atomically() for crash safety.
+// flush_batch_leader() appends the batch with write_atomically(); the decide
+// follows in a separate write_atomically() once the durability settlement
+// has cast the leader's vote for the appended entries.
 // ---------------------------------------------------------------------------
 
-/// Verifies that the leader's batch flush path uses write_atomically for
-/// the combined append+decide operation.
+/// Verifies that the leader's batch flush and the decide that follows it go
+/// through write_atomically.
 #[test]
 fn test_leader_batch_flush_atomicity() {
     smol::block_on(async {
-        // Use FailableStorage to detect whether write_atomically is called
-        // for the batch flush + decide path (vs separate calls).
+        // Use FailableStorage to count write_atomically calls on the batch
+        // flush + decide path.
         let ctrl = Rc::new(RefCell::new(FailCtrl::new()));
         let storage = FailableStorage {
             inner: MemoryStorage::default(),
@@ -1026,17 +1017,13 @@ fn test_leader_batch_flush_atomicity() {
         // Entries should be decided
         assert_eq!(node.get_decided_idx(), 5, "entries should be decided");
 
-        // The batch flush + decide should have used write_atomically.
-        // If write_atomically_count is 0, it means the leader used
-        // separate append_entries() + set_decided_idx() calls — which
-        // is not crash-safe.
+        // The batch flush and the decide must both go through
+        // write_atomically, the only storage mutation entry point.
         let count = ctrl.borrow().write_atomically_count;
         assert!(
             count > 0,
-            "Leader batch flush path should use write_atomically for atomic \
-             append+decide, but write_atomically was called 0 times. \
-             The leader uses separate append_entries() + set_decided_idx() \
-             calls which are not crash-safe."
+            "leader batch flush and decide should go through write_atomically, \
+             but write_atomically was called 0 times"
         );
     });
 }
@@ -1178,26 +1165,28 @@ fn test_follower_batch_cache_preserved_on_write_failure() {
 }
 
 // ===========================================================================
-// Bug fix: Leader state reverted on flush failure
+// Leader self-vote only for entries its storage holds
 //
-// flush_batch_leader() must revert leader_state.accepted_idx if the
-// underlying write fails. Previously, accepted_idx was set before the
-// write and never reverted, causing is_chosen() to return true for
-// entries that were never persisted.
+// The leader's own accepted_idx in leader_state is its vote toward a write
+// quorum. It is set only by the durability settlement after a write has
+// returned (and, with asynchronously durable storage, after the host reported
+// the entries durable), never when flush_batch_leader() queues the append. A
+// failed flush therefore leaves the vote where it was, and the quorum never
+// counts entries the leader did not persist.
 // ===========================================================================
 
-/// Verifies that the leader's accepted_idx in leader_state is reverted
-/// when the batch flush write fails. After clearing the failure, the
-/// leader should be able to successfully flush and decide entries.
+/// Verifies that a failed batch flush does not advance the leader's vote or
+/// decided index, and that the leader flushes and decides the entries once
+/// the failure clears.
 ///
 /// Uses a 3-node cluster with batch_size=100 because:
 /// 1. batch_size=100 forces entries to accumulate in the batch buffer
 ///    and flush via flush_batch_leader() on tick timeout (not immediately
-///    via append_entries). flush_batch_leader uses write_atomically.
+///    on append).
 /// 2. A multi-node cluster means the quorum calculation matters:
-///    leader_state tracks each node's accepted_idx, and is_chosen() checks
-///    whether a quorum has accepted. If the leader's own accepted_idx is
-///    advanced before write succeeds, is_chosen() uses stale state.
+///    leader_state tracks each node's accepted_idx, and
+///    quorum_accepted_idx() decides from those votes. A vote for an
+///    unpersisted batch would decide it.
 #[test]
 fn test_leader_state_reverted_on_flush_failure() {
     smol::block_on(async {
@@ -1256,8 +1245,7 @@ fn test_leader_state_reverted_on_flush_failure() {
         }
 
         // Inject WriteAtomically failure on the LEADER's storage.
-        // This blocks flush_batch_leader() → flush_batch_and_decide_with_entries()
-        // → write_atomically().
+        // This fails the append flush_batch_leader() queues.
         let leader_ctrl = ctrls.get(&leader).unwrap();
         leader_ctrl
             .borrow_mut()
@@ -1275,9 +1263,8 @@ fn test_leader_state_reverted_on_flush_failure() {
         }
         tick_and_route_cluster_tolerant(&mut nodes, 30);
 
-        // Leader should not have decided beyond 5 because its storage write failed.
-        // The fix reverts leader_state.accepted_idx on failure so is_chosen()
-        // doesn't use stale state.
+        // Leader should not have decided beyond 5 because its storage write failed:
+        // its vote only covers entries a successful write holds.
         let leader_decided = nodes.get(&leader).unwrap().get_decided_idx();
         assert!(
             leader_decided <= 5,
@@ -1300,9 +1287,7 @@ fn test_leader_state_reverted_on_flush_failure() {
         let final_decided = nodes.get(&leader).unwrap().get_decided_idx();
         assert!(
             final_decided >= 10,
-            "after clearing failure, at least 10 entries should be decided, got {}. \
-             If leader_state.accepted_idx was not reverted on write failure, \
-             is_chosen() uses stale quorum state and entries may never decide.",
+            "after clearing failure, at least 10 entries should be decided, got {}",
             final_decided
         );
 
@@ -1790,7 +1775,8 @@ fn test_append_on_prefix_at_trim_boundary() {
         // Append 10 entries
         storage
             .write_atomically(vec![StorageOp::AppendEntries(
-                (0..10).map(|i| Value { id: i }).collect(), false,
+                (0..10).map(|i| Value { id: i }).collect(),
+                false,
             )])
             .await
             .unwrap();
@@ -1825,7 +1811,8 @@ fn test_append_on_prefix_above_trim_boundary() {
         // Append 10 entries (ids 0-9)
         storage
             .write_atomically(vec![StorageOp::AppendEntries(
-                (0..10).map(|i| Value { id: i }).collect(), false,
+                (0..10).map(|i| Value { id: i }).collect(),
+                false,
             )])
             .await
             .unwrap();
@@ -1861,7 +1848,8 @@ fn test_get_suffix_beyond_log_end() {
 
         storage
             .write_atomically(vec![StorageOp::AppendEntries(
-                (0..5).map(|i| Value { id: i }).collect(), false,
+                (0..5).map(|i| Value { id: i }).collect(),
+                false,
             )])
             .await
             .unwrap();
@@ -1884,7 +1872,8 @@ fn test_get_suffix_after_trim() {
 
         storage
             .write_atomically(vec![StorageOp::AppendEntries(
-                (0..10).map(|i| Value { id: i }).collect(), false,
+                (0..10).map(|i| Value { id: i }).collect(),
+                false,
             )])
             .await
             .unwrap();
@@ -1908,7 +1897,11 @@ fn test_get_suffix_after_trim() {
 
         // get_suffix at exactly trimmed_idx
         let suffix = storage.get_suffix(7).await.unwrap();
-        assert_eq!(suffix.len(), 3, "get_suffix at trimmed_idx returns remaining");
+        assert_eq!(
+            suffix.len(),
+            3,
+            "get_suffix at trimmed_idx returns remaining"
+        );
 
         // get_suffix above trimmed_idx
         let suffix = storage.get_suffix(8).await.unwrap();
@@ -1979,7 +1972,9 @@ fn test_write_atomically_preflight_error_leaves_state_unchanged() {
             .unwrap();
 
         // Make write_atomically fail (goes through MemoryStorage which has its own rollback)
-        ctrl.borrow_mut().permanent_failures.insert(FailOn::WriteAtomically);
+        ctrl.borrow_mut()
+            .permanent_failures
+            .insert(FailOn::WriteAtomically);
 
         let ops = vec![
             StorageOp::AppendEntries(vec![Value { id: 2 }, Value { id: 3 }], false),
@@ -1993,7 +1988,10 @@ fn test_write_atomically_preflight_error_leaves_state_unchanged() {
         assert_eq!(len, 1, "log should still have 1 entry after failed write");
 
         let state = storage.load_state().await.unwrap();
-        assert_eq!(state.decided_idx, 0, "decided_idx should still be 0 after failed write");
+        assert_eq!(
+            state.decided_idx, 0,
+            "decided_idx should still be 0 after failed write"
+        );
     });
 }
 
@@ -2023,14 +2021,23 @@ fn test_write_atomically_mid_operation_rollback() {
             StorageOp::SetDecidedIndex(3),
         ];
         let result = storage.write_atomically(ops).await;
-        assert!(result.is_err(), "write_atomically should fail when WriteAtomically fails");
+        assert!(
+            result.is_err(),
+            "write_atomically should fail when WriteAtomically fails"
+        );
 
         // Both operations should be rolled back
         let len = storage.get_log_len().await.unwrap();
-        assert_eq!(len, 1, "log should still have 1 entry after rollback (AppendEntries was reverted)");
+        assert_eq!(
+            len, 1,
+            "log should still have 1 entry after rollback (AppendEntries was reverted)"
+        );
 
         let state = storage.load_state().await.unwrap();
-        assert_eq!(state.decided_idx, 0, "decided_idx should still be 0 after rollback");
+        assert_eq!(
+            state.decided_idx, 0,
+            "decided_idx should still be 0 after rollback"
+        );
     });
 }
 
@@ -2093,7 +2100,9 @@ fn test_crash_recovery_with_torn_write() {
 // ===========================================================================
 
 /// Helper: build a MemoryStorage with arbitrary persisted state.
-async fn build_with_state(state_setup: impl FnOnce(&mut MemoryStorage<Value>)) -> Result<OmniPaxos<Value, MemoryStorage<Value>>, omnipaxos::errors::OmniPaxosError> {
+async fn build_with_state(
+    state_setup: impl FnOnce(&mut MemoryStorage<Value>),
+) -> Result<OmniPaxos<Value, MemoryStorage<Value>>, omnipaxos::errors::OmniPaxosError> {
     let mut storage = MemoryStorage::<Value>::default();
     state_setup(&mut storage);
     let config = OmniPaxosConfig {
@@ -2117,11 +2126,16 @@ fn test_startup_validates_compacted_gt_decided() {
             smol::block_on(s.write_atomically(vec![
                 StorageOp::SetDecidedIndex(5),
                 StorageOp::SetCompactedIdx(10), // compacted > decided
-            ])).unwrap();
-        }).await;
+            ]))
+            .unwrap();
+        })
+        .await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert!(matches!(err, omnipaxos::errors::OmniPaxosError::CorruptedState(_)));
+        assert!(matches!(
+            err,
+            omnipaxos::errors::OmniPaxosError::CorruptedState(_)
+        ));
         let msg = format!("{}", err);
         assert!(msg.contains("compacted_idx"));
     });
@@ -2133,16 +2147,27 @@ fn test_startup_validates_decided_gt_accepted() {
         let result = build_with_state(|s| {
             // log_len=5, compacted_idx=0, so accepted=5. decided=10 > 5 is invalid.
             smol::block_on(s.write_atomically(vec![
-                StorageOp::AppendEntries(vec![
-                    Value::with_id(1), Value::with_id(2), Value::with_id(3),
-                    Value::with_id(4), Value::with_id(5),
-                ], false),
+                StorageOp::AppendEntries(
+                    vec![
+                        Value::with_id(1),
+                        Value::with_id(2),
+                        Value::with_id(3),
+                        Value::with_id(4),
+                        Value::with_id(5),
+                    ],
+                    false,
+                ),
                 StorageOp::SetDecidedIndex(10),
-            ])).unwrap();
-        }).await;
+            ]))
+            .unwrap();
+        })
+        .await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert!(matches!(err, omnipaxos::errors::OmniPaxosError::CorruptedState(_)));
+        assert!(matches!(
+            err,
+            omnipaxos::errors::OmniPaxosError::CorruptedState(_)
+        ));
         let msg = format!("{}", err);
         assert!(msg.contains("decided_idx"));
     });
@@ -2153,13 +2178,20 @@ fn test_startup_validates_snapshot_without_compaction() {
     smol::block_on(async {
         let result = build_with_state(|s| {
             // Snapshot present but compacted_idx = 0
-            smol::block_on(s.write_atomically(vec![
-                StorageOp::SetSnapshot(Some(ValueSnapshot { map: HashMap::new() })),
-            ])).unwrap();
-        }).await;
+            smol::block_on(
+                s.write_atomically(vec![StorageOp::SetSnapshot(Some(ValueSnapshot {
+                    map: HashMap::new(),
+                }))]),
+            )
+            .unwrap();
+        })
+        .await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert!(matches!(err, omnipaxos::errors::OmniPaxosError::CorruptedState(_)));
+        assert!(matches!(
+            err,
+            omnipaxos::errors::OmniPaxosError::CorruptedState(_)
+        ));
         let msg = format!("{}", err);
         assert!(msg.contains("snapshot"));
     });
@@ -2170,16 +2202,31 @@ fn test_startup_validates_promise_lt_accepted_round() {
     smol::block_on(async {
         let result = build_with_state(|s| {
             // promise < accepted_round
-            let low = Ballot { config_id: 1, n: 1, priority: 0, pid: 1 };
-            let high = Ballot { config_id: 1, n: 5, priority: 0, pid: 1 };
+            let low = Ballot {
+                config_id: 1,
+                n: 1,
+                priority: 0,
+                pid: 1,
+            };
+            let high = Ballot {
+                config_id: 1,
+                n: 5,
+                priority: 0,
+                pid: 1,
+            };
             smol::block_on(s.write_atomically(vec![
                 StorageOp::SetPromise(low),
                 StorageOp::SetAcceptedRound(high),
-            ])).unwrap();
-        }).await;
+            ]))
+            .unwrap();
+        })
+        .await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert!(matches!(err, omnipaxos::errors::OmniPaxosError::CorruptedState(_)));
+        assert!(matches!(
+            err,
+            omnipaxos::errors::OmniPaxosError::CorruptedState(_)
+        ));
         let msg = format!("{}", err);
         assert!(msg.contains("promise"));
     });
@@ -2197,14 +2244,21 @@ fn test_startup_valid_fresh_state() {
 fn test_startup_valid_state_with_data() {
     smol::block_on(async {
         let result = build_with_state(|s| {
-            let ballot = Ballot { config_id: 1, n: 3, priority: 0, pid: 1 };
+            let ballot = Ballot {
+                config_id: 1,
+                n: 3,
+                priority: 0,
+                pid: 1,
+            };
             smol::block_on(s.write_atomically(vec![
                 StorageOp::AppendEntries(vec![Value::with_id(1), Value::with_id(2)], false),
                 StorageOp::SetPromise(ballot),
                 StorageOp::SetAcceptedRound(ballot),
                 StorageOp::SetDecidedIndex(2),
-            ])).unwrap();
-        }).await;
+            ]))
+            .unwrap();
+        })
+        .await;
         assert!(result.is_ok());
     });
 }
@@ -2225,7 +2279,9 @@ fn test_storage_error_details_on_write_failure() {
         }
 
         // Enable failure on writes
-        ctrl.borrow_mut().permanent_failures.insert(FailOn::WriteAtomically);
+        ctrl.borrow_mut()
+            .permanent_failures
+            .insert(FailOn::WriteAtomically);
 
         // Try appending -- should fail with storage error containing details
         let err = node.append(Value::with_id(42)).await;
@@ -2325,9 +2381,13 @@ fn test_lease_read_disabled_by_default() {
         let mut node = build_single_node(ctrl).await;
 
         // Elect leader + decide something
-        for _ in 0..10 { node.tick().await.unwrap(); }
+        for _ in 0..10 {
+            node.tick().await.unwrap();
+        }
         let _ = node.append(Value::with_id(1)).await.unwrap();
-        for _ in 0..5 { node.tick().await.unwrap(); }
+        for _ in 0..5 {
+            node.tick().await.unwrap();
+        }
 
         let result = node.ensure_linearizable();
         assert!(result.is_ok());
@@ -2355,11 +2415,15 @@ fn test_lease_read_fast_path() {
         let mut node = config.build(storage).await.unwrap();
 
         // Elect leader
-        for _ in 0..10 { node.tick().await.unwrap(); }
+        for _ in 0..10 {
+            node.tick().await.unwrap();
+        }
 
         // Decide an entry to set last_quorum_ack_tick
         let _ = node.append(Value::with_id(1)).await.unwrap();
-        for _ in 0..5 { node.tick().await.unwrap(); }
+        for _ in 0..5 {
+            node.tick().await.unwrap();
+        }
 
         // Now ensure_linearizable should use the lease fast path
         let result = node.ensure_linearizable();
@@ -2387,20 +2451,32 @@ fn test_lease_read_expires() {
         let mut node = config.build(storage).await.unwrap();
 
         // Elect leader and decide
-        for _ in 0..10 { node.tick().await.unwrap(); }
+        for _ in 0..10 {
+            node.tick().await.unwrap();
+        }
         let _ = node.append(Value::with_id(1)).await.unwrap();
-        for _ in 0..3 { node.tick().await.unwrap(); }
+        for _ in 0..3 {
+            node.tick().await.unwrap();
+        }
 
         // Lease should be valid immediately
         let result = node.ensure_linearizable();
-        assert!(matches!(result.as_ref().unwrap(), omnipaxos::ReadGuard::Lease(_)));
+        assert!(matches!(
+            result.as_ref().unwrap(),
+            omnipaxos::ReadGuard::Lease(_)
+        ));
 
         // Tick past the lease timeout
-        for _ in 0..10 { node.tick().await.unwrap(); }
+        for _ in 0..10 {
+            node.tick().await.unwrap();
+        }
 
         // Now should fall back to ReadIndex
         let result = node.ensure_linearizable();
-        assert!(matches!(result.as_ref().unwrap(), omnipaxos::ReadGuard::Pending(_)));
+        assert!(matches!(
+            result.as_ref().unwrap(),
+            omnipaxos::ReadGuard::Pending(_)
+        ));
     });
 }
 

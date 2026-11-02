@@ -20,8 +20,7 @@ pub trait Entry: Clone + Debug {
 }
 
 /// A StopSign entry that marks the end of a configuration. Used for reconfiguration.
-#[derive(Clone, Debug, PartialEq)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct StopSign {
     /// The new `Omnipaxos` cluster configuration
@@ -42,8 +41,7 @@ impl StopSign {
 
 /// Snapshot type. A `Complete` snapshot contains all snapshotted data while `Delta` has snapshotted changes since an earlier snapshot.
 #[allow(missing_docs)]
-#[derive(Clone, Debug)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SnapshotType<T>
 where
@@ -101,6 +99,26 @@ pub enum StorageOp<T: Entry> {
     SetStopsign(Option<StopSign>),
     /// Sets the snapshot.
     SetSnapshot(Option<T::Snapshot>),
+    /// Opens an uncommitted accept of `round` that rewrites the log from
+    /// `sync_idx`. Emitted only by storage whose
+    /// [`log_writes_durable_on_return`](Storage::log_writes_durable_on_return)
+    /// is `false`, as the first op of an AcceptSync batch, which then carries
+    /// no `SetAcceptedRound`. The log mutations of this batch and of later
+    /// batches belong to that uncommitted accept; they commit when a later
+    /// `SetAcceptedRound(round)` is durable. Recovery before that commit must
+    /// reproduce the previously committed accepted round and log. Recovery
+    /// after it must reflect the whole rewrite, including a truncation at
+    /// `sync_idx`: the engine commits once the log below the sync's new head
+    /// is reported durable, which a sync that only truncates satisfies at
+    /// once, so the commit must not become durable ahead of the rewrite point.
+    /// A StopSign change made while an accept is uncommitted is written only
+    /// together with its commit.
+    BeginSync {
+        /// The round being accepted.
+        round: Ballot,
+        /// The log index from which the accept rewrites the log.
+        sync_idx: u64,
+    },
 }
 
 impl<T: Entry> StorageOp<T> {
@@ -117,13 +135,17 @@ impl<T: Entry> StorageOp<T> {
             StorageOp::Trim(_) => "Trim",
             StorageOp::SetStopsign(_) => "SetStopsign",
             StorageOp::SetSnapshot(_) => "SetSnapshot",
+            StorageOp::BeginSync { .. } => "BeginSync",
         }
     }
 }
 
 /// Describe all operations in a batch for error diagnostics.
 pub(crate) fn describe_batch<T: Entry>(ops: &[StorageOp<T>]) -> String {
-    ops.iter().map(|op| op.describe()).collect::<Vec<_>>().join(", ")
+    ops.iter()
+        .map(|op| op.describe())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// All persisted scalar state, loaded once during recovery via [`Storage::load_state`].
@@ -193,11 +215,32 @@ where
     async fn can_snapshot(&self) -> bool {
         true
     }
+
+    /// Whether `Ok` from [`write_atomically`](Storage::write_atomically) means
+    /// every op of the batch is durable.
+    ///
+    /// `true` (the default, e.g. `MemoryStorage`): the engine treats every
+    /// written log entry as durable and votes for it immediately.
+    ///
+    /// `false`: log ops (`AppendEntry`, `AppendEntries`, `AppendOnPrefix`, and
+    /// the `SetDecidedIndex`, `Trim` and `SetCompactedIdx` that follow them)
+    /// may become durable after `write_atomically` returns. The host reports
+    /// the durable prefix of the real log through
+    /// [`OmniPaxos::on_log_durable`](crate::OmniPaxos::on_log_durable), and
+    /// neither this node's `Accepted` nor its leader self-vote covers an entry
+    /// before it is reported durable. `SetPromise`, `SetAcceptedRound` and
+    /// `SetStopsign` must still be durable when `write_atomically` returns, and
+    /// the storage must honour the [`StorageOp::BeginSync`] commit protocol.
+    ///
+    /// Read at the start of every public `OmniPaxos` call, so it may change
+    /// over the lifetime of the instance.
+    fn log_writes_durable_on_return(&self) -> bool {
+        true
+    }
 }
 
 /// A place holder type for when not using snapshots. You should not use this type, it is only internally when deriving the Entry implementation.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct NoSnapshot;
 

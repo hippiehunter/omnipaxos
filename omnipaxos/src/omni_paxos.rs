@@ -1,7 +1,7 @@
 use crate::{
     ballot_leader_election::{Ballot, BallotLeaderElection},
-    engine::{Engine, EngineAction, InitialEngineState, Phase},
     engine::state::EngineStateSnapshot,
+    engine::{Engine, EngineAction, InitialEngineState, Phase},
     errors::{valid_config, ConfigError, OmniPaxosError, StorageError},
     messages::Message,
     runtime::Runtime,
@@ -101,6 +101,7 @@ impl OmniPaxosConfig {
             compacted_idx: state.compacted_idx,
             stopsign: state.stopsign,
             flexible_quorum: self.cluster_config.flexible_quorum,
+            async_log_durability: !storage.log_writes_durable_on_return(),
         };
 
         let engine = Engine::new(
@@ -148,8 +149,7 @@ impl OmniPaxosConfig {
 /// Validate invariants of persisted state loaded from storage at startup.
 /// Catches corrupted or inconsistent storage before constructing the node.
 fn validate_persisted_state<T: Entry>(state: &PersistedState<T>) -> Result<(), OmniPaxosError> {
-    let max_accepted = state.log_len + state.compacted_idx
-        + state.stopsign.is_some() as u64;
+    let max_accepted = state.log_len + state.compacted_idx + state.stopsign.is_some() as u64;
 
     if state.compacted_idx > state.decided_idx {
         return Err(OmniPaxosError::CorruptedState(format!(
@@ -171,8 +171,7 @@ fn validate_persisted_state<T: Entry>(state: &PersistedState<T>) -> Result<(), O
         ));
     }
 
-    if let (Some(ref promise), Some(ref accepted_round)) = (&state.promise, &state.accepted_round)
-    {
+    if let (Some(ref promise), Some(ref accepted_round)) = (&state.promise, &state.accepted_round) {
         if promise < accepted_round {
             return Err(OmniPaxosError::CorruptedState(format!(
                 "promise ({:?}) < accepted_round ({:?})",
@@ -189,8 +188,7 @@ fn validate_persisted_state<T: Entry>(state: &PersistedState<T>) -> Result<(), O
 /// * `configuration_id`: The identifier for the cluster configuration that this OmniPaxos server is part of.
 /// * `nodes`: The nodes in the cluster i.e. the `pid`s of the other servers in the configuration.
 /// * `flexible_quorum` : Defines read and write quorum sizes. Can be used for different latency vs fault tolerance tradeoffs.
-#[derive(Clone, Debug, PartialEq, Default)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[cfg_attr(any(feature = "serde", feature = "toml_config"), derive(Deserialize))]
 #[cfg_attr(feature = "toml_config", serde(default))]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -387,6 +385,43 @@ where
         self.runtime.execute_commands(cmds).await
     }
 
+    /// Re-read whether the storage's log writes are durable on return; the
+    /// host may switch durability modes between calls.
+    fn refresh_log_durability_mode(&mut self) {
+        self.engine.s.async_log_durability = !self.runtime.storage.log_writes_durable_on_return();
+    }
+
+    /// Settle this node's votes against its durable state after a mutating
+    /// call: commit a pending AcceptSync whose log is durable and send the
+    /// leader self-vote or follower `Accepted` the durable state allows.
+    /// `durable_log_idx` is the host-reported durable real-log prefix; `None`
+    /// keeps the current one, except that storage whose log writes are durable
+    /// on return has its whole appended log durable. Rolls the settlement back
+    /// if its writes fail.
+    async fn settle_durability(
+        &mut self,
+        durable_log_idx: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let snap = self.engine.s.durability_snapshot();
+        let outgoing_len = self.engine.outgoing.len();
+        match durable_log_idx {
+            Some(idx) => self.engine.s.durable_log_idx = idx,
+            None if !self.engine.s.async_log_durability => {
+                self.engine.s.durable_log_idx = self.engine.s.real_log_head();
+            }
+            None => {}
+        }
+        self.engine.on_durability_changed();
+        let cmds = self.engine.take_commands();
+        if let Err(e) = self.runtime.execute_commands(cmds).await {
+            self.engine.s.restore_durability(snap);
+            self.engine.outgoing.truncate(outgoing_len);
+            self.engine.commands.clear();
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Helper: run action from engine that may need storage reads.
     async fn handle_engine_action(&mut self, action: EngineAction<T>) -> Result<(), StorageError> {
         // Execute any commands generated before the action
@@ -423,8 +458,8 @@ where
         old_leader: NodeId,
         old_dropped: u64,
     ) {
-        use crate::engine::state::{Role as R, Phase as P};
-        use crate::metrics::{Role, Phase};
+        use crate::engine::state::{Phase as P, Role as R};
+        use crate::metrics::{Phase, Role};
 
         let (new_role, new_phase) = &self.engine.s.state;
         let new_decided = self.engine.get_decided_idx();
@@ -512,8 +547,7 @@ where
         use crate::engine::state::Role;
         match self.engine.s.state {
             (Role::Leader, _) => {
-                let min_all_accepted_idx =
-                    self.engine.s.leader_state.get_min_all_accepted_idx();
+                let min_all_accepted_idx = self.engine.s.leader_state.get_min_all_accepted_idx();
                 let trimmed_idx = match trim_index {
                     Some(idx) if idx <= min_all_accepted_idx => idx,
                     None => min_all_accepted_idx,
@@ -534,13 +568,12 @@ where
                     for peer in peers {
                         use crate::messages::sequence_paxos::*;
                         let msg = PaxosMsg::Compaction(Compaction::Trim(trimmed_idx));
-                        self.engine.try_push_message(Message::SequencePaxos(
-                            PaxosMessage {
+                        self.engine
+                            .try_push_message(Message::SequencePaxos(PaxosMessage {
                                 from: pid,
                                 to: peer,
                                 msg,
-                            },
-                        ));
+                            }));
                     }
                 }
                 result.map_err(CompactionErr::Storage)
@@ -596,8 +629,50 @@ where
     /// Return the accepted index, including the protocol slot of an accepted
     /// StopSign. Equal to `get_decided_idx()` exactly when every accepted
     /// entry (and any accepted StopSign) has been decided.
+    ///
+    /// This counts every appended entry. With storage whose log writes are not
+    /// durable on return, entries may be appended but not yet durable; see
+    /// [`get_durable_accepted_idx`](Self::get_durable_accepted_idx).
     pub fn get_accepted_idx(&self) -> u64 {
         self.engine.s.accepted_idx
+    }
+
+    /// Return the committed accepted index: the prefix of the accepted log,
+    /// including an accepted StopSign's slot, that is durable in storage and
+    /// not covered by an uncommitted AcceptSync. This node's `Accepted`
+    /// messages and its leader self-vote never exceed it.
+    pub fn get_durable_accepted_idx(&self) -> u64 {
+        self.engine.s.committed_accepted_idx()
+    }
+
+    /// Report that every real (non-StopSign) log entry with index below
+    /// `durable_log_len` is durable in storage. Indexes count compacted
+    /// entries, like [`get_accepted_idx`](Self::get_accepted_idx).
+    ///
+    /// Used with storage whose
+    /// [`log_writes_durable_on_return`](crate::storage::Storage::log_writes_durable_on_return)
+    /// is `false`, and ignored otherwise. The engine votes for entries only
+    /// once they are reported durable, so the host calls this whenever its
+    /// durable log prefix advances. It never waits on I/O, but may write the
+    /// commit of a pending AcceptSync (`SetAcceptedRound`) and a newly decided
+    /// index, and queue `Accepted` or `Decide` messages.
+    pub async fn on_log_durable(&mut self, durable_log_len: u64) -> Result<(), OmniPaxosError> {
+        self.refresh_log_durability_mode();
+        if !self.engine.s.async_log_durability {
+            return Ok(());
+        }
+        let durable_log_idx = durable_log_len.min(self.engine.s.real_log_head());
+        if durable_log_idx == self.engine.s.durable_log_idx {
+            return Ok(());
+        }
+        let (old_role, old_phase, old_decided, old_leader, old_dropped) = self.snapshot_metrics();
+        if let Err(e) = self.settle_durability(Some(durable_log_idx)).await {
+            self.running_state = crate::metrics::RunningState::StorageError;
+            self.metrics_version += 1;
+            return Err(e.into());
+        }
+        self.detect_and_report_changes(old_role, old_phase, old_decided, old_leader, old_dropped);
+        Ok(())
     }
 
     /// Return trim index from storage.
@@ -648,11 +723,7 @@ where
 
     /// Read entry at index `idx` in the log. Returns `None` if `idx` is out of bounds.
     pub async fn read(&self, idx: u64) -> Result<Option<LogEntry<T>>, OmniPaxosError> {
-        match self
-            .runtime
-            .read(&self.engine, idx..idx + 1)
-            .await?
-        {
+        match self.runtime.read(&self.engine, idx..idx + 1).await? {
             Some(mut v) => Ok(v.pop()),
             None => Ok(None),
         }
@@ -681,12 +752,16 @@ where
     /// Note: on storage failure, state may be partially updated (matching
     /// the old behavior where each storage call was independent).
     pub async fn handle_incoming(&mut self, m: Message<T>) -> Result<(), OmniPaxosError> {
-        let (old_role, old_phase, old_decided, old_leader, old_dropped) =
-            self.snapshot_metrics();
+        let (old_role, old_phase, old_decided, old_leader, old_dropped) = self.snapshot_metrics();
         match m {
             Message::SequencePaxos(p) => {
+                self.refresh_log_durability_mode();
                 let action = self.engine.handle(p);
-                if let Err(e) = self.handle_engine_action(action).await {
+                let result = match self.handle_engine_action(action).await {
+                    Ok(()) => self.settle_durability(None).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = result {
                     self.running_state = crate::metrics::RunningState::StorageError;
                     self.metrics_version += 1;
                     return Err(e.into());
@@ -729,8 +804,8 @@ where
         if self.engine.accepted_reconfiguration() {
             return Err(ProposeErr::PendingReconfigEntry(entry));
         }
-        let (old_role, old_phase, old_decided, old_leader, old_dropped) =
-            self.snapshot_metrics();
+        let (old_role, old_phase, old_decided, old_leader, old_dropped) = self.snapshot_metrics();
+        self.refresh_log_durability_mode();
         let snap = self.snapshot_engine();
         match self.engine.propose_entry(entry) {
             Ok(result) => {
@@ -740,8 +815,17 @@ where
                     self.metrics_version += 1;
                     return Err(ProposeErr::Storage(e));
                 }
+                if let Err(e) = self.settle_durability(None).await {
+                    self.running_state = crate::metrics::RunningState::StorageError;
+                    self.metrics_version += 1;
+                    return Err(ProposeErr::Storage(e));
+                }
                 self.detect_and_report_changes(
-                    old_role, old_phase, old_decided, old_leader, old_dropped,
+                    old_role,
+                    old_phase,
+                    old_decided,
+                    old_leader,
+                    old_dropped,
                 );
                 Ok(match result {
                     crate::engine::ProposeResult::Accepted => AppendResult::Accepted,
@@ -788,6 +872,7 @@ where
             ));
         }
         use crate::engine::state::Role;
+        self.refresh_log_durability_mode();
         let ss = StopSign::with(new_configuration, metadata);
         match self.engine.s.state {
             (Role::Leader, Phase::Prepare) => self.engine.s.buffered_stopsign = Some(ss),
@@ -798,6 +883,9 @@ where
                     self.restore_engine(snap);
                     return Err(ProposeErr::Storage(e));
                 }
+                self.settle_durability(None)
+                    .await
+                    .map_err(ProposeErr::Storage)?;
             }
             _ => self.engine.forward_stopsign(ss),
         }
@@ -815,8 +903,8 @@ where
     /// (See how to configure these timeouts in `ServerConfig`).
     pub async fn tick(&mut self) -> Result<(), OmniPaxosError> {
         self.tick_count += 1;
-        let (old_role, old_phase, old_decided, old_leader, old_dropped) =
-            self.snapshot_metrics();
+        let (old_role, old_phase, old_decided, old_leader, old_dropped) = self.snapshot_metrics();
+        self.refresh_log_durability_mode();
         if self.election_clock.tick_and_check_timeout() {
             self.election_timeout().await?;
         }
@@ -834,9 +922,7 @@ where
             .s
             .transfer_state
             .as_ref()
-            .is_some_and(|ts| {
-                ts.target == self.engine.s.pid && ts.ticks_remaining == 0
-            })
+            .is_some_and(|ts| ts.target == self.engine.s.pid && ts.ticks_remaining == 0)
             && self.engine.s.state.0 == crate::engine::state::Role::Follower
         {
             self.engine.s.transfer_state = None;
@@ -850,22 +936,18 @@ where
         self.engine.tick_backoff();
         if self.flush_batch_clock.tick_and_check_timeout() {
             let snap = self.snapshot_engine();
-            let old_leader_accepted_idx = self
-                .engine
-                .s
-                .leader_state
-                .get_accepted_idx(self.engine.s.pid);
             self.engine.flush_batch_timeout();
             if let Err(e) = self.execute_engine_commands().await {
                 self.restore_engine(snap);
-                self.engine
-                    .s
-                    .leader_state
-                    .set_accepted_idx(self.engine.s.pid, old_leader_accepted_idx);
                 self.running_state = crate::metrics::RunningState::StorageError;
                 self.metrics_version += 1;
                 return Err(e.into());
             }
+        }
+        if let Err(e) = self.settle_durability(None).await {
+            self.running_state = crate::metrics::RunningState::StorageError;
+            self.metrics_version += 1;
+            return Err(e.into());
         }
         self.detect_and_report_changes(old_role, old_phase, old_decided, old_leader, old_dropped);
         Ok(())
@@ -885,12 +967,14 @@ where
         // Sync BLE state so it's aware of the new ballot
         self.ble.set_current_ballot(my_ballot);
         self.ble.set_leader(my_ballot);
+        self.refresh_log_durability_mode();
         let snap = self.snapshot_engine();
         let action = self.engine.handle_leader(my_ballot);
         if let Err(e) = self.handle_engine_action(action).await {
             self.restore_engine(snap);
             return Err(e.into());
         }
+        self.settle_durability(None).await?;
         Ok(())
     }
 
@@ -902,9 +986,7 @@ where
     /// Returns a snapshot of the current metrics for this node.
     pub fn metrics(&self) -> crate::metrics::Metrics {
         use crate::engine::state::{Phase as P, Role as R};
-        use crate::metrics::{
-            FollowerMetrics, Metrics, Phase, Role, RunningState,
-        };
+        use crate::metrics::{FollowerMetrics, Metrics, Phase, Role, RunningState};
         let (role, phase) = &self.engine.s.state;
         let role = match role {
             R::Leader => Role::Leader,
@@ -980,10 +1062,7 @@ where
     }
 
     /// Set a custom metrics recorder for push-based observability.
-    pub fn set_metrics_recorder(
-        &mut self,
-        recorder: Box<dyn crate::metrics::MetricsRecorder>,
-    ) {
+    pub fn set_metrics_recorder(&mut self, recorder: Box<dyn crate::metrics::MetricsRecorder>) {
         self.metrics_recorder = Some(recorder);
     }
 
@@ -1024,7 +1103,7 @@ where
         if self.engine.accepted_reconfiguration() {
             return Err(ReadError::Reconfigured);
         }
-        use crate::engine::state::{Role, Phase as EngPhase};
+        use crate::engine::state::{Phase as EngPhase, Role};
         // Lease fast path: skip network round-trip if within lease window
         if let Some(lease_timeout) = self.lease_tick_timeout {
             if self.engine.s.state == (Role::Leader, EngPhase::Accept) {
@@ -1099,6 +1178,7 @@ where
                 self.restore_engine(snap);
                 return Err(e.into());
             }
+            self.settle_durability(None).await?;
         }
         Ok(())
     }
@@ -1237,13 +1317,18 @@ impl Error for TransferError {}
 
 /// Describes how an appended entry was handled.
 ///
-/// **Important:** Only `Accepted` means the entry has been persisted to the
-/// leader's storage. Both `Forwarded` and `Buffered` are best-effort — the
-/// entry may be lost if the node crashes before it is replicated.
+/// **Important:** None of the variants means the entry is durable or decided.
+/// `Accepted` means the leader appended it to its log (once the batch
+/// flushes) and sent it to its followers; with storage whose log writes are
+/// not durable on return, it may not be durable yet. `Forwarded` and
+/// `Buffered` are best-effort. Acknowledge a write to clients only once it
+/// appears in the decided log.
 #[derive(Debug)]
-#[must_use = "AppendResult must be checked — only Accepted means the entry was persisted to the leader's storage"]
+#[must_use = "AppendResult must be checked — an entry is only safe once it is decided"]
 pub enum AppendResult {
-    /// Leader accepted the entry directly and persisted it to storage.
+    /// The leader appended the entry to its log (once the batch flushes) and
+    /// replicates it. Written through `write_atomically`, but durable only if
+    /// the storage's log writes are durable on return.
     Accepted,
     /// Entry forwarded to the known leader via a network message. The leader
     /// may not have received it — the caller should confirm the entry appears
