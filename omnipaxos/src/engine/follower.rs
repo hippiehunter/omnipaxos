@@ -17,11 +17,7 @@ impl<T: Entry> Engine<T> {
 
     pub(crate) fn handle_prepare(&mut self, prep: Prepare, from: NodeId) -> EngineAction<T> {
         let old_promise = self.s.promise;
-        // An equal ballot is the current leader asking again: its resend
-        // after a lost Promise, or a resync of a follower it saw stall. The
-        // promise is unchanged, so answering is safe, and ignoring it leaves
-        // the leader without this follower's promise for good.
-        if old_promise <= prep.n {
+        if old_promise < prep.n || (old_promise == prep.n && self.s.state.1 == Phase::Recover) {
             tracing::debug!(
                 pid = self.s.pid,
                 from,
