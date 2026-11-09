@@ -1298,6 +1298,47 @@ fn test_competing_try_become_leader() {
     });
 }
 
+/// A leader cut off from the node that replaced it still reaches the follower
+/// that promised the replacement. That follower's rejection is the only word
+/// the old leader will get, and it must end the leadership: nothing the old
+/// leader proposes can be decided any more.
+#[test]
+fn test_leader_steps_down_when_its_last_quorum_follower_promised_higher() {
+    smol::block_on(async {
+        let mut cluster = SimCluster::new(vec![1, 2, 3]).await;
+        let old_leader = elect_leader(&mut cluster).await;
+        let followers: Vec<u64> = cluster
+            .live_nodes()
+            .into_iter()
+            .filter(|&p| p != old_leader)
+            .collect();
+        let (replacement, bridge) = (followers[0], followers[1]);
+        cluster.partition(vec![old_leader], vec![replacement]);
+
+        cluster
+            .nodes
+            .get_mut(&replacement)
+            .unwrap()
+            .try_become_leader()
+            .await
+            .unwrap();
+        // The old leader's next message reaches the bridge, whose rejection
+        // names the replacement.
+        cluster.propose(old_leader, Value::with_id(1)).await;
+        cluster.tick_and_route(3).await;
+        assert_eq!(
+            cluster.nodes[&bridge].get_current_leader().unwrap().0,
+            replacement,
+            "the bridge follower must promise the replacement"
+        );
+        assert_eq!(
+            cluster.nodes[&old_leader].get_current_leader().unwrap().0,
+            replacement,
+            "the old leader must yield to the ballot its follower promised"
+        );
+    });
+}
+
 #[test]
 fn test_try_become_leader_outranks_the_initial_round_of_a_fresh_configuration() {
     smol::block_on(async {

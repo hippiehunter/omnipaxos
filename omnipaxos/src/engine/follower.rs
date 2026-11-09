@@ -30,23 +30,7 @@ impl<T: Entry> Engine<T> {
                 ballot_pid = prep.n.pid,
                 "prepare_received"
             );
-            // Emit: flush batch + set promise atomically
-            let num_new = self.s.batched_entries.len();
-            let mut ops = Vec::with_capacity(2);
-            if num_new > 0 {
-                ops.push(StorageOp::AppendEntries(
-                    self.s.batched_entries.clone(),
-                    false,
-                ));
-            }
-            ops.push(StorageOp::SetPromise(prep.n));
-            self.commands.push(Command::WriteAtomic(ops));
-            // Update shadow state
-            if num_new > 0 {
-                self.s.batched_entries.clear();
-            }
-            self.s.accepted_idx += num_new as u64;
-            self.s.promise = prep.n;
+            self.flush_batch_and_promise(prep.n);
 
             self.s.state = (Role::Follower, Phase::Prepare);
             self.s.current_seq_num = SequenceNumber::default();
@@ -116,6 +100,27 @@ impl<T: Entry> Engine<T> {
             }
         }
         EngineAction::Done
+    }
+
+    /// Flush the batched entries and persist the promise of `n` in one atomic
+    /// write.
+    pub(crate) fn flush_batch_and_promise(&mut self, n: Ballot) {
+        let num_new = self.s.batched_entries.len();
+        let mut ops = Vec::with_capacity(2);
+        if num_new > 0 {
+            ops.push(StorageOp::AppendEntries(
+                self.s.batched_entries.clone(),
+                false,
+            ));
+        }
+        ops.push(StorageOp::SetPromise(n));
+        self.commands.push(Command::WriteAtomic(ops));
+        // Update shadow state
+        if num_new > 0 {
+            self.s.batched_entries.clear();
+        }
+        self.s.accepted_idx += num_new as u64;
+        self.s.promise = n;
     }
 
     /// Complete a prepare response after Runtime has built the LogSync.

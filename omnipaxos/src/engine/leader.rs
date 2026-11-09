@@ -8,7 +8,7 @@ use crate::{
     ballot_leader_election::Ballot,
     messages::{sequence_paxos::*, Message},
     storage::{Entry, StopSign, StorageOp},
-    util::{AcceptedMetaData, LeaderState, NodeId, PromiseMetaData},
+    util::{AcceptedMetaData, LeaderState, NodeId, PromiseMetaData, SequenceNumber},
     InlineOrRef, ReadBarrier, ReadError, TransferError,
 };
 use std::sync::Arc;
@@ -622,7 +622,39 @@ impl<T: Entry> Engine<T> {
                 "not_accepted"
             );
             self.s.leader_state.lost_promise(from);
+            // Whoever owns the higher ballot has promised it as well.
+            if self.s.peers.contains(&not_acc.n.pid) {
+                self.s.leader_state.lost_promise(not_acc.n.pid);
+            }
+            let voters = self.s.leader_state.get_promised_followers().len() + 1;
+            if !self.s.leader_state.quorum.is_accept_quorum(voters) {
+                self.abdicate(not_acc.n);
+            }
         }
+    }
+
+    /// Yield to the higher ballot `n` once this leader's remaining promises
+    /// can no longer form an accept quorum. Nothing proposed here can be
+    /// decided any more, and the owner of `n` may be unreachable from this
+    /// node, so its Prepare cannot be counted on to end this leadership.
+    fn abdicate(&mut self, n: Ballot) {
+        tracing::info!(
+            pid = self.s.pid,
+            old_role = "leader",
+            new_role = "follower",
+            ballot_n = n.n,
+            ballot_pid = n.pid,
+            "state_change"
+        );
+        self.flush_batch_and_promise(n);
+        self.s.state = (Role::Follower, Phase::Recover);
+        self.s.current_seq_num = SequenceNumber::default();
+        self.s.follower_ack = None;
+        self.try_push_message(Message::SequencePaxos(PaxosMessage {
+            from: self.s.pid,
+            to: n.pid,
+            msg: PaxosMsg::PrepareReq(PrepareReq { n }),
+        }));
     }
 
     pub(crate) fn resend_messages_leader(&mut self) {
